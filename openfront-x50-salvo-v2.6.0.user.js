@@ -1016,12 +1016,15 @@
     if (plan0 && (CFG.samHydroCount | 0) > 0 && (salvoHydro === null || salvoHydro.fired)) {
       salvoHydro = { tile: tile, fireTick: Math.max(0, plan0.fireTick | 0), fireAt: null,
                      bus: bus, ctor: ctor, fired: false, armed: false, armedAt: null };
-      salvoFollow = { tile: tile, bus: bus, ctor: ctor,
-                      atomsLeft: Math.max(0, plan0.afterAtoms | 0),
-                      hydrosLeft: Math.max(0, plan0.afterHydros | 0),
-                      atoms0: Math.max(0, plan0.afterAtoms | 0),
-                      hydros0: Math.max(0, plan0.afterHydros | 0),
-                      started: false, timer: null };
+      // 진행 중인 후속 산개가 있으면 덮어쓰지 않는다 (타이머 유실 방지)
+      if (salvoFollow === null) {
+        salvoFollow = { tile: tile, bus: bus, ctor: ctor,
+                        atomsLeft: Math.max(0, plan0.afterAtoms | 0),
+                        hydrosLeft: Math.max(0, plan0.afterHydros | 0),
+                        atoms0: Math.max(0, plan0.afterAtoms | 0),
+                        hydros0: Math.max(0, plan0.afterHydros | 0),
+                        started: false, timer: null };
+      }
       const how = plan0.ok ? "사각창 역산" : "근사(사각창 미확보)";
       const waste = (plan0.drops | 0) > 0 ? ` · 관부족 낭비 ${plan0.drops}발` : "";
       const aft = (plan0.afterAtoms | 0) + (plan0.afterHydros | 0) > 0
@@ -1174,10 +1177,18 @@
     const totalLeft = F.atomsLeft + F.hydrosLeft;
     if (totalLeft <= 0) {
       const done = salvoQueue.length === 0 && salvoTimer === null && salvoHydro === null;
-      if (done) { const F0 = salvoFollow; salvoFollow = null; if (F0) {} salvoClear(null); }
-      else salvoFollow = null;
+      salvoFollow = null;
+      if (done) salvoClear(null);
       return;
     }
+    // 골드 가드 — 원자 1발 값도 없으면 이후는 서버가 전부 버린다 (낭비 방지)
+    try {
+      const c1 = atomCostPerBomb();
+      if (c1 && c1 > 0n) {
+        const gold = myGold();
+        if (gold !== null && gold < c1) { salvoClear("💰 골드 소진"); return; }
+      }
+    } catch (e) {}
     // 이번 스텝: 원자(50발 단위, 남은 양 이하) 또는 수소 1발을 확률적으로 선택
     const pAtom = F.hydrosLeft <= 0 ? 1 : (F.atomsLeft <= 0 ? 0 : 0.72);
     const pickAtom = Math.random() < pAtom;
