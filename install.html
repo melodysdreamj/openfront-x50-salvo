@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenFront x50 스크립트 설치</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 20px 80px;
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    background: #0e1116; color: #e6edf3;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .sub { color: #8b949e; margin: 0 0 32px; font-size: 14px; }
+  ol { list-style: none; counter-reset: s; padding: 0; margin: 0; }
+  li {
+    counter-increment: s; position: relative;
+    background: #161b22; border: 1px solid #21262d; border-radius: 12px;
+    padding: 20px 22px 22px 62px; margin-bottom: 14px;
+  }
+  li::before {
+    content: counter(s); position: absolute; left: 20px; top: 20px;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: #238636; color: #fff; font-size: 14px; font-weight: 700;
+    display: grid; place-items: center;
+  }
+  li b { display: block; font-size: 17px; margin-bottom: 4px; }
+  li p { margin: 6px 0 10px; color: #8b949e; font-size: 14px; }
+  a.btn, button.btn {
+    display: inline-block; margin: 4px 8px 0 0; padding: 9px 16px;
+    background: #1f6feb; color: #fff; border: 0; border-radius: 8px;
+    font: 600 14px/1.2 inherit; text-decoration: none; cursor: pointer;
+  }
+  a.btn:hover, button.btn:hover { background: #388bfd; }
+  a.btn.ghost { background: transparent; color: #58a6ff; border: 1px solid #30363d; }
+  a.btn.ghost:hover { background: #21262d; }
+  code { background: #21262d; padding: 2px 6px; border-radius: 5px; font-size: 13px; }
+  .warn { color: #d29922; font-size: 13px; margin-top: 10px; }
+  .note {
+    margin-top: 26px; padding: 16px 18px; border-radius: 10px;
+    background: #161b22; border: 1px solid #21262d; color: #8b949e; font-size: 14px;
+  }
+  details { margin-top: 26px; background: #161b22; border: 1px solid #21262d; border-radius: 12px; padding: 16px 20px; }
+  summary { cursor: pointer; font-weight: 600; color: #e6edf3; }
+  details p { color: #8b949e; font-size: 14px; }
+  #cpmsg { margin-left: 10px; color: #3fb950; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>OpenFront x50 스크립트 설치</h1>
+  <p class="sub">v2.5.0 · <b>I: 수소타격 한큐 — 목표를 커버하는 모든 SAM을 분석해 필요 원자만큼 쏘고, 사각창에 수소 1발을 꽂은 뒤 3~5% 추가 벌크</b> · <b>Z: 1,000발 살포</b> (연타 = 대기열) · 화면 모서리 HUD: 서버 리밋 해제 카운트다운(80%) + 커서 타깃 필요 원자·비용·사일로 상시 표시 &nbsp;+&nbsp; 원자 50발 / xMax / 수소 / MIRV &nbsp;+&nbsp; 구조물 <b>+50</b> (V) / <b>+500</b> (X) 업그레이드<br>사설·연습 로비 전용</p>
+
+  <ol>
+    <li>
+      <b>Tampermonkey 설치 (먼저!)</b>
+      <p>크롬 웹스토어에서 <b>Chrome에 추가</b> → <b>확장 프로그램 추가</b> 를 누르세요.</p>
+      <a class="btn" target="_blank" rel="noopener"
+         href="https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo">Tampermonkey 설치 페이지 열기</a>
+      <p class="warn">설치 후 한 번 더: chrome://extensions → Tampermonkey → <b>세부정보</b> → <b>사용자 스크립트 허용</b> 켜기<br>(이걸 빼먹으면 스크립트가 작동하지 않습니다)</p>
+    </li>
+
+    <li>
+      <b>스크립트 설치</b>
+      <p>Tampermonkey가 설치된 <b>뒤에</b> 아래 버튼을 누르면 Tampermonkey 설치 화면이 뜹니다 → <b>설치</b> 클릭.</p>
+      <a class="btn" href="/openfront-x50-salvo-v2.5.0.user.js">스크립트 설치 (Tampermonkey)</a>
+      <a class="btn ghost" href="/openfront-x50-salvo-v2.5.0.user.js?dl=1">파일로 다운로드</a>
+      <p class="warn">Tampermonkey 없이 이 버튼을 누르면 코드가 텍스트로 보이기만 합니다. 순서를 지켜주세요.</p>
+    </li>
+
+    <li>
+      <b>확인</b>
+      <p>openfront.io 에 접속 → <code>F12</code> → 콘솔에 <code>[x50] 준비 완료</code> 가 뜨면 성공.<br>
+      게임에서 <b>V</b> 한 번 → 무장 유지 → 구조물을 <b>계속 클릭</b> (클릭마다 +50 누적, <b>사일로는 +30</b>)<br><b>X</b> → 같은 방식으로 <b>+500</b>씩 (사일로는 +300) — <b>클릭하면 즉시</b>(서버 초당 한도인 500레벨을 한 번에 요청, 1초대). 해제는 X/Esc<br><b>N</b> 누르고 바다 클릭 → <b>군함 10척</b> 한 번에 건조 (항구 필요)<br><b>M</b> → 커서 위치에 <b>MIRV</b> (탄두 최대 350발, 영토에만) — 누르고 있으면 연사<br><b>I</b> → <b>수소타격 한큐</b>: 목표를 커버하는 적 SAM(사거리·레벨)을 전부 분석해 <b>필요 원자만큼 전량 발사 → 회복 사각창에 수소 1발 → 3~5% 추가 벌크</b>를 한 번에. SAM이 없으면 일반 살포와 동일. (화면 모서리 HUD가 필요 원자·비용·사일로를 상시 표시)<br><b>Z</b> → 커서 위치에 <b>원자폭탄 1,000발</b>을 서버 최대 속력(초당 500발)으로 살포 (약 1.2초). <b>연달아 누르면</b> 누른 위치별로 대기열에 쌓여 <b>끊김 없이</b> 이어서 나감 (5곳 연타 = 5,000발 연속). <b>자동 중단</b>: 골드 소진·발사관 소진 시 낭비 없이 멈춤 (Esc로 수동 중단도 가능). 서버 분당 한도 도달 시 남은 초만큼 대기 후 자동 재개<br>키를 누르고 있으면 서버 감당 속도로 자동 반복 발사 (H/G/J/M) / <b>H</b> 원자 50발 / <b>G</b> xMax / <b>J</b> 수소 1발 / <b>M</b> MIRV (탄두 350발)</p>
+    </li>
+  </ol>
+
+  <details>
+    <summary>Tampermonkey 없이 쓰기 (콘솔에 붙여넣기)</summary>
+    <p>openfront.io 게임 화면에서 <code>F12</code> → Console 탭 → 아래 버튼으로 복사 → 붙여넣고 Enter.</p>
+    <button class="btn" id="cp">스크립트 전체 복사</button><span id="cpmsg"></span>
+    <p class="warn">탭을 새로고침하면 다시 붙여넣어야 합니다. 계속 쓰려면 Tampermonkey 설치를 권장합니다.</p>
+  </details>
+
+  <div class="note">
+    설치가 끝나면 이 페이지와 로컬 서버는 더 이상 필요하지 않습니다.<br>
+    파일 경로: <code>~/Documents/OpenFront/openfront-x50-salvo-v2.5.0.user.js</code>
+  </div>
+</div>
+
+<script>
+document.getElementById('cp').addEventListener('click', async () => {
+  const msg = document.getElementById('cpmsg');
+  try {
+    const r = await fetch('/openfront-x50-salvo-v2.5.0.user.js');
+    const t = await r.text();
+    await navigator.clipboard.writeText(t);
+    msg.textContent = ' 복사됨 (' + t.length.toLocaleString() + '자) — 콘솔에 붙여넣으세요';
+  } catch (e) {
+    msg.textContent = ' 복사 실패 — 파일을 직접 열어 복사하세요';
+  }
+});
+</script>
+</body>
+</html>
