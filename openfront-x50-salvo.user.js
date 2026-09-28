@@ -598,7 +598,7 @@
   function stStream(silos, C, E, hTick) {
     const st = silos.map((x) => ({ d: x.dist, lv: Math.max(1, x.level | 0), q: [], out: 0 }));
     const total = C + E, intents = Math.ceil(total / SIMC.PER);
-    const arr = [];
+    const arr = [], arrD = [];
     let h = null, hDone = (hTick === undefined || hTick === null || hTick < 0);
     let sent = 0, drops = 0, tMainMs = 0;
 
@@ -646,6 +646,7 @@
         const r = pickAndFire(t);
         if (!r) { drops++; continue; }
         arr.push(r.arr);
+        if (arrD) arrD.push(r.d);
       }
       sent += nB;
     }
@@ -653,16 +654,32 @@
       const r = pickAndFire(hTick);
       h = r ? { F: hTick * SIMC.TICK, arr: r.arr, d: r.d } : { F: hTick * SIMC.TICK, fail: true };
     }
-    arr.sort((a, b) => a - b);
-    return { arr, h, qs: st.map((s) => s.q), drops, tMainMs: tMainMs || 0 };
+    // 도착·거리 짝 정렬 (교전창을 비행시간으로 캡하기 위해)
+    const idx = arr.map((a, i) => i).sort((x, y) => arr[x] - arr[y]);
+    const arrS = idx.map((i) => arr[i]), arrDS = idx.map((i) => arrD[i]);
+    return { arr: arrS, arrD: arrDS, h, qs: st.map((s) => s.q), drops, tMainMs: tMainMs || 0 };
   }
 
   // 틱 스윕 → 사각창(모든 슬롯 점유·회복 없음) 목록
-  function stDeadRuns(sams, arr, lead) {
+  //   arrD(선택): 폭탄별 사일로 거리 — 교전창 시작은 '발사 시점'을 넘을 수 없다.
+  //   → w0[i] = 도착 − min(lead, 비행시간−100ms). (짧은 거리 폭탄은 교전창이 짧다)
+  //   주의: w0는 더 이상 단조가 아니다(arrD가 제각각) → w0 기준 정렬 인덱스를 따로 둔다.
+  function stDeadRuns(sams, arr, lead, arrD) {
     const SL = sams.sumLevel, n = arr.length;
     if (!n || !(SL > 0)) return { runs: [], maxBusy: 0 };
     const w0 = new Float64Array(n), w1 = new Float64Array(n);
-    for (let i = 0; i < n; i++) { w0[i] = arr[i] - lead; w1[i] = arr[i] - SIMC.END_MS; }
+    for (let i = 0; i < n; i++) {
+      const fly = arrD ? arrD[i] * 10 : Infinity;
+      const eff = Math.min(lead, fly - 100);
+      w0[i] = arr[i] - Math.max(0, eff);
+      w1[i] = arr[i] - SIMC.END_MS;
+    }
+    // arr는 오름차순이므로 w1도 오름차순. w0는 별도 정렬 인덱스(ord)로 스윕한다.
+    const ord = new Array(n);
+    for (let i = 0; i < n; i++) ord[i] = i;
+    ord.sort((a, b) => w0[a] - w0[b]);
+    const W0 = new Float64Array(n);
+    for (let i = 0; i < n; i++) W0[i] = w0[ord[i]];
     const tEnd = arr[n - 1] + 9000 + 1000;
     const nT = Math.ceil(tEnd / SIMC.TICK) + 2;
     const runs = [];
@@ -671,23 +688,29 @@
     let eHead = 0, eTail = 0, busy = 0, cand = 0, pe = 0, px = 0, ks = 0, cur = null, maxBusy = 0;
     for (let i = 0; i <= nT; i++) {
       const t = i * SIMC.TICK;
+      // 1) 슬롯 회복 (9초 지난 항목부터)
       while (eHead < eTail && ends[eHead] <= t) { eHead++; busy--; }
       const freeBefore = SL - busy;
+      // 2) 만료 (w1 기준 — arr 순서 = 단조): 교전창이 닫힌 후보 제거
       while (px < n && w1[px] < t) { if (!dead[px]) cand--; px++; }
-      while (pe < n && w0[pe] <= t) { if (!dead[pe]) cand++; pe++; }
+      // 3) 진입 (w0 정렬 기준)
+      while (pe < n && W0[pe] <= t) { if (!dead[ord[pe]]) cand++; pe++; }
+      // 4) 요격: 빈 슬롯 × 후보 (w0 순서로 앞선 후보부터)
       let k = Math.min(freeBefore, cand);
       if (k < 0) k = 0;
       if (k > 0) {
         cand -= k; busy += k;
         for (let z = 0; z < k; z++) ends[eTail++] = t + 9000;
         while (k > 0 && ks < n) {
-          if (dead[ks]) { ks++; continue; }
-          if (w1[ks] < t) { ks++; continue; }
-          if (w0[ks] > t) break;
-          dead[ks] = 1; k--; ks++;
+          const ci = ord[ks];
+          if (dead[ci]) { ks++; continue; }
+          if (w1[ci] < t) { ks++; continue; }        // 이미 만료 (px가 처리)
+          if (w0[ci] > t) break;                     // 아직 창이 안 열림 → 이후도 전부 미개방
+          dead[ci] = 1; k--; ks++;
         }
       }
       if (busy > maxBusy) maxBusy = busy;
+      // 5) 사각창: 회복 전 free==0
       if (freeBefore === 0) { if (!cur) cur = { s: t, e: t }; else cur.e = t; }
       else if (cur) { runs.push(cur); cur = null; }
     }
@@ -759,7 +782,7 @@
       const C = Cs[ci];
       const E = opt.extra || 0;
       const base = stStream(silos, C, E, -1);
-      const D = stDeadRuns(sams, base.arr, lead);
+      const D = stDeadRuns(sams, base.arr, lead, base.arrD);
       for (let ri = 0; ri < D.runs.length; ri++) {
         const ln = D.runs[ri].e - D.runs[ri].s;
         if (ln > maxRunLen) { maxRunLen = ln; bestRunAt = { C: C, run: D.runs[ri] }; }
