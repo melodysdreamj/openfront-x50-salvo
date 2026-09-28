@@ -90,6 +90,12 @@
     // 보내므로 서버 스키마 상한(50)은 그대로 지킨다.
     hotkeyUpgradeBig: "KeyX",   // 무장 (X) → 구조물 클릭: +500
     addLevelsBig: 500,          // 클릭당 레벨 증가 (大)
+    // 한 번의 클릭에서 '한 서버창(1초)'에 몰아 보낼 최대 인텐트 수.
+    //   서버 초당 한도는 10건인데 X(+500=10건)를 다 몰아쓰면 그 1초 동안
+    //   창을 독점해 Z 살포·수소·MIRV·다른 업그레이드가 전부 대기한다.
+    //   6으로 두면 창에 4건 여유를 남기고 나머지는 다음 창에서 이어간다
+    //   (체감 소요는 +500에 약 1.2초 — 게임 클라이언트도 창을 꽉 채우지 않는다).
+    upgradeBurstPerWindow: 6,
     addLevelsByTypeBig: {
       "Missile Silo": 300,      // 사일로는 +300 (발사관 수라 과하면 곤란)
     },
@@ -1204,7 +1210,9 @@
     try {
       const ana = samDefenders(tile);
       if (ana === null) return { k: "na" };
-      if (ana.n === 0) return { k: "no-sam" };
+      if (ana.n === 0) {
+        return { k: "no-sam" };
+      }
       const silos = mySilos(tile);
       let tx = null, ty = null;
       try {
@@ -1491,6 +1499,9 @@
     try {
       tile = computeCursorTile();
       if (tile === null) { toast("❌ 타깃 위에 커서를 올린 뒤 누르세요", "#ffaa00"); return; }
+      // 지형 제한 없음 — 게임의 nukeSpawn 은 '산(isImpassable)'만 막는다.
+      //   바다는 isImpassable=false 이고 owner 도 TerraNullius 라 발사 가능하다.
+      //   (GameMap.isImpassable = isLand && magnitude==IMPASSABLE → 바다는 해당 없음)
       ana = samDefenders(tile);
       if (ana === null) {
         // 방어 정보를 못 읽으면 판정 보류 → 일반 살포로 넘긴다
@@ -1499,8 +1510,31 @@
         return;
       }
       if (ana.n === 0) {
-        toast("ℹ️ 커버하는 적 SAM 없음 — 일반 살포로 진행", "#ffd166");
-        startSalvo({ forceSam: true });
+        // 방어 SAM이 없으면 '수소 1발'만 쏜다 — 수소가 최종 목표이므로
+        // 원자로 사각창을 열 필요 자체가 없다 (낭비 방지).
+        if ((CFG.samHydroCount | 0) <= 0) {
+          toast("ℹ️ 커버하는 적 SAM 없음 — 수소 미사용 설정", "#ffd166");
+          return;
+        }
+        const bus0 = getEventBus(), ctor0 = findNukeEventCtor();
+        if (!bus0 || !ctor0) { toast("❌ 경로 없음 — 게임 시작 후 다시 시도", "#ff5555"); return; }
+        let ready0 = null;
+        try {
+          const g0 = getGameView();
+          const me0 = g0 && typeof g0.myPlayer === "function" ? g0.myPlayer() : null;
+          if (me0 && typeof me0.readyMissileCount === "function") ready0 = me0.readyMissileCount();
+        } catch (e) {}
+        if (ready0 === 0) { toast("❌ 준비된 발사관 없음 (사일로 쿨다운 해제 후 재시도)", "#ffaa00"); return; }
+        try {
+          bus0.emit(new ctor0("Hydrogen Bomb", tile, getRocketDirectionUp(), undefined));
+          rateUse();
+          const rl = hudRateState();
+          const rlTxt = rl.ok ? "" : ` · ⏳ 한도 ${rl.left.toFixed(1)}초`;
+          toast(`💧 방어 없음 — 수소 1발 발사 (막을 SAM 없음)${rlTxt}`, "#7ee787");
+        } catch (e) {
+          console.warn("[x50] 수소 emit 실패:", e);
+          toast("❌ 수소 발사 실패 (콘솔 확인)", "#ff5555");
+        }
         return;
       }
       s = strikeSummary(tile, false);   // 정밀 판정 (가산 스캔 포함)
@@ -1990,6 +2024,17 @@
   //   · 서버 초당 한도(10건)에 여유 1을 두고 스스로 페이싱한다 (드롭 0).
   //   · 골드로 감당 가능한 만큼만 사전 절단 (최종 판정은 서버).
   //   · 레벨을 못 읽으면 중단 (추측 금지).
+  // 이번 서버창(1초)에서 '업그레이드가' 쓴 인텐트 수.
+  //   여러 클릭(다중 구조물)이 각자 펌프를 돌려도 합계가 상한을 넘지 않게 한다
+  //   → X(+500=10건)를 눌러도 창에 여유가 남아 Z 살포·수소가 굶지 않는다.
+  let upSentTimes = [];
+  function upRoomNow() {
+    const now = Date.now();
+    while (upSentTimes.length && now - upSentTimes[0] > 1000) upSentTimes.shift();
+    const cap = Math.max(1, Math.min(CFG.upgradeBurstPerWindow | 0 || 6, RL.perSecond));
+    return Math.max(0, cap - upSentTimes.length);
+  }
+
   function fireUpgrade(unitId, type, row, me, bus, ctor, big) {
     const lv0 = unitLevel(unitId, type);
     if (lv0 === null) {
@@ -2086,8 +2131,8 @@
         return;
       }
 
-      // 이번 창 몫: 여유만큼 (최대 10건 = 500레벨)
-      const burst = Math.min(room, remaining - sent);
+      // 이번 창 몫: 서버 여유 · 업그레이드 전용 상한 · 남은 양 중 최소
+      const burst = Math.min(room, upRoomNow(), remaining - sent);
       let n = 0;
       while (n < burst && sent < remaining) {
         const amt = Math.min(perIntent, remaining - sent);
@@ -2095,6 +2140,7 @@
         try {
           bus.emit(new ctor(unitId, type, amt));
           rateUse();
+          upSentTimes.push(Date.now());
         } catch (e) {
           console.warn("[x50] 업그레이드 emit 실패:", e);
           toast("❌ 업그레이드 발송 실패", "#ff5555");
@@ -2104,10 +2150,10 @@
         n++;
       }
       if (sent < remaining) {
-        // 창을 다 썼으면 회전까지, 아니면 짧게 재시도
-        const wait2 = RL.secWindow.length >= RL.perSecond
-          ? Math.max(40, RL.secWindow[0] + 1050 - Date.now())
-          : 40;
+        // 이번 창에서 업그레이드 몫을 다 썼다 → 창 회전까지 기다린다.
+        //   (60ms 재시도로는 결국 창을 다 먹어 독점이 그대로 재현된다 — 실측 확인)
+        const last = upSentTimes.length ? upSentTimes[upSentTimes.length - 1] : Date.now();
+        const wait2 = Math.max(60, last + 1050 - Date.now());
         timer = setTimeout(pump, wait2);
         return;
       }
@@ -2603,7 +2649,7 @@
         try {
           const ana = samDefenders(tileNow);
           if (ana === null) brief = "🎯 —";
-          else if (ana.n === 0) brief = "🎯 방어 없음 — 원자만";
+          else if (ana.n === 0) brief = "🎯 방어 없음 — I=수소 1발";
           else brief = `🎯 SAM ${ana.n}기 ΣLv${ana.sumLevel} · 계산 중…`;
         } catch (e) { brief = "🎯 계산 중…"; }
         hudCache = brief; hudCacheBrief = true; hudCacheTile = tileNow;
@@ -2617,7 +2663,7 @@
       if (tile === null) { hudCache = "🎯 커서를 영토에"; return hudCache; }
       const a = strikeSummary(tile, true);   // 경량 모드 (가산 스캔 생략)
       if (a.k === "na") { hudCache = "🎯 —"; return hudCache; }
-      if (a.k === "no-sam") { hudCache = "🎯 방어 없음 — 원자만"; return hudCache; }
+      if (a.k === "no-sam") { hudCache = "🎯 방어 없음 — I=수소 1발"; return hudCache; }
       if (a.k !== "plan") { hudCache = "🎯 —"; return hudCache; }
       const jt = (a.jitterMin !== undefined && a.jitterMax !== undefined) ? `+${a.jitterMin}~${a.jitterMax}` : "";
       let l1 = `🎯 SAM ${a.samN}기 ΣLv${a.samSL} · 필요 ☢ ${a.C.toLocaleString()}발${jt ? " +랜덤" + jt : ""}`;
