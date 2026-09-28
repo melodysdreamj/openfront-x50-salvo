@@ -251,9 +251,10 @@
   }
 
   // ── 커서 타일 ──
+  let lastMouseMoveAt = 0;
   window.addEventListener(
     "mousemove",
-    (e) => { lastMouse = { x: e.clientX, y: e.clientY }; },
+    (e) => { lastMouse = { x: e.clientX, y: e.clientY }; lastMouseMoveAt = Date.now(); },
     { passive: true },
   );
 
@@ -752,47 +753,51 @@
   // ── 발사 스트림: 원자 (C+E)발 — 창 스케줄·관 회복·체인 정밀 모델 ──
   //   shiftAt = max(발사틱+90, 앞 발사 shiftAt+1) · dep = max(체인, 발사틱+1)
   //   반환 { arr(도착,정렬), arrSilo, arrL(발사ms), h, qs, drops, tMainMs }
+  //   최적화: 사일로를 '거리순'으로 미리 정렬하고, 각 사일로의 체인·관 상태를
+  //   O(1)로 유지한다(증분 갱신). 발사마다 전 사일로를 다시 훑지 않는다.
   function stStream(silos, C, E, hTick) {
-    const st = silos.map((x) => ({ d: x.dist, lv: Math.max(1, x.level | 0), q: [], out: 0 }));
+    const st = silos.map((x, idx) => ({ idx, d: x.dist, lv: Math.max(1, x.level | 0), q: [], out: 0, lastLt: -1, lastDep: 0, free: Math.max(1, x.level | 0) }))
+                     .sort((a, b) => a.d - b.d);          // 거리 오름차순 = 배정 우선순위
+    const NS = st.length;
     const total = C + E, intents = Math.ceil(total / SIMC.PER);
     const rec = [];
     let h = null, hDone = (hTick === undefined || hTick === null || hTick < 0);
     let sent = 0, drops = 0, tMainMs = 0;
-    function freeCnt(si, t) {
-      const s = st[si];
-      while (s.out < s.q.length && s.q[s.out].shiftAt <= t) s.out++;
-      return s.lv - (s.q.length - s.out);
-    }
-    function depOf(si, t) {
-      const s = st[si];
-      let chain = 0;
-      for (let z = s.out; z < s.q.length; z++) {
-        const lt = s.q[z].lt;
-        chain = (lt + 1 > chain + 1) ? lt + 1 : chain + 1;
+
+    // 회복 반영 (그 사일로만, O(회복 수))
+    function refresh(s, t) {
+      while (s.out < s.q.length && s.q[s.out].shiftAt <= t) {
+        s.out++;
+        s.free++;
       }
-      return Math.max(chain, t + 1);
     }
     function fireAt(si, t) {
       const s = st[si];
-      const dep = depOf(si, t);
+      refresh(s, t);
+      // 체인: 마지막 발사 이후 1틱 뒤 또는 t+1 중 늦은 것 (큐가 비면 lastDep 유지)
+      let dep = s.lastDep + 1 > t + 1 ? s.lastDep + 1 : t + 1;
+      s.lastDep = dep;
+      s.lastLt = t;
       const prevShift = s.q.length ? s.q[s.q.length - 1].shiftAt : 0;
       s.q.push({ lt: t, shiftAt: Math.max(t + SIMC.CD_T, prevShift + 1) });
-      return { arr: dep, si: si, L: t * SIMC.TICK };   // arr은 임시로 dep — 아래서 가공
+      s.free--;
+      return { dep: dep, si: s.idx, L: t * SIMC.TICK };
     }
+    // 빈 관이 있는 '가장 가까운' 사일로 — 거리순이라 앞에서 첫 히트
     function pickAndFire(t) {
-      let bi = -1, bd = Infinity;
-      for (let si = 0; si < st.length; si++) {
-        if (st[si].d < bd && freeCnt(si, t) > 0) { bd = st[si].d; bi = si; }
+      for (let i = 0; i < NS; i++) {
+        const s = st[i];
+        if (s.free > 0) return fireAt(i, t);
+        if (s.q.length > s.out && s.q[s.out].shiftAt <= t) { refresh(s, t); if (s.free > 0) return fireAt(i, t); }
       }
-      if (bi < 0) return null;
-      return fireAt(bi, t);
+      return null;
     }
     for (let j = 0; j < intents; j++) {
       const sendMs = Math.floor(j / 10) * SIMC.WIN + (j % 10) * 5;
       const t = Math.floor(sendMs / SIMC.TICK);
       if (!hDone && t >= hTick) {
         const r = pickAndFire(hTick);
-        h = r ? { F: hTick * SIMC.TICK, dep: r.arr, si: r.si, L: r.L, fail: false } : { F: hTick * SIMC.TICK, fail: true };
+        h = r ? { F: hTick * SIMC.TICK, dep: r.dep, si: r.si, L: r.L, fail: false } : { F: hTick * SIMC.TICK, fail: true };
         hDone = true;
       }
       const nB = Math.min(SIMC.PER, total - sent);
@@ -800,21 +805,24 @@
       for (let b = 0; b < nB; b++) {
         const r = pickAndFire(t);
         if (!r) { drops++; continue; }
-        rec.push({ dep: r.arr, si: r.si, L: r.L });
+        rec.push(r);
       }
       sent += nB;
     }
     if (!hDone) {
       const r = pickAndFire(hTick);
-      h = r ? { F: hTick * SIMC.TICK, dep: r.arr, si: r.si, L: r.L, fail: false } : { F: hTick * SIMC.TICK, fail: true };
+      h = r ? { F: hTick * SIMC.TICK, dep: r.dep, si: r.si, L: r.L, fail: false } : { F: hTick * SIMC.TICK, fail: true };
     }
     rec.sort((a, b) => a.dep - b.dep || a.L - b.L);
+    // qs: 원본 silos 인덱스 순으로 재배치 (호출부가 silos[i] / siloData[i]와 짝지어 쓴다)
+    const qs = new Array(silos.length);
+    for (let i = 0; i < NS; i++) qs[st[i].idx] = st[i].q;
     return {
       rec,
       arr: rec.map((r) => r.dep),
       arrSilo: rec.map((r) => r.si),
       arrL: rec.map((r) => r.L),
-      h, qs: st.map((s) => s.q), drops, tMainMs: tMainMs || 0,
+      h, qs, drops, tMainMs: tMainMs || 0,
     };
   }
 
@@ -826,13 +834,16 @@
   //   각 틱: 빈 슬롯이 있고 '격추 가능 구간 중'인 폭탄이 있으면 '가장 임박한(구간끝이 이른)' 것부터 격추.
   //   슬롯은 90틱(9s) 점유 후 1개씩 회복.
   //   반환 { runs(전 슬롯 점유·무회복 구간 = 사각창), maxBusy, kills }
-  function stDeadRuns(sams, bombs) {
+  //   ivsFn(bomb) → 그 폭탄의 절대 격추구간 목록 (필요할 때 계산)
+  function stDeadRuns(sams, bombs, ivsFn) {
     const SL = sams.sumLevel, n = bombs.length;
     if (!n || !(SL > 0)) return { runs: [], maxBusy: 0, kills: 0 };
     // 이벤트(진입/이탈) 정렬
+    const ivsCache = new Array(n);
+    for (let b = 0; b < n; b++) ivsCache[b] = ivsFn ? ivsFn(bombs[b]) : (bombs[b].ivs || null);
     const evs = [];
     for (let b = 0; b < n; b++) {
-      const ivs = bombs[b].ivs;
+      const ivs = ivsCache[b];
       if (!ivs) continue;
       for (let k = 0; k < ivs.length; k++) {
         if (ivs[k].e <= ivs[k].s) continue;
@@ -884,7 +895,7 @@
         if (ev.ty === 1) {
           if (curK[ev.b] < 0) {
             curK[ev.b] = ev.k; inPool++;
-            hpush(bombs[ev.b].ivs[ev.k].e, ev.b, ev.k);
+            hpush(ivsCache[ev.b][ev.k].e, ev.b, ev.k);
           }
         } else {
           if (curK[ev.b] === ev.k) { curK[ev.b] = -1; inPool--; }
@@ -899,7 +910,7 @@
           const b = top.b;
           if (dead[b]) continue;
           if (curK[b] !== top.k) continue;
-          if (bombs[b].ivs[top.k].e < t - SIMC.TICK) continue;
+          if (ivsCache[b][top.k].e < t - SIMC.TICK) continue;
           victim = b; break;
         }
         if (victim < 0) break;
@@ -949,28 +960,44 @@
     const cap = Math.min(opt.cap || 20000, 20000);
     const m = (opt.margin === undefined) ? 150 : opt.margin;
 
-    function buildBombs(stream, C2) {
-      // 폭탄별 격추구간 (절대 ms)
-      const out = [];
-      const n2 = stream.rec.length;
+    // 폭탄별 격추구간 — 배열을 매번 새로 만들지 않는다.
+    //   · usePaths: 사일로별 uni(발사 기준 상대 ms)를 그대로 쓰고, 절대 시각은 소비측에서 더한다
+    //     → bombs[]는 {a(도착ms), si(사일로), L(발사ms)}만 (수천 개라도 가볍다)
+    //   · 폴백: 사일로별 직선 구간을 1회 만들어 재사용
+    const fallbackIvs = {};
+    function bombsOf(stream) {
+      const rec = stream.rec, n2 = rec.length;
+      const out = new Array(n2);
       for (let b = 0; b < n2; b++) {
-        const r = stream.rec[b];
+        const r = rec[b];
         const sd = siloData[r.si];
-        const arrT = arrMs(r.dep, usePaths ? sd.P.flightMs : (sd.P ? sd.P.flightMs : silos[r.si].dist * 10));
-        const ivs = [];
-        if (usePaths && sd.uni) {
-          for (let z = 0; z < sd.uni.length; z++) ivs.push({ s: r.L + sd.uni[z].s, e: r.L + sd.uni[z].e });
-        } else {
-          // 경로 모델 불가(좌표·사일로 정보 없음) → 직선 폴백: 도착 전 lead~0.2s 구간
-          ivs.push({ s: arrT - leadFallback, e: arrT - SIMC.END_MS });
-        }
-        out.push({ a: arrT, ivs });
+        const fm = (sd && sd.P) ? sd.P.flightMs : ((silos[r.si] && silos[r.si].dist ? silos[r.si].dist : 300) * 10);
+        out[b] = { a: r.dep * SIMC.TICK + fm, si: r.si, L: r.L };
       }
-      out.sort((a, b) => a.a - b.a);
+      out.sort((x, y) => x.a - y.a);
+      return out;
+    }
+    // 폭탄의 절대 격추구간 목록 (소비측에서 필요할 때만 계산)
+    function ivsOf(bomb) {
+      const sd = siloData[bomb.si];
+      if (usePaths && sd && sd.uni) {
+        const out = new Array(sd.uni.length);
+        for (let z = 0; z < sd.uni.length; z++) out[z] = { s: bomb.L + sd.uni[z].s, e: bomb.L + sd.uni[z].e };
+        return out;
+      }
+      const key = bomb.si;
+      if (!fallbackIvs[key]) fallbackIvs[key] = [{ s: -leadFallback, e: -SIMC.END_MS }];   // 도착 기준 상대
+      const fb = fallbackIvs[key], out = new Array(fb.length);
+      for (let z = 0; z < fb.length; z++) out[z] = { s: bomb.a + fb[z].s, e: bomb.a + fb[z].e };
       return out;
     }
 
-    const mults = opt.mults || [1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.5];
+    // 규모 적응 배수: 큰 타격일수록 1.0~1.6배면 충분 (4.5배까지 보면 계산이 수십 배로 는다)
+    const mults = opt.mults || (SL >= 1500 ? [1.0, 1.4]
+                              : SL >= 600 ? [1.0, 1.3, 1.6]
+                              : [1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.5]);
+    const budgetMs = (opt.budgetMs | 0) || 30;    // 탐색 시간 상한 (프레임 보호)
+    const tStart = Date.now();
     const bonusReq = Math.max(0, opt.bonus | 0);
     const bonusList = [bonusReq];
     if (opt.bonusScan !== false) {
@@ -978,13 +1005,23 @@
       for (let b = bLo; b <= bHi; b += (bHi - bLo > 20 ? 7 : 3)) { if (b !== bonusReq) bonusList.push(b); }
       if (bonusList.length > 1) bonusList.push(bLo);
     }
-    const bonusTrials = Math.max(1, Math.min(bonusList.length, opt.maxBonusTry | 0 || bonusList.length));
+    // 규모 적응: ΣLv가 크면 조합을 줄인다 (계산 시간이 조합 수에 비례).
+    //   작은 규모는 촘촘히(정확), 큰 규모는 거칠게(빠르게) — HUD 반응성 우선.
+    const scaleCap = SL >= 400 ? 1 : (SL >= 200 ? 2 : (SL >= 90 ? 3 : 99));
+    const wantTry = Math.max(1, Math.min(bonusList.length, opt.maxBonusTry | 0 || bonusList.length));
+    const bonusTrials = Math.min(wantTry, scaleCap);
     let anyRuns = false, maxRunLen = 0, bestRunAt = null, anyTubeFail = false, firstC = null;
     let lastMaxBusy = 0, lastKills = 0, lastFired = 0, lastDrops = 0, lastH2Gap = null;
+    let overBudget = false;
     for (let bi = 0; bi < bonusTrials; bi++) {
+      if (Date.now() - tStart > budgetMs) { overBudget = true; break; }
+      // 규모가 크면 후보 배수를 줄인다 (비용 ∝ 후보수 × C)
+      const useMults = (SL >= 200 && mults.length > 3)
+        ? mults.filter((m, i) => i === 0 || i === Math.floor(mults.length / 2) || i === mults.length - 1)
+        : mults;
       const Cs = [], seen = {};
-      for (let i = 0; i < mults.length; i++) {
-        let v = Math.ceil(sams.sumLevel * mults[i]) + bonusList[bi];
+      for (let i = 0; i < useMults.length; i++) {
+        let v = Math.ceil(sams.sumLevel * useMults[i]) + bonusList[bi];
         if (v < 5) v = 5;
         if (v > cap) v = cap;
         if (!seen[v]) { seen[v] = 1; Cs.push(v); }
@@ -992,10 +1029,11 @@
       }
       if (firstC === null) firstC = Cs[0];
       for (let ci = 0; ci < Cs.length; ci++) {
+        if (Date.now() - tStart > budgetMs) { overBudget = true; break; }
         const C = Cs[ci];
         const base = stStream(silos, C, 0, -1);
-        const bombs = buildBombs(base, C);
-        const D = stDeadRuns(sams, bombs);
+        const bombs = bombsOf(base);
+        const D = stDeadRuns(sams, bombs, (bm) => ivsOf(bm));
         lastKills = D.kills; lastFired = bombs.length;
         if (base.drops > 0) lastDrops = base.drops;   // 관 부족 → 서버가 버릴 발수
         for (let ri = 0; ri < D.runs.length; ri++) {
@@ -1017,7 +1055,8 @@
     }
     // 실패 사유: 관이 모자라 발사 자체가 안 되면 'tubes'가 가장 먼저다
     let why;
-    if (lastDrops > 0) why = "tubes";
+    if (overBudget && !anyRuns) why = "timeout";     // 예산 초과(정밀 재시도 필요)
+    else if (lastDrops > 0) why = "tubes";
     else if (anyRuns && maxRunLen >= leadFallback + 2 * m) why = anyTubeFail ? "tubes" : "no-window";
     else if (!anyRuns) why = lastMaxBusy < SL ? "spread" : "no-gap";
     else why = "short-run";
@@ -1043,7 +1082,7 @@
       // FT 범위: H2 도착이 사각창 안에 (도착 = dep*100+flightMs)
       const lo = Math.max(1, Math.floor((run.s - maxFly) / 100) - 1);
       const hi = Math.floor((run.e) / 100) + 1;
-      const hi2 = Math.min(hi, lo + 1200);
+      const hi2 = Math.min(hi, lo + (silos.length > 24 ? 420 : 1200));   // 대규모는 스캔 폭 축소
       // 사일로별 관 회복 포인터 (FT 증가에 따라 전진)
       const qs = base.qs;
       const pIn = new Array(silos.length).fill(0), pOut = new Array(silos.length).fill(0);
@@ -1053,17 +1092,24 @@
         while (pIn[i] < q.length && q[pIn[i]].lt <= lo) { lastLt[i] = q[pIn[i]].lt; pIn[i]++; }
         while (pOut[i] < pIn[i] && q[pOut[i]].shiftAt <= lo) pOut[i]++;
       }
-      for (let FT = lo; FT <= hi2; FT++) {
+      // 사일로를 거리순으로 미리 정렬 → FT마다 '가장 가까운 빈 관'을 앞에서 찾는다.
+      const order = []; for (let i = 0; i < silos.length; i++) order.push(i);
+      order.sort((a, b) => silos[a].dist - silos[b].dist);
+      // FT 스텝 3틱 (300ms) — 수소 창 정렬은 창 단위(1,150ms)라 이 오차는 무해
+      const FT_STEP = (silos.length > 24 ? 3 : 1);
+      for (let FT = lo; FT <= hi2; FT += FT_STEP) {
         let bestSi = -1, bestDist = Infinity, bestDep = 0;
         var lastGap = null;   // H2가 격추되는 지점(진단용)
         stH2LastGap = null;
-        for (let i = 0; i < silos.length; i++) {
+        for (let oi = 0; oi < order.length; oi++) {
+          const i = order[oi];
           const q = qs[i], lv = Math.max(1, silos[i].level | 0);
           while (pIn[i] < q.length && q[pIn[i]].lt <= FT) { lastLt[i] = q[pIn[i]].lt; pIn[i]++; }
           while (pOut[i] < pIn[i] && q[pOut[i]].shiftAt <= FT) pOut[i]++;
           if (pIn[i] - pOut[i] >= lv) continue;              // 빈 관 없음
           const dep = ((lastLt[i] + 1 > FT + 1) ? lastLt[i] + 1 : FT + 1);
-          if (silos[i].dist < bestDist) { bestDist = silos[i].dist; bestSi = i; bestDep = dep; }
+          bestDist = silos[i].dist; bestSi = i; bestDep = dep;
+          break;                                             // 거리순이므로 첫 히트가 최근접
         }
         if (bestSi < 0) continue;
         const sd = siloData[bestSi];
@@ -1155,9 +1201,11 @@
         return Object.assign(sum, { ok: false, why: "no-silo", C: Math.max(5, Math.ceil(ana.sumLevel * 1.25)) });
       }
       const bonus = light ? Math.round((j0 + j1) / 2) : (j0 + Math.round(Math.random() * (j1 - j0)));
+      // 경량(HUD)은 후보 1개·짧은 예산 — 정밀(I 키)은 더 넓게 본다
       const p = stPlan(ana, silos, { cap: CFG.samCap || 20000, margin: 120, bonus, bonusScan: !light,
                                      bonusMin: j0, bonusMax: j1, maxBonusTry: light ? 1 : 6,
-                                     mults: light ? [1.25, 2, 3, 4.5] : undefined,
+                                     mults: light ? [1.25] : undefined,
+                                     budgetMs: light ? 10 : 80,
                                      tx, ty, dirUp: getRocketDirectionUp() });
       let C, plan = null;
       if (p && p.ok) { C = p.C; plan = p; }
@@ -1212,23 +1260,30 @@
   function stSilosNeeded(sams, silos, opt) {
     opt = opt || {};
     if (!silos || !silos.length) return { ok: false };
+    const tStart = Date.now();
+    const totalBudget = (opt.budgetMs | 0) || 45;      // 전체 예산 (수십 회 시뮬 방지)
     let minLv = Infinity;
     for (let i = 0; i < silos.length; i++) if (silos[i].level < minLv) minLv = silos[i].level;
     const lvCap = Math.max(5, Math.min(minLv === Infinity ? 50 : minLv, 50));
-    const lightOpt = { cap: opt.cap || 8000, margin: 150, maxBonusTry: 1, mults: [1.25, 2, 3, 4.5],
-                       tx: opt.tx, ty: opt.ty };
-    for (let mult = 2; mult <= 8; mult *= 2) {
+    const lightOpt = { cap: opt.cap || 8000, margin: 150, maxBonusTry: 1, mults: [1.25],
+                       budgetMs: 12, tx: opt.tx, ty: opt.ty };
+    // 사일로가 많으면 '기수 늘리기' 스캔을 축소 (곱셈 폭발 방지)
+    const spreadMults = silos.length > 24 ? [2] : [2, 4];
+    for (let sm = 0; sm < spreadMults.length; sm++) {
+      if (Date.now() - tStart > totalBudget) return { ok: false, timeout: true };
+      const mult = spreadMults[sm];
       const s2 = [];
       let tubes = 0;
       for (let i = 0; i < silos.length; i++) {
         const lv = Math.min(999, Math.max(5, Math.min(silos[i].level, lvCap)));
         for (let r = 0; r < mult; r++) { s2.push({ dist: silos[i].dist, level: lv, x: silos[i].x, y: silos[i].y }); tubes += lv; }
       }
-      const p = stPlan(sams, s2, lightOpt);
+      const p = stPlan(sams, s2, lightOpt, tStart);
       if (p && p.ok) return { ok: true, mode: "spread", mult, siloN: s2.length, lvEach: lvCap, tubes, C: p.C };
     }
-    const ladder = opt.ladder || [1.5, 2, 3];
+    const ladder = opt.ladder || [1.5, 2];
     for (let i = 0; i < ladder.length; i++) {
+      if (Date.now() - tStart > totalBudget) return { ok: false, timeout: true };
       const s2 = [];
       let tubes = 0;
       for (let j = 0; j < silos.length; j++) {
@@ -1236,7 +1291,7 @@
         s2.push({ dist: silos[j].dist, level: lv, x: silos[j].x, y: silos[j].y });
         tubes += lv;
       }
-      const p = stPlan(sams, s2, lightOpt);
+      const p = stPlan(sams, s2, lightOpt, tStart);
       if (p && p.ok) return { ok: true, mode: "level", lvMult: ladder[i], siloN: s2.length, tubes, C: p.C };
     }
     return { ok: false };
@@ -2427,6 +2482,20 @@
   //    (SAM이 없으면 '방어 없음', 분석 불가면 '—')
   // ═════════════════════════════════════════════
   let hudEl = null, hudTimer = null, hudCache = null, hudCacheAt = 0, hudCacheTile = null;
+  let hudCacheBrief = false;    // 현재 캐시가 '이동 중 요약'인가 (정밀 아님)
+  let hudPreciseTimer = null;   // 디바운스된 정밀 계산 예약
+  // 커서가 멈추면 그 타일을 정밀 계산하도록 예약한다 (중복 예약은 취소)
+  function schedulePrecise(tile) {
+    if (hudPreciseTimer !== null) clearTimeout(hudPreciseTimer);
+    hudPreciseTimer = setTimeout(() => {
+      hudPreciseTimer = null;
+      try {
+        if (computeCursorTile() !== tile) return;   // 그새 커서가 더 움직였으면 생략
+        hudCacheAt = 0; hudCacheTile = null;        // 강제 재계산 유도
+        hudTick();
+      } catch (e) {}
+    }, 380);
+  }
 
   function hudEnsure() {
     if (hudEl) return hudEl;
@@ -2501,12 +2570,31 @@
       if (!CFG.hudHover) return "🎯 —";
       const now = Date.now();
       const tileNow = computeCursorTile();
-      // 커서 타일이 그대로면 재계산하지 않는다 (계획 시뮬은 무겁다).
-      //   같은 타일에 머무는 동안은 이전 결과를 그대로 보여준다.
-      if (hudCache && hudCacheTile === tileNow) return hudCache;
-      // 타일이 바뀌어도 최소 간격(0.6초)을 둔다 (마우스 이동 중 과부하 방지)
-      if (hudCache && now - hudCacheAt < 600) return hudCache;
-      hudCacheAt = now; hudCacheTile = tileNow;
+      if (tileNow === null) { hudCache = "🎯 커서를 영토에"; hudCacheTile = null; return hudCache; }
+      // ── 디바운스: 커서가 '멈춘 뒤'에만 정밀 계산한다 ──
+      //   정밀 계획은 규모에 따라 30~80ms까지 걸릴 수 있어, 커서가 움직이는 동안
+      //   계산하면 프레임이 끊긴다. → 이동 중에는 가벼운 요약만 보여주고,
+      //   멈추고 350ms 뒤에 한 번 정밀 계산한다 (타일별 캐시로 재방문은 즉시).
+      const moving = (now - lastMouseMoveAt) < 350;
+      if (hudCache && hudCacheTile === tileNow) {
+        // 같은 타일 재방문/머무름: 캐시가 유효하면 그대로, 아니면 정밀 갱신
+        if (now - hudCacheAt < 2500 && !(moving && hudCacheBrief)) return hudCache;
+      } else if (moving) {
+        // 이동 중: 가벼운 요약 (SAM 수·ΣLv·방어량) + '계산 중' 안내, 정밀 계산은 예약
+        let brief = null;
+        try {
+          const ana = samDefenders(tileNow);
+          if (ana === null) brief = "🎯 —";
+          else if (ana.n === 0) brief = "🎯 방어 없음 — 원자만";
+          else brief = `🎯 SAM ${ana.n}기 ΣLv${ana.sumLevel} · 계산 중…`;
+        } catch (e) { brief = "🎯 계산 중…"; }
+        hudCache = brief; hudCacheBrief = true; hudCacheTile = tileNow;
+        schedulePrecise(tileNow);   // 커서가 멈추면 이 타일을 정밀 계산
+        return hudCache;
+      } else if (hudCache && now - hudCacheAt < 600) {
+        return hudCache;
+      }
+      hudCacheAt = now; hudCacheTile = tileNow; hudCacheBrief = false;
       const tile = tileNow;
       if (tile === null) { hudCache = "🎯 커서를 영토에"; return hudCache; }
       const a = strikeSummary(tile, true);   // 경량 모드 (가산 스캔 생략)
