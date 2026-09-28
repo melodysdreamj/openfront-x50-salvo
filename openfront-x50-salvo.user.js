@@ -558,15 +558,15 @@
     }
     // 샘플링: 요격은 '목표 150 이내 or 사일로 150 이내'에서만 가능하므로
     //   양 끝 구간을 3배 밀집 샘플링한다 (중간 구간은 요격 불가라 듬성해도 무방).
-    const N = n || 32;
-    const ts = [];
-    for (let i = 0; i <= N; i++) {
-      ts.push(i / N);
-      if (i < N) {                                   // 구간마다 끝쪽에 보조 샘플
-        const a = i / N, b = (i + 1) / N;
-        if (a < 0.30) ts.push(a + (b - a) / 3);
-        else if (a > 0.68) ts.push(a + (b - a) / 3);
-      }
+    // 경로 샘플: 기본 3중(촘촘), 대규모에선 호출부가 n을 낮춘다.
+    //   (요격 경계는 '목표/사일로 150 이내' 구간에서 결정되므로 그쪽만 촘촘하면 충분)
+    const N = n || 48;
+    const ts = [0];
+    for (let i = 0; i < N; i++) {
+      const a = i / N, b = (i + 1) / N;
+      ts.push(a + (b - a) / 3);
+      ts.push(a + (b - a) * 2 / 3);
+      ts.push(b);
     }
     ts.sort((a, b) => a - b);
     const pts = new Array(ts.length);
@@ -586,12 +586,23 @@
   // ── SAM별 '격추 가능 구간' (발사 시각=0 기준 상대 ms) ──
   //   경로점 하나하나에 대해 세 조건을 검사해 만족하는 연속 구간을 뽑는다.
   //   out: { samIndex → [{s,e}] }
+  // ── SAM별 '격추 가능 구간' (발사 시각=0 기준 상대 ms) ──
+  //   게임(SAMLauncherExecution)의 판정을 그대로 옮긴다:
+  //     ① computeInterceptionTile: 경로를 따라가며
+  //        - 그 지점이 요격 가능(targetable: 목표 150 or 사일로 150 이내)
+  //        - SAM 사거리 이내
+  //        - nukeTicks(그 지점까지 남은 핵 비행 틱) >= samTicks(SAM 미사일 도달 틱)
+  //        이면 그 틱에 발사한다 → 교전 성립.
+  //     ② checkDetonationInterception: 마지막 타일(폭발 직전)도 별도로 검사한다
+  //        (경로 끝에서 급격히 가까워지는 경우를 잡기 위함).
+  //   샘플을 촘촘히(경로 전체를 1타일 간격에 가깝게) 훑어 경계를 놓치지 않는다.
   function stEngage(path, sams, sx, sy, tx, ty, out) {
     const pts = path.pts, arc = path.arc, fT = path.flightT, fMs = path.flightMs;
     const R2 = SIMC.TGT_R * SIMC.TGT_R;
     for (let si = 0; si < sams.length; si++) {
       const S = sams[si];
       const r = (S.rng && S.rng > 0) ? S.rng : 150;
+      const r2 = r * r;
       let s0 = -1, e0 = -1, list = null;
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
@@ -600,11 +611,13 @@
         let ok = false;
         if (dT <= R2 || dS <= R2) {                       // 요격 가능 지점 (targetable)
           const ddx = p.x - S.x, ddy = p.y - S.y;
-          if (ddx * ddx + ddy * ddy <= r * r) {           // SAM 사거리 이내
+          if (ddx * ddx + ddy * ddy <= r2) {              // SAM 사거리 이내
             const mdist = Math.abs(ddx) + Math.abs(ddy);
             const samT = Math.ceil(mdist / SIMC.SAM_MSL);
             const nukeT = ((arc - p.cum) / arc) * fT;     // 남은 비행 틱
-            if (nukeT >= samT) ok = true;                 // 미사일이 먼저 도착 가능
+            // 게임과 동일: 핵의 남은 비행이 SAM 미사일 도달보다 길거나 같아야 발사 가능
+            //   (여유 2틱을 둔다 — 폭발 직전엔 판정이 촘촘해 실전 오차를 흡수)
+            if (nukeT >= samT - 2) ok = true;
           }
         }
         if (ok) { if (s0 < 0) s0 = p.cum; e0 = p.cum; }
@@ -615,9 +628,11 @@
         const ivs = [];
         for (let k = 0; k < list.length; k++) {
           const a = (list[k].s / arc) * fMs, b = (list[k].e / arc) * fMs;
-          if (ivs.length && a <= ivs[ivs.length - 1].e + 120) { if (b > ivs[ivs.length - 1].e) ivs[ivs.length - 1].e = b; }
+          if (ivs.length && a <= ivs[ivs.length - 1].e + 200) { if (b > ivs[ivs.length - 1].e) ivs[ivs.length - 1].e = b; }
           else ivs.push({ s: a, e: b });
+          // 마지막 지점까지 계속: 구간을 최소 폭(300ms)으로 보정 — 실전 요격은 순간적
         }
+        for (let k = 0; k < ivs.length; k++) { if (ivs[k].e - ivs[k].s < 300) ivs[k].e = ivs[k].s + 300; }
         out[si] = ivs;
       }
     }
@@ -691,8 +706,9 @@
         const dirUp = getRocketDirectionUp();
         const mapH = simMapH();
         const mask = new Uint8Array(cand.length);
+        const sN2 = silPos.length > 40 ? 16 : (silPos.length > 20 ? 24 : 32);
         for (let pi = 0; pi < silPos.length; pi++) {
-          const P = stPath(silPos[pi].x, silPos[pi].y, tx, ty, dirUp, 32, mapH);
+          const P = stPath(silPos[pi].x, silPos[pi].y, tx, ty, dirUp, sN2, mapH);
           const ivs = stEngage(P, cand, silPos[pi].x, silPos[pi].y, tx, ty, {});
           for (const kk in ivs) mask[kk | 0] = 1;
         }
@@ -946,7 +962,9 @@
       const sy = Number.isFinite(s.y) ? s.y : (ty !== null ? ty : null);
       let P = null, uni = null, nPart = 0;
       if (sx !== null && tx !== null && defs) {
-        P = stPath(sx, sy, tx, ty, dirUp, 32, mapH);
+        // 사일로가 많을수록 샘플을 줄인다 (비용 ∝ 사일로수 × 샘플수)
+        const sN = silos.length > 40 ? 16 : (silos.length > 20 ? 24 : 36);
+        P = stPath(sx, sy, tx, ty, dirUp, sN, mapH);
         const ivs = stEngage(P, defs, sx, sy, tx, ty, {});
         const all = [];
         for (const kk in ivs) { nPart++; const L2 = ivs[kk]; for (let z = 0; z < L2.length; z++) all.push(L2[z]); }
