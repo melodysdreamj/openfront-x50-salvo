@@ -786,54 +786,70 @@
     const cap = Math.min(opt.cap || 20000, 20000);
     const m = (opt.margin === undefined) ? 150 : opt.margin;
     const mults = opt.mults || [1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.5];
-    const Cs = [], seen = {};
-    // bonus: ΣLv 배수 후보에 더할 가산(발) — '랜덤성'을 위해 필요 원자에 얹는 값.
-    //   시뮬레이션을 이 가산이 포함된 총량으로 돌려야 수소 타이밍이 그 총량 기준으로 유지된다.
-    const bonus = Math.max(0, opt.bonus | 0);
-    for (let i = 0; i < mults.length; i++) {
-      let v = Math.ceil(sams.sumLevel * mults[i] / 50) * 50 + bonus;
-      if (v < 50) v = 50;
-      if (v > cap) v = Math.ceil(cap / 50) * 50;
-      if (!seen[v]) { seen[v] = 1; Cs.push(v); }
-      if (v >= cap) break;
+    // bonus: 필요 원자에 얹는 '랜덤 가산'(발). 시뮬은 이 가산이 포함된
+    //   총량으로 돌려야 수소 타이밍이 그 총량 기준으로 유지된다.
+    //   가산이 특정 값에서 사각창/여유관 조건을 못 맞출 수 있으므로
+    //   여러 가산값(요청값 우선 → 5..50 스캔)을 시도한다.
+    const bonusReq = Math.max(0, opt.bonus | 0);
+    const bonusList = [bonusReq];
+    if (opt.bonusScan !== false) {
+      const bLo = Math.max(1, opt.bonusMin | 0 || 5), bHi = Math.max(bLo, opt.bonusMax | 0 || 50);
+      for (let b = bLo; b <= bHi; b += (bHi - bLo > 20 ? 7 : 3)) { if (b !== bonusReq) bonusList.push(b); }
+      if (bonusList.length > 1) bonusList.push(bLo);   // 최소 가산 폴백
     }
-    let anyRuns = false, maxRunLen = 0, bestRunAt = null, anyTubeFail = false;
-    for (let ci = 0; ci < Cs.length; ci++) {
-      const C = Cs[ci];
-      const E = opt.extra || 0;
-      const base = stStream(silos, C, E, -1);
-      const D = stDeadRuns(sams, base.arr, lead, base.arrD);
-      for (let ri = 0; ri < D.runs.length; ri++) {
-        const ln = D.runs[ri].e - D.runs[ri].s;
-        if (ln > maxRunLen) { maxRunLen = ln; bestRunAt = { C: C, run: D.runs[ri] }; }
+    // 후보 생성·탐색을 '가산값'별로 순차 시도한다 (요청 가산 → 스캔 값 순).
+    //   가산이 특정 값에서 조건(사각창·여유관)을 못 맞출 수 있으므로
+    //   실패하면 다음 가산값으로 넘어간다.
+    let anyRuns = false, maxRunLen = 0, bestRunAt = null, anyTubeFail = false, firstC = null;
+    for (let bi = 0; bi < bonusList.length; bi++) {
+      const C0 = Math.max(5, Math.ceil(sams.sumLevel * mults[0]) + bonusList[bi]);
+      const Cs = [], seen = {};
+      for (let i = 0; i < mults.length; i++) {
+        let v = Math.ceil(sams.sumLevel * mults[i]) + bonusList[bi];
+        if (v < 5) v = 5;
+        if (v > cap) v = cap;
+        if (!seen[v]) { seen[v] = 1; Cs.push(v); }
+        if (v >= cap) break;
       }
-      if (!D.runs.length) continue;
-      anyRuns = true;
-      for (let rj = 0; rj < D.runs.length; rj++) {
-        const run = D.runs[rj];
-        if (run.e - run.s < lead + 2 * m) continue;
-        // FT 범위: 수소 도착이 [run.s+lead+m, run.e−m]에 들도록 거리를 반영해 역산
-        let dmin = Infinity, dmax = 0;
-        for (let si = 0; si < silos.length; si++) {
-          if (silos[si].dist < dmin) dmin = silos[si].dist;
-          if (silos[si].dist > dmax) dmax = silos[si].dist;
+      if (firstC === null) firstC = Cs[0];
+      for (let ci = 0; ci < Cs.length; ci++) {
+        const C = Cs[ci];
+        const E = opt.extra || 0;
+        const base = stStream(silos, C, E, -1);
+        const D = stDeadRuns(sams, base.arr, lead, base.arrD);
+        for (let ri = 0; ri < D.runs.length; ri++) {
+          const ln = D.runs[ri].e - D.runs[ri].s;
+          if (ln > maxRunLen) { maxRunLen = ln; bestRunAt = { C: C, run: D.runs[ri] }; }
         }
-        const needLo = run.s + m + lead, needHi = run.e - m;
-        let ftLo = Math.max(1, Math.floor((needLo - dmax * 10) / SIMC.TICK) - 4);
-        let ftHi = Math.ceil((needHi - dmin * 10) / SIMC.TICK) + 2;
-        if (ftHi < ftLo) continue;
-        if (ftHi - ftLo > 3000) ftHi = ftLo + 3000;
-        const hit = stScanHydro(base, silos, run, lead, m, ftLo, ftHi);
-        if (!hit) { anyTubeFail = true; continue; }
-        return { ok: true, C: C, extra: E, FT: hit.FT, F: hit.FT * SIMC.TICK, Dh: hit.Dh,
-                 runS: run.s, runE: run.e,
-                 score: Math.min(hit.Dh - lead - run.s, run.e - hit.Dh),
-                 lead: lead, SL: SL, maxRunLen: maxRunLen, hd: hit.d, drops: base.drops };
+        if (!D.runs.length) continue;
+        anyRuns = true;
+        for (let rj = 0; rj < D.runs.length; rj++) {
+          const run = D.runs[rj];
+          if (run.e - run.s < lead + 2 * m) continue;
+          // FT 범위: 수소 도착이 [run.s+lead+m, run.e−m]에 들도록 거리를 반영해 역산
+          let dmin = Infinity, dmax = 0;
+          for (let si = 0; si < silos.length; si++) {
+            if (silos[si].dist < dmin) dmin = silos[si].dist;
+            if (silos[si].dist > dmax) dmax = silos[si].dist;
+          }
+          const needLo = run.s + m + lead, needHi = run.e - m;
+          let ftLo = Math.max(1, Math.floor((needLo - dmax * 10) / SIMC.TICK) - 4);
+          let ftHi = Math.ceil((needHi - dmin * 10) / SIMC.TICK) + 2;
+          if (ftHi < ftLo) continue;
+          if (ftHi - ftLo > 3000) ftHi = ftLo + 3000;
+          const hit = stScanHydro(base, silos, run, lead, m, ftLo, ftHi);
+          if (!hit) { anyTubeFail = true; continue; }
+          return { ok: true, C: C, extra: E, FT: hit.FT, F: hit.FT * SIMC.TICK, Dh: hit.Dh,
+                   runS: run.s, runE: run.e,
+                   score: Math.min(hit.Dh - lead - run.s, run.e - hit.Dh),
+                   lead: lead, SL: SL, maxRunLen: maxRunLen, hd: hit.d, drops: base.drops,
+                   bonusUsed: bonusList[bi] };
+        }
       }
     }
     const why = !anyRuns ? "no-run"
       : (maxRunLen < lead + 2 * m ? "short-run" : (anyTubeFail ? "tubes" : "no-window"));
-    return { ok: false, why: why, SL: SL, lead: lead, maxRunLen: maxRunLen, bestRunAt: bestRunAt, C: bestRunAt ? bestRunAt.C : Cs[0] };
+    return { ok: false, why: why, SL: SL, lead: lead, maxRunLen: maxRunLen, bestRunAt: bestRunAt, C: firstC || 5 };
   }
 
   // 수소 없는 '원자만' 계획 (사각창 없이도 최소 C 계산 — 수소 미포함 폴백용)
@@ -854,7 +870,7 @@
       const sum = { k: "plan", samN: ana.n, samSL: ana.sumLevel, maxRange: ana.maxRange,
                     jitterMin: j0, jitterMax: j1 };
       if (!silos || !silos.length) {
-        return Object.assign(sum, { ok: false, why: "no-silo", C: Math.max(50, Math.ceil(ana.sumLevel * 1.25 / 50) * 50) });
+        return Object.assign(sum, { ok: false, why: "no-silo", C: Math.max(5, Math.ceil(ana.sumLevel * 1.25)) });
       }
       // 가산 폭을 미리 뽑아 '그 총량으로' 시뮬 → HUD가 실제 발사 총량을 보여준다
       const bonus = j0 + Math.round(Math.random() * (j1 - j0));
@@ -863,7 +879,7 @@
       if (p && p.ok) {
         C = p.C; plan = p;
       } else {
-        C = Math.max(50, Math.ceil((ana.sumLevel * 1.25 + bonus) / 50) * 50);
+        C = Math.max(5, Math.ceil(ana.sumLevel * 1.25 + bonus));
       }
       extra = 0;   // 총량에 이미 가산이 포함됨 (별도 비율 추가 없음)
       // 관 부족 시 '필요 관 수' 추정 (실패 안내용 — 가벼운 사다리만)
@@ -976,8 +992,8 @@
           // ① 랜덤 가산 — '딱 맞는 발수'는 티가 나므로 5~50발을 얹는다.
           const j0 = Math.max(0, CFG.samJitterMin | 0), j1 = Math.max(j0, CFG.samJitterMax | 0);
           const bonus = j0 + Math.round(Math.random() * (j1 - j0));
-          const p = stPlan(ana, silos, { cap: CFG.samCap || 20000, margin: 120, bonus: bonus });
-          const C = (p && p.ok) ? p.C : Math.max(50, Math.ceil((ana.sumLevel * 1.25 + bonus) / 50) * 50);
+          const p = stPlan(ana, silos, { cap: CFG.samCap || 20000, margin: 120, bonus: bonus, bonusMin: j0, bonusMax: j1 });
+          const C = (p && p.ok) ? p.C : Math.max(5, Math.ceil(ana.sumLevel * 1.25 + bonus));
           const fT = (p && p.ok) ? Math.max(1, p.FT) : Math.ceil((Math.ceil(C / 50) / 10) * 11.5) + 8;
           // ③ 후속 산개량 (이번에 뽑아 고정 — 예약 시 사용)
           const a0 = Math.max(0, CFG.samAfterMin | 0), a1 = Math.max(a0, CFG.samAfterMax | 0);
@@ -1304,16 +1320,19 @@
         if (gold !== null && gold < costPerBomb) { salvoClear("💰 골드 소진"); return; }
       }
       const item = salvoQueue[0];
+      // 마지막 인텐트는 남은 양만큼만 보낸다 (50발 단위 강제 없음 → 총량 정확)
+      const amtSent = Math.min(per, item.total - item.sent);
+      if (amtSent <= 0) { salvoQueue.shift(); salvoItemsDone++; continue; }
       try {
-        item.bus.emit(new item.ctor("Atom Bomb", item.tile, getRocketDirectionUp(), per));
+        item.bus.emit(new item.ctor("Atom Bomb", item.tile, getRocketDirectionUp(), amtSent));
         rateUse();                  // 수동 발사와 같은 카운터 공유 (서로 간섭 방지)
       } catch (e) {
         console.warn("[x50] 대량 발사 emit 실패:", e);
         salvoClear("❌ 대량 발사 중단 (emit 실패 — 콘솔 확인)");
         return;
       }
-      item.sent += per;
-      salvoDone += per;
+      item.sent += amtSent;
+      salvoDone += amtSent;
       n++;
       // 첫 원자 인텐트가 나간 순간 = 시뮬레이터의 t=0 → 수소 발사 시각의 기준점.
       // (armedAt이 이미 있으면 건드리지 않는다 — 연타/재개 시 첫 기준 유지)
