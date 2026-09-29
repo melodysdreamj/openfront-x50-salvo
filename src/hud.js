@@ -74,7 +74,7 @@
       refresh=changed?'커서를 멈추면 새 위치를 분석합니다.':p.pending?'재계산 중 · 직전 결과를 표시하고 있습니다.':`${Math.max(0,Math.floor((Date.now()-d.updated)/1000))}초 전 계산 · 현재 상태의 예측`;
       if(changed){model={...model,title:'이전 위치 · '+model.title,tone:'idle',action:'새 위치를 확인한 뒤 I로 분석·발사하세요.'};}
     } else if(p.pending) {model.title='공격 방법을 계산하고 있습니다';model.reason='이 위치에 도달할 수 있는 원자·수소 공격을 비교합니다.';model.action='Esc로 계산을 취소할 수 있습니다.';}
-    if(p.pending?.execute&&!run) {refresh=p.pending.kind==='prices'?'발사 준비 · 가격 확인 중':p.pending.kind==='advice'?'다음 공격에 필요한 조건 확인 중':'발사 전 최신 상태 확인 중 · Esc로 취소';model.action='선택한 목표를 확인 중입니다. 아직 발사하지 않았습니다.';}
+    if(p.pending?.execute&&!run) {refresh=p.pending.kind==='prices'?'발사 준비 · 가격 확인 중':p.pending.kind==='advice'?'다음 공격에 필요한 조건 확인 중':p.pending.kind==='retry'?p.pending.message:p.pending.kind==='search'?`후보 ${p.pending.tested??0}개 검토 · ${Math.floor((Date.now()-p.pending.started)/1000)}초째 계속 계산 중 · Esc 취소`:`최신 상태 검증 중 · ${Math.floor((Date.now()-p.pending.started)/1000)}초 · Esc 취소`;model.action='선택한 목표를 확인 중입니다. 아직 발사하지 않았습니다.';}
     if(p.error&&!run) {
       const loading=/가격.*조회 중/.test(p.error);
       model={...model,title:loading?'무기 가격을 확인하고 있습니다':'지금은 분석할 수 없습니다',tone:loading?'idle':'error',

@@ -8,7 +8,7 @@ test('blocked preview states uncertainty without inventing a minimum silo level 
  assert.doesNotMatch(p.reason,/불가능|부족|레벨/);assert.ok(p.options.every(o=>o.value==='돌파 계획 미확인'));
 });
 test('limited search never claims attack is impossible and warns that I may fire',()=>{
- const p=resultPresentation({...blocked,limited:true});assert.match(p.title,/시간/);assert.match(p.action,/검증되면 발사/);assert.ok(p.options.every(o=>o.value==='시간 내 확인 못함'));
+ const p=resultPresentation({...blocked,limited:true});assert.match(p.title,/미리보기.*확인 못/);assert.match(p.action,/끝까지/);assert.match(p.action,/검증되면 발사/);assert.ok(p.options.every(o=>o.value==='시간 내 확인 못함'));
 });
 test('failure explanation uses observed capacity or weapon restrictions instead of a generic bottleneck',()=>{
  assert.match(resultPresentation({...blocked,ready:0}).reason,/재장전 중/);

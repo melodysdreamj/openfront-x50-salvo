@@ -158,6 +158,113 @@ try {
   assert.equal(await page.evaluate(()=>__x50.planner.state().running),false);
   console.log('Browser: Esc during price lookup blocks the late execution callback.');
   await load();
+  await page.evaluate(()=>{
+    __x50.planner.stop();
+    const Native=window.Worker;
+    window.Worker=class extends Native {
+      postMessage(d,...rest){
+        if(d.options?.continuous){fixture.continuous=true;setTimeout(()=>{try{super.postMessage(d,...rest);}catch{}},7000);}
+        else super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.continuous);
+  await page.waitForTimeout(6300);
+  assert.equal(await page.evaluate(()=>__x50.planner.state().pending),true);
+  assert.equal(await page.evaluate(()=>__x50.planner.state().error),'');
+  assert.equal(await page.evaluate(()=>fixture.sent.length),0);
+  assert.match(await page.locator('.of-refresh').textContent(),/계속 계산 중/);
+  await page.waitForFunction(()=>fixture.sent.length>0,{timeout:10000});
+  await page.keyboard.press('Escape');
+  console.log('Browser: I survives the former 4-second budget and 6-second watchdog; HUD stays responsive.');
+
+  await load();
+  await page.evaluate(()=>{
+    const Native=window.Worker;
+    window.Worker=class extends Native {
+      postMessage(d,...rest){
+        if(d.kind==='assess'){fixture.assessStarted=fixture.game.ticks();setTimeout(()=>{try{super.postMessage(d,...rest);}catch{}},800);}
+        else super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.sent.length>0,{timeout:10000});
+  assert.ok(await page.evaluate(()=>fixture.sent[0].tick-fixture.assessStarted>2));
+  await page.keyboard.press('Escape');
+  console.log('Browser: an unchanged state passes a validation longer than 200ms without stale rejection.');
+
+  await load();
+  await page.evaluate(()=>{
+    fixture.checkedLevels=[];const Native=window.Worker;
+    window.Worker=class extends Native {
+      postMessage(d,...rest){
+        if(d.kind==='assess'){
+          fixture.checkedLevels.push(d.snapshot.sams[0].level);
+          if(fixture.checkedLevels.length===1){fixture.units()[1].level=()=>3;setTimeout(()=>{try{super.postMessage(d,...rest);}catch{}},400);return;}
+        }
+        super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.sent.length>0,{timeout:10000});
+  const checked=await page.evaluate(()=>fixture.checkedLevels);
+  assert.equal(checked[0],1);assert.equal(checked.at(-1),3);assert.ok(checked.length>=2);
+  assert.equal(await page.evaluate(()=>__x50.planner.state().error),'');
+  await page.keyboard.press('Escape');
+  console.log('Browser: SAM upgrade during validation triggers fresh validation/search and fires without a second I.');
+
+  await load();
+  await page.evaluate(()=>{
+    const Native=window.Worker;
+    window.Worker=class extends Native {
+      postMessage(d,...rest){
+        if(d.kind==='assess'){
+          fixture.retryAssess=(fixture.retryAssess??0)+1;
+          if(fixture.retryAssess===1)fixture.units()[1].level=()=>3;
+          setTimeout(()=>{try{super.postMessage(d,...rest);}catch{}},300);return;
+        }
+        super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.retryAssess>=2);
+  await page.keyboard.press('Escape');await page.waitForTimeout(700);
+  assert.equal(await page.evaluate(()=>fixture.sent.length),0);
+  console.log('Browser: Esc during automatic prelaunch revalidation prevents late firing.');
+
+  await load();
+  await page.evaluate(()=>{
+    fixture.adaptiveBudgets=[];const Native=window.Worker;
+    window.Worker=class extends Native {
+      postMessage(d,...rest){
+        if(d.kind==='adapt'){
+          fixture.adaptiveBudgets.push(d.options.budgetMs);
+          if(fixture.adaptiveBudgets.length===1){
+            setTimeout(()=>this.onmessage?.({data:{id:d.id,result:{chosen:null,limited:true,reason:'injected deadline'}}}),100);return;
+          }
+        }
+        super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.units().some(u=>u.type()==='Hydrogen Bomb'));
+  await page.evaluate(()=>{
+    fixture.units()[1].level=()=>3;
+    fixture.units().push(fixture.unit(3,'Missile Silo',550,500,50,fixture.me));
+  });
+  await page.waitForFunction(()=>__x50.planner.state().history?.some(h=>h.decision==='rescue'),{timeout:10000});
+  const budgets=await page.evaluate(()=>fixture.adaptiveBudgets);
+  assert.equal(budgets[0],350);assert.equal(budgets[1],700);
+  assert.equal(await page.evaluate(()=>fixture.sent.filter(e=>e.unit==='Hydrogen Bomb').reduce((n,e)=>n+e.amount,0)),1);
+  await page.keyboard.press('Escape');
+  console.log('Browser: adaptive deadline expands the next budget and rescues without resetting the hydro cap.');
+
+  await load();
   await page.setViewportSize({width:390,height:844});await page.keyboard.press('F8');
   await page.waitForTimeout(250);
   const sizes=await page.evaluate(()=>{const panel=[...document.querySelectorAll('div')].find(e=>e.id==='of-strike-hud');return {width:panel.getBoundingClientRect().width,page:innerWidth,overflow:document.documentElement.scrollWidth};});

@@ -1,6 +1,6 @@
   // Predictive I/HUD integration. The old manual H/J/Z/etc. remain available.
   const plannerSettings = {maxAtoms:2000,maxHydros:1,minAtomHits:1,budgetMs:1800,maxTicks:1200,
-    adaptiveBudgetMs:350,maxReplans:12,details:false};
+    adaptiveBudgetMs:350,maxReplans:Infinity,details:false};
   const plannerState = {worker:null,job:0,pending:null,tile:null,game:null,result:null,
     snapshot:null,display:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
   const plannerPaths=new WeakMap();
@@ -79,10 +79,6 @@
     validateSnapshot(s); return s;
   }
 
-  function plannerFingerprint(s) {
-    return JSON.stringify([s.game,s.me,s.target,s.rules,s.atomCost.toString(),s.hydroCost.toString(),s.allowed,
-      s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building]),s.sams.map(u=>[u.id,u.x,u.y,u.level,u.building,u.upgrade])]);
-  }
   function plannerStop(reason='사용자가 남은 발사를 중단했습니다') {
     plannerCancelJob();
     if(plannerState.timer!==null) clearTimeout(plannerState.timer);
@@ -97,6 +93,23 @@
     if(plannerState.pending) clearTimeout(plannerState.pending.timeout);
     plannerState.pending=null; plannerState.job++;
   }
+  // Long worker jobs may outlive the price cache. Refresh before reading the
+  // latest snapshot, retaining the same cancellation generation across await.
+  async function plannerFreshPrices(id) {
+    const game=getGameView(),me=game?.myPlayer();
+    plannerState.pending={id,execute:true,kind:'prices',timeout:null};
+    try {
+      if(!game||!me)throw Error('게임 정보를 읽을 수 없습니다');
+      await plannerPrices.refresh(game,me,true);
+      if(id!==plannerState.job)return false;
+      plannerState.pending=null;
+      return !document.hidden&&getGameView()===game;
+    }catch(e){
+      if(id===plannerState.job){plannerState.pending=null;plannerState.error=e.message;}
+      return false;
+    }
+  }
+
   function plannerCompute(snapshot,execute=false) {
     if(plannerState.run)return;
     plannerCancelJob();
@@ -110,23 +123,32 @@
     URL.revokeObjectURL(url);plannerState.worker=worker;
     const budgetMs=execute?Math.max(4000,plannerSettings.budgetMs):plannerSettings.budgetMs;
     const fail=message=>{if(id!==plannerState.job)return;plannerCancelJob();plannerState.error=message;plannerState.updated=Date.now();};
-    plannerState.pending={id,execute,timeout:setTimeout(()=>fail('계산 시간이 초과되었습니다. I로 다시 분석하세요'),budgetMs+2000)};
+    plannerState.pending={id,execute,kind:'search',started:Date.now(),tested:0,timeout:execute?null:setTimeout(()=>fail('미리보기 계산이 지연됐습니다. I로 끝까지 분석할 수 있습니다'),budgetMs+2000)};
     worker.onerror=e=>fail('계산 오류: '+e.message);
-    worker.onmessage=event=>{
+    worker.onmessage=async event=>{
       if(id!==plannerState.job)return;
-      const {result,error}=event.data;
+      const {result,error,progress}=event.data;
+      if(progress){Object.assign(plannerState.pending,progress);return;}
       clearTimeout(plannerState.pending.timeout);plannerState.pending=null;
       worker.terminate();plannerState.worker=null;
       if(error){plannerState.error='판정 불가: '+error;plannerState.updated=Date.now();return;}
+      if(execute&&!(await plannerFreshPrices(id)))return;
       if(getGameView()?.gameID()!==snapshot.game || (!execute&&computeCursorTile()!==snapshot.tile)) return;
       plannerState.result=result;plannerState.updated=Date.now();
       plannerState.display={result,snapshot,updated:plannerState.updated};
       if(execute) {
-        if(!result.chosen) {toast(result.reason,'#ffd166');return;}
+        if(!result.chosen) {
+          let fresh;try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
+          if(fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
+          if(preflightKey(fresh)!==preflightKey(snapshot)) {
+            plannerRetry(snapshot,null,'계산 중 상태 변경 · 최신 상태에서 후보를 다시 탐색합니다');return;
+          }
+          toast(result.reason,'#ffd166');return;
+        }
         plannerExecute(snapshot,result);
       }
     };
-    worker.postMessage({id,snapshot:workerSnapshot(snapshot),options:{...plannerSettings,budgetMs,allowNewHydro:plannerSettings.maxHydros>0}});
+    worker.postMessage({id,snapshot:workerSnapshot(snapshot),options:{...plannerSettings,budgetMs,continuous:execute,allowNewHydro:plannerSettings.maxHydros>0}});
   }
 
   function plannerJob(kind,data,budget,done,fail) {
@@ -136,33 +158,52 @@
     try{worker=new Worker(url);}catch(e){URL.revokeObjectURL(url);fail(e.message);return;}
     URL.revokeObjectURL(url);plannerState.worker=worker;
     const failed=message=>{if(id!==plannerState.job)return;plannerCancelJob();fail(message);};
-    plannerState.pending={id,execute:true,kind,timeout:setTimeout(()=>failed('계산 시간 초과'),budget+1500)};
+    plannerState.pending={id,execute:true,kind,started:Date.now(),timeout:Number.isFinite(budget)?setTimeout(()=>failed('계산 시간 초과'),budget+1500):null};
     worker.onerror=e=>failed(e.message);
-    worker.onmessage=e=>{
+    worker.onmessage=async e=>{
       if(id!==plannerState.job)return;
       clearTimeout(plannerState.pending.timeout);plannerState.pending=null;plannerState.worker=null;worker.terminate();
-      if(e.data.error)fail(e.data.error);else done(e.data.result);
+      if(e.data.error){fail(e.data.error);return;}
+      if(kind==='assess'&&!(await plannerFreshPrices(id)))return;
+      done(e.data.result);
     };
     worker.postMessage({id,kind,...data,snapshot:workerSnapshot(data.snapshot)});
+  }
+
+  // Retry the fixed I target without allowing a late response to resurrect an
+  // Esc-cancelled operation. A state change is a revalidation, not a user error.
+  function plannerRetry(snapshot,result,message,delay=100) {
+    plannerCancelJob();const id=plannerState.job;
+    plannerState.pending={id,execute:true,kind:'retry',message,started:Date.now(),timeout:setTimeout(()=>{
+      if(id!==plannerState.job)return;
+      plannerState.pending=null;
+      try {
+        const fresh=plannerSnapshot(snapshot.tile);
+        if(document.hidden||fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
+        if(result)plannerExecute(fresh,result);else plannerCompute(fresh,true);
+      }catch(e){plannerState.error=e.message;}
+    },delay)};
   }
 
   // Freeze limits for the whole operation, including every later revision.
   function plannerExecute(snapshot,result) {
     let fresh;
     try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
-    if(plannerFingerprint(fresh)!==plannerFingerprint(snapshot)) {
-      plannerState.error='계산 중 구조물·규칙이 바뀌었습니다. I로 다시 분석하세요';return;
-    }
-    plannerJob('assess',{snapshot:fresh,plan:result.chosen,options:{minAtomHits:plannerSettings.minAtomHits,budgetMs:2500}},2500,check=>{
-      if(!check.ok){plannerState.error='현재 상태에서 계획이 유효하지 않습니다. I로 다시 분석하세요';return;}
+    if(document.hidden||fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
+    if(result.chosen.actions.some(a=>a.type===HYDRO?fresh.allowed.mixed===false:fresh.allowed.atomic===false)){plannerRetry(snapshot,null,'목표의 발사 제한 변경 · 가능한 공격을 다시 확인합니다');return;}
+    plannerJob('assess',{snapshot:fresh,plan:result.chosen,options:{minAtomHits:plannerSettings.minAtomHits,maxTicks:plannerSettings.maxTicks,budgetMs:Infinity}},Infinity,check=>{
       let current;try{current=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
-      if(current.tick-fresh.tick>2||plannerFingerprint(current)!==plannerFingerprint(fresh)||
-        JSON.stringify(current.silos.map(s=>s.queue))!==JSON.stringify(fresh.silos.map(s=>s.queue))||
-        JSON.stringify(current.sams.map(s=>s.queue))!==JSON.stringify(fresh.sams.map(s=>s.queue))) {
-        plannerState.error='발사 직전 상태가 변했습니다. I로 다시 분석하세요';return;
+      if(document.hidden||current.game!==snapshot.game||current.me!==snapshot.me)return;
+      if(preflightKey(current)!==preflightKey(fresh)) {
+        plannerRetry(snapshot,result,'재장전·SAM·사일로 변경 · 같은 후보를 최신 상태로 재검증합니다');return;
       }
-      const plan=result.chosen,bus=getEventBus(),ctor=findNukeEventCtor();
-      if(current.gold<plan.cost||rateGate()>0){plannerState.error='골드 또는 명령 한도가 부족합니다';return;}
+      if(!check.ok){plannerRetry(snapshot,null,'기존 후보가 방어를 통과하지 못해 다른 수량·순서를 탐색합니다');return;}
+      const plan={...result.chosen,...check.result},bus=getEventBus(),ctor=findNukeEventCtor();
+      if(current.gold<plan.cost){plannerState.error='계획을 실행할 골드가 부족합니다';return;}
+      const rateWait=rateGate();
+      if(rateWait>0||plan.actions.length>current.intentBudget) {
+        plannerRetry(snapshot,result,'명령 한도 회복 대기 · 회복 후 최신 상태로 재검증합니다',1000);return;
+      }
       if(!bus||!ctor){plannerState.error='게임 발사 이벤트를 찾지 못했습니다';return;}
       const ids=new Set(getGameView().units(ATOM,HYDRO).map(u=>u.id()));
       const run={plan,tile:snapshot.tile,game:snapshot.game,me:snapshot.me,rules:JSON.stringify(current.rules),
@@ -230,7 +271,17 @@
     if(run.sent!==run.confirmed){run.phase='waiting-ack';return;}
     if(run.replans>=plannerSettings.maxReplans)return plannerFinish('방어 변화가 반복되어 재계산 한도에 도달했습니다',s,true);
     run.replans++;run.phase='adapting';run.needsReplan=false;
-    const budget=Math.max(50,Math.min(1500,plannerSettings.adaptiveBudgetMs)),lead=Math.ceil(budget/100)+2;
+    const timeLeft=(plannerSettings.maxTicks-(s.tick-run.startedTick)-3)*100;
+    if(timeLeft<50)return plannerFinish('공격 관측 시간 안에 남은 계획을 검증할 시간이 없습니다',s,false);
+    const budget=Math.max(50,Math.min(timeLeft,run.adaptiveBudget??plannerSettings.adaptiveBudgetMs)),lead=Math.ceil(budget/100)+2;
+    const continueComputing=()=>{
+      if(plannerState.run!==run)return;
+      // A timed-out candidate search is unknown, not an impossible attack.
+      // Keep the cumulative weapon caps and observe flights while trying again.
+      run.adaptiveBudget=budget*2;run.replans--;
+      run.phase='waiting-ack';run.needsReplan=true;
+      run.reason='재계산 시간이 더 필요해 계산 시간을 늘려 다시 확인합니다 · 남은 발사 보류';
+    };
     const signature=defenseSignature(s),risk=plannerRisk(s);
     const remaining=remainingPlan(run.plan,run.index,run.baseTick,s.tick,lead);
     plannerJob('adapt',{snapshot:s,request:{remaining,goal:run.goal,atomLimit:run.atomLimit,hydroLimit:run.hydroLimit,
@@ -239,6 +290,7 @@
       let fresh;
       try{fresh=plannerSnapshot(run.tile);plannerObserve(run,fresh);}catch(e){return plannerFinish(e.message,run.current,false);}
       const first=result.chosen?.actions[0];
+      if(result.limited&&!result.chosen){continueComputing();return;}
       if(signature!==defenseSignature(fresh)||risk!==plannerRisk(fresh)||(first&&s.tick+first.tick<=fresh.tick)||fresh.tick-s.tick>lead) {
         run.phase='waiting-ack';run.needsReplan=true;run.reason='계산 중 상태가 바뀌어 다시 검증';return;
       }
@@ -247,8 +299,12 @@
       run.goal=run.plan.goal??(run.plan.hydros?'hydro':'atomic');
       run.phase=run.plan.actions.length?'firing':'observing';run.reason=result.reason;
       run.history.push({tick:fresh.tick,decision:result.decision,atoms:run.plan.atoms,hydros:run.plan.hydros,reason:result.reason});
-      run.needsReplan=false;
-    },message=>{if(plannerState.run===run)plannerFinish('재계산 실패로 남은 발사 중단: '+message,run.current,true);});
+      run.needsReplan=false;run.adaptiveBudget=plannerSettings.adaptiveBudgetMs;
+    },message=>{
+      if(plannerState.run!==run)return;
+      if(message==='계산 시간 초과'){continueComputing();return;}
+      plannerFinish('재계산 실패로 남은 발사 중단: '+message,run.current,true);
+    });
   }
 
   function plannerPump() {

@@ -50,7 +50,7 @@ let cursor=500700;
 const legacy=fs.readFileSync(new URL('../src/legacy.js',import.meta.url),'utf8');
 const ownerFn=legacy.slice(legacy.indexOf('  function isOwnedByMe'),legacy.indexOf('  function getTransform'));
 const browserSource=fs.readFileSync(new URL('../src/browser.js',import.meta.url),'utf8');
-const snapshotFn=browserSource.slice(browserSource.indexOf('  function plannerSnapshot'),browserSource.indexOf('  function plannerFingerprint'));
+const snapshotFn=browserSource.slice(browserSource.indexOf('  function plannerSnapshot'),browserSource.indexOf('  function plannerStop'));
 const reader=createPriceReader(),context=vm.createContext({getGameView:()=>g,ATOM,HYDRO,validateSnapshot,flightProgress,plannerPrices:reader,plannerPaths:new WeakMap(),getRocketDirectionUp:()=>true,RL:{perMinute:150,minWindow:[]},dist2:(a,b)=>(a.x-b.x)**2+(a.y-b.y)**2});
 vm.runInContext(ownerFn+'\n'+snapshotFn+'\nthis.snapshot=plannerSnapshot;',context);
 let checks=0;const check=(label,fn)=>{fn();checks++;console.log('Client boundary: '+label);};

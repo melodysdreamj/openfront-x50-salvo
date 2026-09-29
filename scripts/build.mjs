@@ -6,7 +6,29 @@ const version=JSON.parse(read('package.json')).version;
 const vendor = ['Line','SAMTargeting'].map(n => ts.transpileModule(read('src/vendor/'+n+'.ts'), {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText).join('\n');
 write('src/vendor/engine.mjs', vendor);
 const engine = vendor.replaceAll('export class ', 'class ') + '\n' + ['src/planner.mjs','src/adaptive.mjs'].map(p=>read(p).replace(/^import .*;$/mg,'').replace(/^export /mg,'')).join('\n');
-const worker = engine + '\nself.onmessage = e => { try { const d=e.data; const result=d.kind==="adapt"?adapt(d.snapshot,d.request,d.options):d.kind==="advice"?upgradeAdvice(d.snapshot,d.options):d.kind==="assess"?assess(d.snapshot,d.plan,{...d.options,deadline:performance.now()+(d.options.budgetMs??2500)}):search(d.snapshot,d.options); self.postMessage({id:d.id,result}); } catch(error) { self.postMessage({id:e.data.id,error:error.message}); }};';
+const worker = engine + `
+self.onmessage = e => {
+  const d=e.data;
+  const failed=error=>self.postMessage({id:d.id,error:error.message});
+  try {
+    if(d.options?.continuous) {
+      const steps=searchSteps(d.snapshot,{...d.options,budgetMs:Infinity});
+      const advance=()=>{
+        try {
+          const until=performance.now()+50;let step;
+          do {step=steps.next();if(step.done){self.postMessage({id:d.id,result:step.value});return;}}
+          while(performance.now()<until);
+          self.postMessage({id:d.id,progress:step.value});
+          setTimeout(advance,0);
+        }catch(error){failed(error);}
+      };
+      self.postMessage({id:d.id,progress:{tested:0}});advance();return;
+    }
+    const result=d.kind==="adapt"?adapt(d.snapshot,d.request,d.options):d.kind==="advice"?upgradeAdvice(d.snapshot,d.options):d.kind==="assess"?assess(d.snapshot,d.plan,{...d.options,deadline:performance.now()+(d.options.budgetMs??2500)}):search(d.snapshot,d.options);
+    self.postMessage({id:d.id,result});
+  }catch(error){failed(error);}
+};`;
+
 let base = read('src/legacy.js');
 base = base.replace(/\/\/ @version[^\n]+/, '// @version      '+version);
 base = base.replace(/\/\/ @license[^\n]+/, '// @license      AGPL-3.0-only');

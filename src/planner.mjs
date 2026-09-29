@@ -225,7 +225,15 @@ export function assess(s,plan,options={}) {
   return {ok:true,result:worst};
 }
 
+// A resumable candidate traversal. The worker retains this generator and its
+// geometry cache between slices; the synchronous API keeps identical ordering.
 export function search(s, options={}) {
+  const steps=searchSteps(s,options);
+  let step; do {step=steps.next();} while(!step.done);
+  return step.value;
+}
+
+export function* searchSteps(s, options={}) {
   validateSnapshot(s);
   const began=performance.now(),deadline=began+(options.budgetMs??1800),pathCache=new Map();
   const minHits=Math.max(1,options.minAtomHits??1);
@@ -271,16 +279,19 @@ export function search(s, options={}) {
       for(const up of [s.preferredUp!==false,s.preferredUp===false]) {
         if(fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {
           const p=run({...makePlan(atoms,null,0,up,initial),goal:'atomic'}); if(p) result.atomic=p;
+          yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
         }
         if(!result.mixed&&options.allowHydroGoal!==false&&(committedHydro||s.allowed?.mixed!==false)&&(atoms===0||s.allowed?.atomic!==false)) {
           if(atoms===0&&(fraction!==1||gap!==0))continue;
           if(committedHydro&&fraction===1&&gap===0) {
             const rescue=run({...makePlan(atoms,null,0,up,initial),goal:'hydro'});
             if(rescue)result.mixed=rescue;
+            yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
           }
           if(!result.mixed&&options.allowNewHydro!==false&&s.allowed?.mixed!==false) {
             const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial),goal:'hydro'});
             if(p) result.mixed=p;
+            yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
           }
         }
         if(result.mixed&&result.atomic) break outer;
@@ -315,4 +326,16 @@ export function search(s, options={}) {
   }
   result.elapsedMs=Math.round(performance.now()-began);
   return result;
+}
+
+// Before any launch, the model is invariant under a common translation of time.
+// Compare relative timers, not wall-clock age. This is deliberately exact: a
+// shorter SAM cooldown or progressing range upgrade is NOT assumed harmless.
+// This key is only for prelaunch snapshots, never for committed flying missiles.
+export function preflightKey(s) {
+  const unit=u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.queue.map(t=>t-s.tick),
+    u.upgrade?[u.upgrade.startRange,u.upgrade.targetLevel,u.upgrade.duration,
+      Math.min(u.upgrade.duration,s.tick-u.upgrade.startTick)]:null];
+  return JSON.stringify([s.game,s.me,s.tile,s.target,s.height,s.width,s.rules,s.allowed,
+    s.atomCost.toString(),s.hydroCost.toString(),s.silos.map(unit),s.sams.map(unit)]);
 }

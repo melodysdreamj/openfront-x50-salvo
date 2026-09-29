@@ -7,10 +7,10 @@ export function resultPresentation(r,s={}) {
     reason=r.mode==='mixed'?'원자탄과 수소탄을 섞어 보내는 계획입니다.':'원자탄만 보내는 계획입니다.';
     action='I를 누르면 최신 상태로 확인한 뒤 발사합니다.';
   } else {
-    tone='caution';title=r.limited?'계산 시간이 부족합니다':'돌파 계획을 찾지 못했습니다';
+    tone='caution';title=r.limited?'미리보기에서 아직 확인 못했습니다':'돌파 계획을 찾지 못했습니다';
     reason='발사 수량·순서를 바꿔 시험했지만 통과를 확인하지 못했습니다.';
     action='사일로 레벨·위치와 재장전 상태를 확인하세요.';
-    if(r.limited) {reason='정해진 시간 안에 공격 가능 여부를 확인하지 못했습니다.';action='I를 누르면 더 오래 계산합니다. 검증되면 발사합니다.';}
+    if(r.limited) {reason='화면 갱신용 짧은 계산에서 결론이 나지 않았습니다. 공격 불가 판정은 아닙니다.';action='I를 누르면 후보를 끝까지 검토합니다. 검증되면 발사합니다. Esc로 취소합니다.';}
     else if(!r.silos.length||s.silos?.every(u=>u.building)) {reason='사용할 수 있는 완성된 사일로가 없습니다.';action='사일로를 건설하거나 완공될 때까지 기다리세요.';}
     else if(s.allowed?.atomic===false&&s.allowed?.mixed===false) {reason='게임 규칙상 이 위치에는 핵무기를 발사할 수 없습니다.';action='목표 위치를 바꿔 다시 확인하세요.';}
     else if(s.gold!==undefined&&s.gold<s.atomCost&&s.gold<s.hydroCost) {reason='원자탄이나 수소탄을 살 골드가 부족합니다.';action='골드를 모은 뒤 다시 확인하세요.';}
