@@ -2,7 +2,7 @@
   const plannerSettings = {maxAtoms:2000,maxHydros:1,minAtomHits:1,budgetMs:1800,maxTicks:1200,
     adaptiveBudgetMs:350,maxReplans:12,details:false};
   const plannerState = {worker:null,job:0,pending:null,tile:null,game:null,result:null,
-    snapshot:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
+    snapshot:null,display:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
   const plannerPaths=new WeakMap();
   const plannerPrices=createPriceReader({onUpdate:()=>{plannerState.updated=0;}});
 
@@ -102,6 +102,7 @@
     plannerCancelJob();
     const id=plannerState.job;
     plannerState.error='';plannerState.result=null;plannerState.snapshot=snapshot;
+    if(plannerState.display?.snapshot.game!==snapshot.game)plannerState.display=null;
     plannerState.tile=snapshot.tile;plannerState.game=snapshot.game;
     const blob=new Blob([PLANNER_WORKER_SOURCE],{type:'text/javascript'}), url=URL.createObjectURL(blob);
     let worker;
@@ -119,6 +120,7 @@
       if(error){plannerState.error='판정 불가: '+error;plannerState.updated=Date.now();return;}
       if(getGameView()?.gameID()!==snapshot.game || (!execute&&computeCursorTile()!==snapshot.tile)) return;
       plannerState.result=result;plannerState.updated=Date.now();
+      plannerState.display={result,snapshot,updated:plannerState.updated};
       if(execute) {
         if(!result.chosen) {toast(result.reason,'#ffd166');return;}
         plannerExecute(snapshot,result);
@@ -319,7 +321,7 @@
       plannerCompute(plannerSnapshot(tile),true);
     }).catch(e=>{
       if(id!==plannerState.job)return;
-      plannerState.pending=null;plannerState.error=e.message;toast('무기 가격 확인 실패: '+e.message,'#ffd166');
+      plannerState.pending=null;plannerState.error=e.message;toast('공격 준비 중단 · 표시창의 원인을 확인하세요','#ffd166');
     });
   }
   function plannerKeyGuard(e) {
@@ -336,52 +338,23 @@
   document.addEventListener('visibilitychange',()=>{if(document.hidden){plannerCancelJob();plannerStop('탭을 전환해 계획을 중단했습니다');}});
   window.addEventListener('pagehide',()=>{plannerCancelJob();plannerStop('게임 화면을 떠나 계획을 중단했습니다');});
 
-  function plannerPlanText(label,p,minHits) {
-    if(!p)return label+': 검증된 계획 없음';
-    return `${label}: 원자 ${p.atoms} + 수소 ${p.hydros} → 수소 ${p.hydroHits} / 원자 ${p.atomHits}발 예상\n`+
-      `  ${p.up?'위쪽':'아래쪽'} 궤적 · 비용 ${p.cost.toLocaleString()} · 약 ${(p.lastArrival/10).toFixed(1)}초`;
-  }
-  function hudTargetLine() {
+  // Background refresh never removes the last completed display. The engine
+  // still receives a fresh snapshot and I still independently revalidates it.
+  function plannerRefreshPreview() {
     const p=plannerState,now=Date.now(),tile=computeCursorTile(),g=getGameView();
-    if(p.run) {
-      const run=p.run,phase={firing:'발사 중',adapting:'변화 감지 · 재계산 중',observing:'비행 관측 중','waiting-ack':'발사 반영 대기'}[run.phase];
-      return `${phase} · Esc: 남은 발사 중단\n${run.reason}\n누적 원자 ${run.sentAtoms}/${run.atomLimit} · 수소 ${run.sentHydros}/${run.hydroLimit}\n남은 계획: 원자 ${run.plan.actions.slice(run.index).filter(a=>a.type===ATOM).reduce((n,a)=>n+a.amount,0)} · 수소 ${run.plan.actions.slice(run.index).filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)}\n게임 반영 ${run.confirmed}/${run.sent} · 수정 ${run.replans}회\n도달 확인: 원자 ${run.hitAtoms} · 수소 ${run.hitHydros}\n목표 고정: (${run.current.target.x}, ${run.current.target.y})`;
-    }
-    const report=[p.lastExecution,p.advice].filter(Boolean).join('\n');
-    if(!g?.myPlayer())return '공격 분석 · 게임에서 목표에 커서를 올리세요';
+    if(p.run)return;
+    if(!g?.myPlayer()){p.display=null;p.error='';return;}
     if(!p.pending?.execute&&(tile!==p.tile||g.gameID()!==p.game)) {
+      const differentGame=g.gameID()!==p.game;
       plannerCancelJob();p.tile=tile;p.game=g.gameID();p.result=null;p.error='';p.stableAt=now;p.updated=0;
+      if(differentGame){p.display=null;p.lastExecution='';p.advice=null;}
     }
-    if(!p.pending && !document.hidden && now-p.stableAt>350 && now-p.updated>2500) {
+    if(!p.pending&&!document.hidden&&now-p.stableAt>350&&now-p.updated>2500) {
       try{plannerCompute(plannerSnapshot(tile));}catch(e){p.error=e.message;p.updated=now;}
     }
-    if(p.pending)return `${report?report+'\n':''}${p.pending.kind==='prices'?'무기 가격 확인':p.pending.kind==='advice'?'중단 후 조언':p.pending.execute?'발사 전 검증':'공격 분석'} 중…\n${p.pending.execute?'선택한 목표 고정 · Esc로 취소':'커서를 잠시 멈추면 두 공격 방식을 비교합니다'}`;
-    if(p.error)return [report,'판정 불가 · '+p.error].filter(Boolean).join('\n');
-    const r=p.result;
-    if(!r)return [report,'공격 분석 · 목표에 커서를 잠시 멈추세요'].filter(Boolean).join('\n');
-    const title=r.chosen?(r.mode==='mixed'?'수소 혼합 추천':'원자 집중 추천'):(r.limited?'계산 미완료':'현재 탐색 범위에서 돌파 어려움');
-    const used=r.chosen?.usedSilos.length??0;
-    const lines=[title+' · 현재 상태 기준 예측',
-      `목표: 수소 1발 / 원자 ${r.minAtomHits}발 · 원자 최대 ${r.maxAtoms.toLocaleString()}발 탐색`,
-      `사일로 ${r.silos.length}기 · 준비 ${r.ready}관 · 계획 사용 ${used}기`,
-      `SAM ${r.sams.length}기 검토 · 요격 참여 ${r.chosen?.participating.length??'—'}기`,
-      plannerPlanText('수소 혼합',r.mixed,r.minAtomHits),plannerPlanText('원자 집중',r.atomic,r.minAtomHits)];
-    if(r.reason)lines.push(r.reason);
-    if(r.diagnostics?.length)lines.push(...r.diagnostics);
-    if(r.chosen)lines.push('I: 재검증 후 추천 공격 · Esc: 취소');
-    if(r.limited&&r.chosen)lines.push('시간 제한 내 찾은 계획 · 최적해 보장 없음');
-    lines.push(`비행 중 ${r.existingFlights}발 관측 · 타 미사일의 방어 소모·SAM 파괴 효과 제외`);
-    if(plannerSettings.details) {
-      const usedIds=new Set(r.chosen?.usedSilos??[]),samIds=new Set(r.chosen?.participating??[]);
-      lines.push('사일로 배치 (＊계획 사용)');
-      for(const u of r.silos)lines.push(`${usedIds.has(u.id)?'＊':'·'} (${u.x}, ${u.y}) Lv${u.level} · 준비 ${u.ready}`);
-      lines.push('SAM 배치 (＊요격 참여)');
-      for(const u of r.sams)lines.push(`${samIds.has(u.id)?'＊':'·'} (${u.x}, ${u.y}) Lv${u.level} · 준비 ${u.ready}`);
-    }
-    lines.push('F8: 배치 상세 '+(plannerSettings.details?'접기':'보기'));
-    if(hudEl){hudEl.style.pointerEvents=plannerSettings.details?'auto':'none';hudEl.style.overflowY=plannerSettings.details?'auto':'hidden';}
-    if(report)lines.unshift(report);
-    return lines.join('\n');
+  }
+  function hudTargetLine() {
+    return hudEl?.innerText??'게임 지도에 커서를 잠시 멈추세요.';
   }
   const plannerDebug={settings:plannerSettings,snapshot:()=>plannerSnapshot(computeCursorTile()),
     result:()=>plannerState.result,stop:()=>{plannerCancelJob();plannerStop();},

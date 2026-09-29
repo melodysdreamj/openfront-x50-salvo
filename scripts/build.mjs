@@ -15,12 +15,13 @@ base = base.replace('  "use strict";', '  "use strict";\n'+engine+'\nconst PLANN
 base = base.replace('  function startStrike() {', '  function legacyStartStrike() {');
 base = base.replace('  function hudTargetLine() {', '  function legacyHudTargetLine() {');
 base = base.replace('      if (isTypingTarget(e.target)) return;', '      if (isTypingTarget(e.target)) return;\n      if (plannerKeyGuard(e)) return;');
-base = base.replace('  // ── 디버그용 노출', read('src/prices.mjs').replace(/^export /mg,'')+'\n'+read('src/browser.js')+'\n  // ── 디버그용 노출');
+base = base.replace('  // ── 디버그용 노출', read('src/prices.mjs').replace(/^export /mg,'')+'\n'+read('src/hud.mjs').replace(/^export /mg,'')+'\n'+read('src/hud.js')+'\n'+read('src/browser.js')+'\n  // ── 디버그용 노출');
 base = base.replace('      CFG, setArmed,', '      planner: plannerDebug, CFG, setArmed,');
 base = base.replace('"white-space:pre",', '"white-space:pre-wrap", "overflow-wrap:anywhere", "max-width:min(430px,calc(100vw - 32px))", "max-height:65vh", "overflow:hidden",');
 base = base.replace('"font:600 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace",', '"font:500 14px/1.55 -apple-system,BlinkMacSystemFont,Apple SD Gothic Neo,sans-serif",');
 base = base.replace('"background:rgba(13,17,23,.78)"','"background:rgba(13,17,23,.96)"');
-base = base.replace('      el.textContent = rate + "\\n" + hudTargetLine();','      el.textContent = hudTargetLine() + "\\n" + rate;');
+base = base.replace('      el.textContent = rate + "\\n" + hudTargetLine();','      plannerRenderHud(el, r);');
+base = base.replace('(e) => { lastMouse =', '(e) => { if(hudEl?.contains(e.target))return; lastMouse =');
 base = base.replace('const readyTimer = setInterval', 'const readyTimer = setInterval');
 base = base.replace('✅ 사용 가능 (80%↑)', '요청 한도 여유 (공격 분석과 별개)');
 write('openfront-x50-salvo.user.js', base);

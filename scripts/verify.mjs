@@ -16,6 +16,7 @@ const stages=[
  ['original engine executions',['scripts/verify-upstream.mjs',upstream]],
  ['browser attack flow',['tests/browser.integration.mjs']],
  ['browser upgrade flow',['tests/upgrade.browser.mjs']],
+ ['stable HUD and readable states',['tests/hud.browser.mjs']],
 ];
 for(const [name,args] of stages){
  console.log('\nVerification: '+name);
@@ -23,4 +24,4 @@ for(const [name,args] of stages){
  if(result.error)throw result.error;
  if(result.status!==0)process.exit(result.status??1);
 }
-console.log('\nPASS: all six verification stages. This is not online-server end-to-end certification.');
+console.log('\nPASS: all seven verification stages. This is not online-server end-to-end certification.');

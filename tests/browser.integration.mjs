@@ -160,7 +160,7 @@ try {
   await load();
   await page.setViewportSize({width:390,height:844});await page.keyboard.press('F8');
   await page.waitForTimeout(250);
-  const sizes=await page.evaluate(()=>{const panel=[...document.querySelectorAll('div')].find(e=>e.textContent.includes('수소 혼합 추천'));return {width:panel.getBoundingClientRect().width,page:innerWidth,overflow:document.documentElement.scrollWidth};});
+  const sizes=await page.evaluate(()=>{const panel=[...document.querySelectorAll('div')].find(e=>e.id==='of-strike-hud');return {width:panel.getBoundingClientRect().width,page:innerWidth,overflow:document.documentElement.scrollWidth};});
   assert.ok(sizes.width<=sizes.page-16);assert.ok(sizes.overflow<=sizes.page);
   if(screenshots)await page.screenshot({path:path.join(screenshots,'planner-mobile.png')});
   console.log('Browser: narrow-screen HUD has no horizontal overflow.');
