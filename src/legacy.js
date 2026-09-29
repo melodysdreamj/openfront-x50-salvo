@@ -2419,6 +2419,16 @@
   //   여러 클릭(다중 구조물)이 각자 펌프를 돌려도 합계가 상한을 넘지 않게 한다
   //   → X(+500=10건)를 눌러도 창에 여유가 남아 Z 살포·수소가 굶지 않는다.
   let upSentTimes = [];
+  const upgradeJobs = new Map();
+  let upgradeEpoch = 0, upgradeSelectionPending = false;
+  function cancelUpgrades() {
+    upgradeEpoch++;
+    upgradeSelectionPending=false;
+    for(const job of upgradeJobs.values())job.cancel();
+    upgradeJobs.clear();
+  }
+  window.addEventListener('pagehide',cancelUpgrades);
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelUpgrades();});
   function upRoomNow() {
     const now = Date.now();
     while (upSentTimes.length && now - upSentTimes[0] > 1000) upSentTimes.shift();
@@ -2427,6 +2437,10 @@
   }
 
   function fireUpgrade(unitId, type, row, me, bus, ctor, big) {
+    if(upgradeJobs.has(unitId)) {
+      toast('업그레이드 진행·반영 대기 중 — 같은 구조물 중복 요청을 생략했습니다', '#ffd166');
+      return;
+    }
     const lv0 = unitLevel(unitId, type);
     if (lv0 === null) {
       toast(`⚠️ ${koName(type)} 레벨 확인 실패 — 중단 (게임 로드 후 재시도)`, "#ffaa00");
@@ -2438,6 +2452,7 @@
       return;
     }
     let remaining = target - lv0;
+    if(!Number.isSafeInteger(remaining)||remaining<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');return;}
     let cappedByGold = false;
 
     // 골드 상한 — upgradeCosts[k-1] = k회 연속 업그레이드의 누적 비용
@@ -2456,23 +2471,29 @@
       }
     } catch (e) {}
 
-    const perIntent = Math.min(CFG.amount, 50);   // 서버 스키마 상한
+    const perIntent = 50; // 업그레이드는 원자탄 CFG.amount와 독립: +500 = 정확히 10건
     const t0 = lv0;
     const startedAt = Date.now();
     let sent = 0;
     let timer = null;
+    const game=getGameView(),epoch=upgradeEpoch;
+    const job={cancel(){if(timer!==null)clearTimeout(timer);timer=null;}};
+    upgradeJobs.set(unitId,job);
+    const cleanup=()=>{job.cancel();if(upgradeJobs.get(unitId)===job)upgradeJobs.delete(unitId);};
 
     // 발송이 끝난 뒤 반영을 지켜보고 결과를 알린다 (발사 자체는 이미 끝났다)
     function finish() {
       let tries = 0;
       const wantLv = t0 + sent;
       const report = (nowLv) => {
+        cleanup();
         const gained = (nowLv === null ? t0 : nowLv) - t0;
         const tail = cappedByGold ? " (골드 한도)" : "";
         if (gained > 0) toast(`✅ ${koName(type)} Lv ${t0} → ${nowLv} (+${gained})${tail}`, "#7ee787");
         else toast(`⚠️ ${koName(type)} 반영 없음 — Lv ${t0} 유지 (골드·건설상태 확인)`, "#ffaa00");
       };
       const poll = () => {
+        if(epoch!==upgradeEpoch||getGameView()!==game){cleanup();return;}
         const nowLv = unitLevel(unitId, type);
         if (nowLv !== null && nowLv >= wantLv) { report(nowLv); return; }
         if (++tries >= 25) { report(nowLv); return; }   // 최대 ~5초 대기
@@ -2484,6 +2505,7 @@
     // 창당 몰아쓰기 발송 (서버 초당 한도 10건을 최대 속력으로)
     function pump() {
       timer = null;
+      if(epoch!==upgradeEpoch||getGameView()!==game){cleanup();return;}
       if (sent >= remaining) { finish(); return; }
 
       const now = Date.now();
@@ -2511,7 +2533,7 @@
         const waitMs = Math.max(40, RL.secWindow[0] + 1050 - now);
         if (Date.now() - startedAt > 180000) {
           toast(`⏳ 서버 한도 대기 초과 — 중단 (남은 ${remaining - sent}레벨)`, "#ffaa00");
-          return;
+          cleanup();return;
         }
         const ts = Date.now();
         if (ts - lastBlockToast > 3000) {
@@ -2523,7 +2545,7 @@
       }
 
       // 이번 창 몫: 서버 여유 · 업그레이드 전용 상한 · 남은 양 중 최소
-      const burst = Math.min(room, upRoomNow(), remaining - sent);
+      const burst = Math.min(room, upRoomNow(), RL.perMinute - 5 - RL.minWindow.length, Math.ceil((remaining - sent)/perIntent));
       let n = 0;
       while (n < burst && sent < remaining) {
         const amt = Math.min(perIntent, remaining - sent);
@@ -2535,7 +2557,7 @@
         } catch (e) {
           console.warn("[x50] 업그레이드 emit 실패:", e);
           toast("❌ 업그레이드 발송 실패", "#ff5555");
-          return;
+          cleanup();return;
         }
         sent += amt;
         n++;
@@ -2551,7 +2573,7 @@
       finish();
     }
 
-    toast(`🚀 ${koName(type)} +${remaining} 요청 (Lv ${t0} → ${t0 + remaining})${cappedByGold ? " — 골드 한도" : ""}`, "#ffd166");
+    toast(`🚀 ${koName(type)} +${remaining} · ${Math.ceil(remaining/perIntent)}건 요청 (Lv ${t0} → ${t0 + remaining})${cappedByGold ? " — 골드 한도" : ""}`, "#ffd166");
     pump();
   }
 
@@ -2702,6 +2724,13 @@
   }
 
   function requestUpgrade(big) {
+    if(upgradeSelectionPending)return;
+    upgradeSelectionPending=true;
+    const epoch=upgradeEpoch;
+    selectUpgrade(big,epoch).catch(e=>{console.warn('[x50] 업그레이드 대상 확인 실패',e);})
+      .finally(()=>{if(epoch===upgradeEpoch)upgradeSelectionPending=false;});
+  }
+  async function selectUpgrade(big,epoch) {
     const game = getGameView();
     const bus = getEventBus();
     if (!game || !bus) { toast("❌ 게임 시작 후 사용하세요", "#ff5555"); return; }
@@ -2733,7 +2762,10 @@
 
     if (!p || typeof p.then !== "function") { direct(); return; }
 
-    p.then((res) => {
+    let res;
+    try{res=await p;}catch{if(epoch===upgradeEpoch&&getGameView()===game)direct();return;}
+    if(epoch!==upgradeEpoch||getGameView()!==game)return;
+    {
       const arr = Array.isArray(res) ? res : (res && res.buildableUnits) || [];
       // canUpgrade가 살아있는 행들 중 클릭 지점에서 가장 가까운 구조물 선택
       let bestId = null, bestType = null, bestRow = null, bestD = Infinity;
@@ -2777,7 +2809,7 @@
       const dp = nearestOwn(game, me, tile, ["Defense Post"], maxDist);
       if (dp) { toast("ℹ️ 디펜스 포스트는 업그레이드할 수 없습니다", "#ffaa00"); return; }
       toast(`❌ 반경 ${maxDist}타일 내 업그레이드 가능한 내 구조물 없음`, "#ffaa00");
-    }).catch(() => { try { direct(); } catch (e) {} });
+    }
   }
 
   // ── 무장 상태 클릭 가로채기 (캡처 단계 → 게임보다 먼저) ──
@@ -2850,7 +2882,11 @@
   window.addEventListener(
     "keydown",
     (e) => {
+      if(e.code==='Escape'){cancelUpgrades();if(armed)setArmed(false);}
       if (isTypingTarget(e.target)) return;
+      if(e.repeat&&[CFG.hotkeyUpgrade,CFG.hotkeyUpgradeBig,CFG.hotkeyWarship].includes(e.code)) {
+        e.preventDefault();e.stopPropagation();return;
+      }
 
       // ── 반복 입력 처리 ──
       // 키를 누르고 있으면 OS auto-repeat(초당 ~30회)이 들어온다.
@@ -3232,7 +3268,7 @@
   // ── 디버그용 노출 (F12 콘솔: __x50) ──
   try {
     window.__x50 = {
-      CFG, setArmed, requestUpgrade, requestWarships, rateGate, rateDelayFor, rateUse, RL,
+      CFG, setArmed, requestUpgrade, cancelUpgrades, requestWarships, rateGate, rateDelayFor, rateUse, RL,
       fireAtoms, fireHydro, fireMax, fireMirv, startSalvo, salvoStop,
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
       samsNear, simpleShots, simpleVerdict, verdictText,

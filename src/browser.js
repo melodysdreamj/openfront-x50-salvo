@@ -299,7 +299,7 @@
   function startStrike() {
     if(plannerState.run){toast('계획 실행 중입니다. Esc로 남은 발사를 중단할 수 있습니다','#ffd166');return;}
     if(plannerState.pending?.execute){toast('선택한 위치의 발사 계획을 검증 중입니다. Esc로 취소할 수 있습니다','#ffd166');return;}
-    if(salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
+    if(upgradeJobs.size||upgradeSelectionPending||salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
     try{plannerCompute(plannerSnapshot(computeCursorTile()),true);}catch(e){plannerState.error=e.message;toast(e.message,'#ffd166');}
   }
   function plannerKeyGuard(e) {
