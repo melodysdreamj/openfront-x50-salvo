@@ -1243,10 +1243,11 @@
       //   (경량 HUD는 대표값, I 키는 무작위 — 어느 쪽이든 max 규칙은 stPlan이 적용)
       const bonus = j0 + Math.round(Math.random() * (j1 - j0));
       // 경량(HUD)은 후보 1개·짧은 예산 — 정밀(I 키)은 더 넓게 본다
+      // 경량(HUD)도 배수를 3개 보고 예산 18ms — 표시값이 실제와 크게 어긋나지 않게.
       const p = stPlan(ana, silos, { cap: CFG.samCap || 20000, margin: 120, bonus, bonusScan: !light,
                                      bonusMin: j0, bonusMax: j1, maxBonusTry: light ? 1 : 6,
-                                     mults: light ? [1.25] : undefined,
-                                     budgetMs: light ? 10 : 80,
+                                     mults: light ? [1.0, 1.25, 1.6] : undefined,
+                                     budgetMs: light ? 18 : 80,
                                      tx, ty, dirUp: getRocketDirectionUp() });
       let C, plan = null;
       if (p && p.ok) { C = p.C; plan = p; }
@@ -2689,12 +2690,23 @@
       hudCacheAt = now; hudCacheTile = tileNow; hudCacheBrief = false;
       const tile = tileNow;
       if (tile === null) { hudCache = "🎯 커서를 영토에"; return hudCache; }
-      const a = strikeSummary(tile, true);   // 경량 모드 (가산 스캔 생략)
+      // HUD도 '정밀에 가깝게' — 표시값이 실제 발사량과 어긋나면 오해를 준다.
+      //   경량 모드는 배수 1개라 큰 규모에서 필요량을 과대(1.25배) 표시했다.
+      //   예산은 짧게(18ms) 유지해 프레임 보호.
+      const a = strikeSummary(tile, true);   // light=true (내부에서 예산 관리)
       if (a.k === "na") { hudCache = "🎯 —"; return hudCache; }
       if (a.k === "no-sam") { hudCache = "🎯 방어 없음 — I=수소 1발"; return hudCache; }
       if (a.k !== "plan") { hudCache = "🎯 —"; return hudCache; }
-      const jt = (a.jitterMin !== undefined && a.jitterMax !== undefined) ? `+${a.jitterMin}~${a.jitterMax}` : "";
-      let l1 = `🎯 SAM ${a.samN}기 ΣLv${a.samSL} · 필요 ☢ ${a.C.toLocaleString()}발${jt ? " +랜덤" + jt : ""}`;
+      const jt = (a.jitterMin !== undefined && a.jitterMax !== undefined) ? `${a.jitterMin}~${a.jitterMax}` : "";
+      // 여유분 표기: max(필요×10%, 랜덤 5~50) — '날아가는 동안 SAM 증원' 대비
+      let l1;
+      if (a.atomNeed !== null && a.atomNeed !== undefined && a.atomReserve !== null && a.atomReserve !== undefined) {
+        const pctPart = (a.reservePct || 0) > 0 ? Math.ceil(a.atomNeed * a.reservePct / 100) : 0;
+        const how = (pctPart > 0 && a.atomReserve === pctPart) ? `${a.reservePct}%` : (jt ? `랜덤${jt}` : "여유");
+        l1 = `🎯 SAM ${a.samN}기 ΣLv${a.samSL} · 필요 ☢ ${a.atomNeed.toLocaleString()}발 +여유 ${a.atomReserve}(${how}) = ${a.C.toLocaleString()}`;
+      } else {
+        l1 = `🎯 SAM ${a.samN}기 ΣLv${a.samSL} · 필요 ☢ ${a.C.toLocaleString()}발${jt ? " +여유 " + jt : ""}`;
+      }
       const af = (CFG.samAfterMin | 0) + (CFG.samAfterMax | 0) + (CFG.samAfterHydroMin | 0) + (CFG.samAfterHydroMax | 0) > 0
         ? ` +후속 ☢${CFG.samAfterMin}~${CFG.samAfterMax} 💧${CFG.samAfterHydroMin}~${CFG.samAfterHydroMax}` : "";
       // 🏭 사일로: 필요(실패 시 추정) vs 보유
