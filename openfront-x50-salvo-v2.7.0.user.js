@@ -55,8 +55,12 @@
     //   게임 리뷰에서 부정 사용으로 보이지 않도록 발수·순서·간격에 무작위성을 준다.
     //   ① 필요 원자에 가산하는 랜덤 폭 (이 총량으로 시뮬 → 수소 타이밍 유지)
     //   ② 수소 발사 후 후속 산개: 원자 수십발 + 수소 몇발 (간격도 랜덤)
-    samJitterMin: 5,        // ① 가산 하한 (발)
+    samJitterMin: 5,        // ① 가산 하한 (발) — 랜덤 성분
     samJitterMax: 50,       // ① 가산 상한 (발)
+    //   ①-2 여유율 — '날아가는 동안 적이 SAM을 증원(건설·업그레이드)할 가능성' 대비.
+    //        여유분 = max(필요량 × 이 %, 랜덤 5~50발)  → 둘 중 큰 쪽을 쓴다.
+    //        (작은 규모에선 랜덤이, 큰 규모에선 10%가 지배한다)
+    samReservePct: 10,
     samAfterMin: 20,        // ② 후속 원자 하한 (수십발)
     samAfterMax: 90,        // ② 후속 원자 상한 (수십발)
     samAfterHydroMin: 1,    // ② 후속 수소 하한 (몇발)
@@ -1043,18 +1047,26 @@
       const useMults = (SL >= 200 && mults.length > 3)
         ? mults.filter((m, i) => i === 0 || i === Math.floor(mults.length / 2) || i === mults.length - 1)
         : mults;
-      const Cs = [], seen = {};
+      // C = 필요량 + 여유분,  여유분 = max(필요량의 reservePct%, 랜덤 발수)
+      //   · 10%  : 날아가는 동안 적이 SAM을 증원할 가능성 대비 (큰 규모에서 지배)
+      //   · 랜덤 : '딱 맞는 발수'는 자동화 티 → 발수에 무작위성 부여 (작은 규모에서 지배)
+      const rp = Math.max(0, opt.reservePct === undefined ? (CFG.samReservePct | 0) : (opt.reservePct | 0));
+      const Cs = [], seen = {}, resv = {};
       for (let i = 0; i < useMults.length; i++) {
-        let v = Math.ceil(sams.sumLevel * useMults[i]) + bonusList[bi];
+        const need = Math.max(1, Math.ceil(sams.sumLevel * useMults[i]));
+        const pctPart = Math.ceil(need * rp / 100);
+        const reserve = Math.max(pctPart, bonusList[bi]);
+        let v = need + reserve;
         if (v < 5) v = 5;
         if (v > cap) v = cap;
-        if (!seen[v]) { seen[v] = 1; Cs.push(v); }
+        if (!seen[v]) { seen[v] = 1; Cs.push(v); resv[v] = reserve; }
         if (v >= cap) break;
       }
       if (firstC === null) firstC = Cs[0];
       for (let ci = 0; ci < Cs.length; ci++) {
         if (Date.now() - tStart > budgetMs) { overBudget = true; break; }
         const C = Cs[ci];
+        const reserveUse = (resv[C] !== undefined) ? resv[C] : bonusList[bi];
         const base = stStream(silos, C, 0, -1);
         const bombs = bombsOf(base);
         const D = stDeadRuns(sams, bombs, (bm) => ivsOf(bm));
@@ -1072,7 +1084,8 @@
         if (!h2) { anyTubeFail = true; if (stH2LastGap) lastH2Gap = stH2LastGap; continue; }
         return { ok: true, C, extra: 0, FT: h2.FT, F: h2.FT * SIMC.TICK, Dh: h2.arr,
                  runS: h2.run.s, runE: h2.run.e, score: h2.score, lead: leadFallback, SL,
-                 maxRunLen, hd: h2.dist, drops: base.drops, bonusUsed: bonusList[bi],
+                 atomReserve: reserveUse, atomNeed: C - reserveUse, reservePct: rp,
+                 maxRunLen, hd: h2.dist, drops: base.drops, bonusUsed: reserveUse,
                  kills: D.kills, fired: bombs.length, passed: bombs.length - D.kills,
                  siloUsed: h2.si, h2Ivs: h2.ivs, usePaths };
       }
@@ -1226,7 +1239,9 @@
       if (!silos || !silos.length) {
         return Object.assign(sum, { ok: false, why: "no-silo", C: Math.max(5, Math.ceil(ana.sumLevel * 1.25)) });
       }
-      const bonus = light ? Math.round((j0 + j1) / 2) : (j0 + Math.round(Math.random() * (j1 - j0)));
+      // 여유분 = max(필요량×pct%, 랜덤 발수) — 시뮬레이터가 need에 대해 다시 계산한다.
+      //   (경량 HUD는 대표값, I 키는 무작위 — 어느 쪽이든 max 규칙은 stPlan이 적용)
+      const bonus = j0 + Math.round(Math.random() * (j1 - j0));
       // 경량(HUD)은 후보 1개·짧은 예산 — 정밀(I 키)은 더 넓게 본다
       const p = stPlan(ana, silos, { cap: CFG.samCap || 20000, margin: 120, bonus, bonusScan: !light,
                                      bonusMin: j0, bonusMax: j1, maxBonusTry: light ? 1 : 6,
@@ -1262,6 +1277,9 @@
       return Object.assign(sum, {
         ok: !!(p && p.ok), why: plan ? null : (p ? p.why : "sim"),
         C, plan, bonus,
+        atomNeed: plan ? plan.atomNeed : null,       // 수소 사각창에 필요한 최소 원자수
+        atomReserve: plan ? plan.atomReserve : null, // 여유분 (max(10%, 랜덤))
+        reservePct: plan ? plan.reservePct : null,
         tubesOwned, siloN, ready, maxSiloLv,
         goldNeed: need, goldOk,
         need: nd,
@@ -1384,10 +1402,13 @@
           const bonus = j0 + Math.round(Math.random() * (j1 - j0));
           let tx2 = null, ty2 = null;
           try { const g2 = getGameView(); if (g2 && typeof g2.x === "function") { tx2 = g2.x(tile); ty2 = g2.y(tile); } } catch (e) {}
+          const rp0 = Math.max(0, CFG.samReservePct | 0);
           const p = stPlan(ana, silos, { cap: CFG.samCap || 20000, margin: 120, bonus: bonus,
-                                          bonusMin: j0, bonusMax: j1, tx: tx2, ty: ty2,
+                                          bonusMin: j0, bonusMax: j1, reservePct: rp0, tx: tx2, ty: ty2,
                                           dirUp: getRocketDirectionUp() });
-          const C = (p && p.ok) ? p.C : Math.max(5, Math.ceil(ana.sumLevel * 1.25 + bonus));
+          // 폴백(시뮬 실패): 필요량 + max(10%, 랜덤)
+          const needF = Math.ceil(ana.sumLevel * 1.25);
+          const C = (p && p.ok) ? p.C : Math.max(5, needF + Math.max(Math.ceil(needF * rp0 / 100), bonus));
           const fT = (p && p.ok) ? Math.max(1, p.FT) : Math.ceil((Math.ceil(C / 50) / 10) * 11.5) + 8;
           // ③ 후속 산개량 (이번에 뽑아 고정 — 예약 시 사용)
           const a0 = Math.max(0, CFG.samAfterMin | 0), a1 = Math.max(a0, CFG.samAfterMax | 0);
@@ -1399,6 +1420,9 @@
           plan0 = {
             ok: !!(p && p.ok), why: (p && p.ok) ? null : (p ? p.why : "sim"),
             C: C, bonus: bonus, fireTick: fT,
+            atomNeed: (p && p.ok) ? p.atomNeed : null,
+            atomReserve: (p && p.ok) ? p.atomReserve : null,
+            reservePct: (p && p.ok) ? p.reservePct : null,
             Dh: (p && p.ok) ? p.Dh : null, sumLevel: ana.sumLevel, n: ana.n,
             drops: (p && p.ok) ? p.drops : null, maxRunLen: p ? p.maxRunLen : null,
             kills: p ? p.kills : null, fired: p ? p.fired : null, passed: p ? p.passed : null,
@@ -1444,7 +1468,11 @@
       const pathTxt = plan0.nPath > 0 ? ` · 경로상 SAM ${plan0.nPath}기 포함` : "";
       const aft = (plan0.afterAtoms | 0) + (plan0.afterHydros | 0) > 0
         ? ` → 수소 1발 → 원자 ${plan0.afterAtoms}·수소 ${plan0.afterHydros}발 산개` : "";
-      toast(`🎯 수소타격 — 원자 ${plan0.C.toLocaleString()}발(필요+랜덤 ${plan0.bonus})${aft} (${how}${waste}${killTxt}${pathTxt})`, "#7ee787");
+      const _n = plan0.atomNeed, _r = plan0.atomReserve, _p = plan0.reservePct;
+      const needTxt = (_n !== null && _n !== undefined && _r !== null && _r !== undefined)
+        ? `(필요 ${_n.toLocaleString()}+여유 ${_r}${(_p && _r === Math.ceil(_n * _p / 100)) ? `=${_p}%` : ""})`
+        : `(필요+여유 ${plan0.bonus})`;
+      toast(`🎯 수소타격 — 원자 ${plan0.C.toLocaleString()}발${needTxt}${aft} (${how}${waste}${killTxt}${pathTxt})`, "#7ee787");
     }
 
     if (!idle) {
