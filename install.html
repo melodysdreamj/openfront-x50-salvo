@@ -52,7 +52,8 @@
 <body>
 <div class="wrap">
   <h1>OpenFront x50 스크립트 설치</h1>
-  <p class="sub">v2.7.0 · <b>I: 수소타격 한큐 — 목표를 커버하는 모든 SAM을 분석해 필요 원자+랜덤 5~50발을 쏘고, 사각창에 수소 1발을 꽂은 뒤 원자 수십발·수소 몇발을 랜덤 간격으로 산개 — 발사 전 궤적·SAM 충전·방어량을 전부 계산해 <b>첫 수소가 들어갈 때만 발동</b></b> · <b>Z: 1,000발 살포</b> (연타 = 대기열) · 화면 모서리 HUD: 서버 리밋 해제 카운트다운(80%) + 커서 타깃 필요 원자·비용·사일로 상시 표시 &nbsp;+&nbsp; 원자 50발 / xMax / 수소 / MIRV &nbsp;+&nbsp; 구조물 <b>+50</b> (V) / <b>+500</b> (X) 업그레이드<br>사설·연습 로비 전용</p>
+  <p class="sub">v4.0.0 · 커서 위치의 <b>수소 혼합 / 원자 집중</b> 공격을 비교합니다.<br>
+  <b>I</b>: 선택한 위치를 재검증한 후 추천 계획 실행 · <b>Esc</b>: 남은 발사 취소 · <b>F8</b>: 사일로·SAM 배치 상세<br>사설·연습 로비용. 표시 결과는 현재 상태를 바탕으로 한 예측입니다.</p>
 
   <ol>
     <li>
@@ -66,15 +67,21 @@
     <li>
       <b>스크립트 설치</b>
       <p>Tampermonkey가 설치된 <b>뒤에</b> 아래 버튼을 누르면 Tampermonkey 설치 화면이 뜹니다 → <b>설치</b> 클릭.</p>
-      <a class="btn" href="/openfront-x50-salvo-v3.0.1.user.js">스크립트 설치 (Tampermonkey)</a>
-      <a class="btn ghost" href="/openfront-x50-salvo-v3.0.1.user.js?dl=1">파일로 다운로드</a>
+      <a class="btn" href="./openfront-x50-salvo-v4.0.0.user.js">스크립트 설치 (Tampermonkey)</a>
+      <a class="btn ghost" href="./openfront-x50-salvo-v4.0.0.user.js?dl=1">파일로 다운로드</a>
       <p class="warn">Tampermonkey 없이 이 버튼을 누르면 코드가 텍스트로 보이기만 합니다. 순서를 지켜주세요.</p>
     </li>
 
     <li>
       <b>확인</b>
-      <p>openfront.io 에 접속 → <code>F12</code> → 콘솔에 <code>[x50] 준비 완료</code> 가 뜨면 성공.<br>
-      게임에서 <b>V</b> 한 번 → 무장 유지 → 구조물을 <b>계속 클릭</b> (클릭마다 +50 누적, <b>사일로는 +30</b>)<br><b>X</b> → 같은 방식으로 <b>+500</b>씩 (사일로는 +300) — <b>클릭하면 즉시</b>(서버 초당 한도인 500레벨을 한 번에 요청, 1초대). 해제는 X/Esc<br><b>N</b> 누르고 바다 클릭 → <b>군함 10척</b> 한 번에 건조 (항구 필요)<br><b>M</b> → 커서 위치에 <b>MIRV</b> (탄두 최대 350발, 영토에만) — 누르고 있으면 연사<br><b>I</b> → <b>수소타격 한큐</b>: 목표를 커버하는 적 SAM(사거리·레벨)을 전부 분석해 <b>필요 원자만큼 전량 발사 → 회복 사각창에 수소 1발 → 3~5% 추가 벌크</b>를 한 번에. SAM이 없으면 일반 살포와 동일. (화면 모서리 HUD가 필요 원자·비용·사일로를 상시 표시)<br><b>Z</b> → 커서 위치에 <b>원자폭탄 1,000발</b>을 서버 최대 속력(초당 500발)으로 살포 (약 1.2초). <b>연달아 누르면</b> 누른 위치별로 대기열에 쌓여 <b>끊김 없이</b> 이어서 나감 (5곳 연타 = 5,000발 연속). <b>자동 중단</b>: 골드 소진·발사관 소진 시 낭비 없이 멈춤 (Esc로 수동 중단도 가능). 서버 분당 한도 도달 시 남은 초만큼 대기 후 자동 재개<br>키를 누르고 있으면 서버 감당 속도로 자동 반복 발사 (H/G/J/M) / <b>H</b> 원자 50발 / <b>G</b> xMax / <b>J</b> 수소 1발 / <b>M</b> MIRV (탄두 350발)</p>
+      <p>기존 스크립트를 v4.0.0으로 교체하고 게임 탭을 새로고침하세요. 여러 버전을 동시에 켜지 마세요.<br>
+      커서를 목표에 멈추면 화면 모서리에 두 공격 방식, 예상 명중 수, 비용과 방향이 표시됩니다.<br>
+      <b>I</b>를 한 번 누르면 해당 위치를 고정하여 다시 검증하고 추천 계획을 실행합니다. 수소 혼합이 검증되면 우선 선택하고, 그렇지 않으면 검증된 원자 집중 계획을 사용합니다.<br>
+      <b>Esc</b>는 계산과 남은 발사를 취소합니다. 이미 발사한 미사일은 취소되지 않습니다.<br>
+      <b>F8</b>로 사일로와 SAM의 좌표·레벨·준비 수량을 확인합니다. 상세가 길면 표시창 안에서 스크롤하세요.<br>
+      상태를 읽지 못하거나 계획이 없으면 발사하지 않습니다. 구조물 변경·예정 시각 누락·자원 부족 시에도 남은 발사를 중단합니다.<br>
+      기본 목표는 수소 1발 또는 원자 1발 명중, 원자 최대 2,000발 탐색입니다. 계산 미완료는 불가능 판정이 아닙니다.<br>
+      기존 수동 기능 H / G / J / M / Z / V / X / N은 유지됩니다. 추천 계획 실행 중에는 다른 단축키 공격이 차단됩니다.</p>
     </li>
   </ol>
 
@@ -85,17 +92,14 @@
     <p class="warn">탭을 새로고침하면 다시 붙여넣어야 합니다. 계속 쓰려면 Tampermonkey 설치를 권장합니다.</p>
   </details>
 
-  <div class="note">
-    설치가 끝나면 이 페이지와 로컬 서버는 더 이상 필요하지 않습니다.<br>
-    파일 경로: <code>~/Documents/OpenFront/openfront-x50-salvo-v3.0.1.user.js</code>
-  </div>
+  <div class="note">예측은 적의 추가 건설·다른 플레이어의 명령·통신 지연을 보장하지 않습니다. 다른 미사일의 SAM 소모와 폭발로 인한 SAM 파괴는 성공 조건에 포함하지 않는 보수적인 계산입니다.<br><a href="./README.md">설명·설정·검증 범위 보기</a></div>
 </div>
 
 <script>
 document.getElementById('cp').addEventListener('click', async () => {
   const msg = document.getElementById('cpmsg');
   try {
-    const r = await fetch('/openfront-x50-salvo-v3.0.1.user.js');
+    const r = await fetch('./openfront-x50-salvo-v4.0.0.user.js');
     const t = await r.text();
     await navigator.clipboard.writeText(t);
     msg.textContent = ' 복사됨 (' + t.length.toLocaleString() + '자) — 콘솔에 붙여넣으세요';

@@ -1,0 +1,19 @@
+{
+  "name": "openfront-predictive-strike",
+  "private": true,
+  "version": "4.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs && node --test tests/*.test.mjs",
+    "test:browser": "node scripts/build.mjs && node tests/browser.integration.mjs",
+    "test:upstream": "node scripts/verify-upstream.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1",
+    "typescript": "5.9.3"
+  }
+}
