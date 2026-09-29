@@ -275,10 +275,15 @@
       if (!game || !tf) return null;
       const w = tf.screenToWorldCoordinates(lastMouse.x, lastMouse.y);
       if (!w) return null;
-      if (typeof game.isValidCoord === "function" && !game.isValidCoord(w.x, w.y))
-        return null;
-      const t = game.ref(w.x, w.y);
-      return t === undefined ? null : t;
+      // 좌표 유효성: 정수화 후 검사 (게임은 정수 타일만 허용)
+      const ix = Math.floor(w.x), iy = Math.floor(w.y);
+      if (!Number.isFinite(ix) || !Number.isFinite(iy)) return null;
+      if (typeof game.isValidCoord === "function" && !game.isValidCoord(ix, iy)) return null;
+      let t;
+      try { t = game.ref(ix, iy); } catch (e) { return null; }   // ref는 범위 밖이면 예외를 던진다
+      if (t === undefined || t === null) return null;
+      if (typeof game.isValidRef === "function" && !game.isValidRef(t)) return null;
+      return t;
     } catch (e) {
       return null;
     }
@@ -685,14 +690,15 @@
       } catch (e) {}
       // 1차 후보 필터: 궤적·목표 어디에도 닿을 수 없는 SAM은 제외
       const cand = [];
+      const rej = [];   // 진단용: 왜 제외됐는지
       for (let i = 0; i < list.length; i++) {
         const u = list[i];
         try {
           const o = (typeof u.owner === "function") ? u.owner() : null;
           if (!o || typeof o.id !== "function") continue;
           if (o.id() === me.id()) continue;
-          if (typeof o.isFriendly === "function" && o.isFriendly(me)) continue;
-          if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) continue;
+          if (typeof o.isFriendly === "function" && o.isFriendly(me)) { rej.push({ id: u.id ? u.id() : "?", why: "friendly" }); continue; }
+          if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) { rej.push({ id: u.id ? u.id() : "?", why: "building" }); continue; }
           const lv = Math.max(1, (typeof u.level === "function" ? (u.level() || 1) : 1));
           const rng = samRangeAtLevel(lv);
           const ut = u.tile();
@@ -705,12 +711,12 @@
           }
           // 요격점은 목표 150 or 사일로 150 이내여야 하므로, (rng+150) 밖이면 불가
           const lim = rng + 150 + 60;
-          if (dT > lim && dS > lim) continue;
+          if (dT > lim && dS > lim) { rej.push({ id: u.id ? u.id() : "?", why: "far", dT: Math.round(dT), dS: Math.round(dS), lim: Math.round(lim) }); continue; }
           cand.push({ lv, rng, x: ux, y: uy, dT, dS });
         } catch (e) {}
       }
       const out = [];
-      if (!cand.length) return { n: 0, sumLevel: 0, maxRange: 150, defs: [] };
+      if (!cand.length) return { n: 0, sumLevel: 0, maxRange: 150, defs: [], _diag: { total: list.length, rej, cand: 0, silN: silPos.length, tx, ty } };
       if (silPos.length) {
         // 궤적 기반 참여 판정 — 사일로별로 1회
         const dirUp = getRocketDirectionUp();
@@ -2678,7 +2684,14 @@
         try {
           const ana = samDefenders(tileNow);
           if (ana === null) brief = "🎯 —";
-          else if (ana.n === 0) brief = "🎯 방어 없음 — I=수소 1발";
+          else if (ana.n === 0) {
+            let extra = "";
+            try {
+              const all = (getGameView().units("SAM Launcher") || []).length;
+              if (all > 0) extra = ` (지도에 SAM ${all}기)`;
+            } catch (e) {}
+            brief = "🎯 방어 없음 — I=수소 1발" + extra;
+          }
           else brief = `🎯 SAM ${ana.n}기 ΣLv${ana.sumLevel} · 계산 중…`;
         } catch (e) { brief = "🎯 계산 중…"; }
         hudCache = brief; hudCacheBrief = true; hudCacheTile = tileNow;
@@ -2695,7 +2708,16 @@
       //   예산은 짧게(18ms) 유지해 프레임 보호.
       const a = strikeSummary(tile, true);   // light=true (내부에서 예산 관리)
       if (a.k === "na") { hudCache = "🎯 —"; return hudCache; }
-      if (a.k === "no-sam") { hudCache = "🎯 방어 없음 — I=수소 1발"; return hudCache; }
+      if (a.k === "no-sam") {
+        // SAM이 실제로 존재하는데 0기로 나오면 계산 문제 → 진단 힌트를 함께 표시
+        let extra = "";
+        try {
+          const all = (getGameView().units("SAM Launcher") || []).length;
+          if (all > 0) extra = ` (지도에 SAM ${all}기 있음 — 경로 밖/아군)`;
+        } catch (e) {}
+        hudCache = "🎯 방어 없음 — I=수소 1발" + extra;
+        return hudCache;
+      }
       if (a.k !== "plan") { hudCache = "🎯 —"; return hudCache; }
       const jt = (a.jitterMin !== undefined && a.jitterMax !== undefined) ? `${a.jitterMin}~${a.jitterMax}` : "";
       // 여유분 표기: max(필요×10%, 랜덤 5~50) — '날아가는 동안 SAM 증원' 대비
@@ -2819,6 +2841,24 @@
       CFG, setArmed, requestUpgrade, requestWarships, rateGate, rateDelayFor, rateUse, RL,
       fireAtoms, fireHydro, fireMax, fireMirv, startSalvo, salvoStop,
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
+      samDiag: (tile) => {
+        // 진단: 왜 SAM이 참여/제외됐는지 한눈에 (게임 F12 콘솔)
+        try {
+          const g = getGameView();
+          const t0 = (tile === undefined || tile === null) ? computeCursorTile() : tile;
+          if (t0 === null || t0 === undefined) return "커서 좌표 없음";
+          const ana = samDefenders(t0);
+          const sil = mySilos(t0);
+          const all = g.units("SAM Launcher") || [];
+          const lines = [];
+          lines.push(`목표 tile=${t0} (${g.x(t0)},${g.y(t0)})`);
+          lines.push(`내 사일로: ${sil ? sil.length + "기 [" + sil.slice(0,3).map(s=>`(${s.x},${s.y})Lv${s.level}`).join(" ") + (sil.length>3?" …":"") + "]" : "읽기 실패"}`);
+          lines.push(`전체 SAM: ${all.length}기 · 참여 ${ana ? ana.n : "?"}기 ΣLv${ana ? ana.sumLevel : "?"}`);
+          if (ana && ana._diag) lines.push(`  진단: 후보0 — 제외사유 ${JSON.stringify(ana._diag.rej.slice(0,5))} · 사일로${ana._diag.silN}기`);
+          if (ana && ana.defs) ana.defs.forEach((d) => lines.push(`  참여: (${d.x},${d.y}) Lv${d.lv} rng${d.rng.toFixed(0)} via=${d.via}`));
+          return lines.join("\n");
+        } catch (e) { return "진단 오류: " + e.message; }
+      },
       stSilosNeeded, strikeSummary, fmtGold, hudRateState, hudTick, hudTargetLine, startStrike,
       lastStrikeRef: () => lastStrike, salvoHydroRef: () => salvoHydro,
       requestUpgrade, requestUpgradeBig: () => requestUpgrade(true),
