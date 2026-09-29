@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      2.8.3
+// @version      2.8.4
 // @description  사설로비용 — x50 원자 살포 · 구조물 대량 업그레이드 · SAM 인식 수소타격(I: 커서 150타일 내 SAM 레벨합×1.2 → 수소 → 후속)
 // @author       local build
 // @match        https://openfront.io/*
@@ -2940,6 +2940,30 @@
       hudCacheAt = now; hudCacheTile = tileNow; hudCacheBrief = false;
       const tile = tileNow;
       if (tile === null) { hudCache = "🎯 커서를 영토에"; return hudCache; }
+      // ── 단순 모드 HUD (v2.8.4) ──
+      //   반드시 strikeSummary(경로 기반)보다 '먼저' 처리한다.
+      //   strikeSummary는 samDefenders(궤적 판정)를 쓰므로 단순 모드와 결과가 다르고,
+      //   no-sam으로 조기 반환해 아래 단순 분기에 도달하지 못하는 버그가 있었다.
+      if (CFG.samSimpleMode) {
+        const sn = samsNear(tile);
+        const afS = (CFG.samAfterMin | 0) + (CFG.samAfterMax | 0) + (CFG.samAfterHydroMin | 0) + (CFG.samAfterHydroMax | 0) > 0
+          ? `+후속 ☢${CFG.samAfterMin}~${CFG.samAfterMax} 💧${CFG.samAfterHydroMin}~${CFG.samAfterHydroMax}` : "";
+        if (!sn || sn.n === 0) {
+          let hint = "";
+          try {
+            const all = (getGameView().units("SAM Launcher") || []).length;
+            if (all > 0) hint = ` (지도에 ${all}기 — 반경 밖/아군)`;
+          } catch (e) {}
+          hudCache = `🎯 SAM 없음 (${CFG.samSimpleRange}타일 내) — I=수소 1발${hint}`;
+          return hudCache;
+        }
+        const shots = simpleShots(sn);
+        const v = simpleVerdict(sn, shots, tile);
+        hudCache = `🎯 SAM ${sn.n}기 ΣLv${sn.sumLevel} (${sn.range}타일 내)\n`
+                 + `☢ ${shots.toLocaleString()}발(×${CFG.samSimpleMult}) → 💧1발 → ${afS}`
+                 + (v ? "\n" + verdictText(v) : "");
+        return hudCache;
+      }
       // HUD도 '정밀에 가깝게' — 표시값이 실제 발사량과 어긋나면 오해를 준다.
       //   경량 모드는 배수 1개라 큰 규모에서 필요량을 과대(1.25배) 표시했다.
       //   예산은 짧게(18ms) 유지해 프레임 보호.
@@ -2956,28 +2980,6 @@
         return hudCache;
       }
       if (a.k !== "plan") { hudCache = "🎯 —"; return hudCache; }
-      // ── 단순 모드 HUD: 커서 150타일 내 SAM ΣLv × 1.2 · 수소 1발 · 후속 ──
-      if (CFG.samSimpleMode) {
-        const sn = samsNear(tile);
-        const af2 = (CFG.samAfterMin | 0) + (CFG.samAfterMax | 0) + (CFG.samAfterHydroMin | 0) + (CFG.samAfterHydroMax | 0) > 0
-          ? `+후속 ☢${CFG.samAfterMin}~${CFG.samAfterMax} 💧${CFG.samAfterHydroMin}~${CFG.samAfterHydroMax}` : "";
-        if (!sn || sn.n === 0) {
-          // 왜 0기인지 힌트 (지도 전체에 SAM이 있는데 0기면 좌표/판독 문제)
-          let hint = "";
-          try {
-            const all = (getGameView().units("SAM Launcher") || []).length;
-            if (all > 0) hint = ` (지도에 ${all}기 — 반경 밖/아군)`;
-          } catch (e) {}
-          hudCache = `🎯 SAM 없음 (${CFG.samSimpleRange}타일 내) — I=수소 1발${hint}`;
-          return hudCache;
-        }
-        const shots = simpleShots(sn);
-        const v = simpleVerdict(sn, shots, tile);
-        hudCache = `🎯 SAM ${sn.n}기 ΣLv${sn.sumLevel} (${sn.range}타일 내)\n`
-                 + `☢ ${shots.toLocaleString()}발(×${CFG.samSimpleMult}) → 💧1발 → ${af2}`
-                 + (v ? "\n" + verdictText(v) : "");
-        return hudCache;
-      }
       const jt = (a.jitterMin !== undefined && a.jitterMax !== undefined) ? `${a.jitterMin}~${a.jitterMax}` : "";
       // 여유분 표기: max(필요×10%, 랜덤 5~50) — '날아가는 동안 SAM 증원' 대비
       let l1;
