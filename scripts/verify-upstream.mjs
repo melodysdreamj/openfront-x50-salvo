@@ -151,3 +151,17 @@ for(const at of [12,35,55])for(const add of [1,3,10,40])for(const nearSilo of [f
 }
 assert.ok(rescued>0&&switched>0);
 console.log(`Upstream in-flight SAM upgrades: ${adaptiveCases} scenarios; ${adaptiveAccepted} accepted revisions achieved the criterion (${rescued} hydro rescues, ${switched} atomic switches).`);
+
+// Exercise multiple 50-atom intents at the new 100ms cadence against the native
+// execution classes, including a 500-slot atomic goal and a high-level SAM.
+let fastAccepted=0,fastCases=0;
+for(const level of [0,50,150])for(const up of [true,false]) {
+  const s={...base,silos:Array.from({length:50},(_,i)=>({id:i+1,x:100+i,y:500,level:20,queue:[]})),
+    sams:level?[{id:101,x:695,y:500,level,queue:[]}]:[]};
+  const p=makePlan(500,level?500:null,0,up);
+  assert.ok(p.actions.slice(1).every((a,i)=>a.tick-p.actions[i].tick===1));
+  const prediction=assess(s,p,{minAtomHits:level?1:500}),actual=engineRun(s,p);fastCases++;
+  if(prediction.ok){fastAccepted++;assert.ok(level?actual.hydroHits>=1:actual.atomHits>=500,JSON.stringify({level,up,actual}));}
+}
+assert.ok(fastAccepted>=2);
+console.log(`Upstream fast salvo: ${fastCases} scenarios with 500 atoms at 100ms cadence; ${fastAccepted} verified plans reached their hit goals.`);

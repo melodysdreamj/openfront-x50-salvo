@@ -170,6 +170,14 @@
     worker.postMessage({id,kind,...data,snapshot:workerSnapshot(data.snapshot)});
   }
 
+  // I can use all ten requests in the shared second window. Other shortcut
+  // queues retain their own reserve policy; every send still records in RL.
+  function plannerRateDelay(now=Date.now()) {
+    RL.secWindow=RL.secWindow.filter(t=>now-t<1000);
+    RL.minWindow=RL.minWindow.filter(t=>now-t<60000);
+    return strikeRateDelay(RL,now);
+  }
+
   // Retry the fixed I target without allowing a late response to resurrect an
   // Esc-cancelled operation. A state change is a revalidation, not a user error.
   function plannerRetry(snapshot,result,message,delay=100) {
@@ -200,7 +208,7 @@
       if(!check.ok){plannerRetry(snapshot,null,'기존 후보가 방어를 통과하지 못해 다른 수량·순서를 탐색합니다');return;}
       const plan={...result.chosen,...check.result},bus=getEventBus(),ctor=findNukeEventCtor();
       if(current.gold<plan.cost){plannerState.error='계획을 실행할 골드가 부족합니다';return;}
-      const rateWait=rateGate();
+      const rateWait=plannerRateDelay();
       if(rateWait>0||plan.actions.length>current.intentBudget) {
         plannerRetry(snapshot,result,'명령 한도 회복 대기 · 회복 후 최신 상태로 재검증합니다',1000);return;
       }
@@ -312,7 +320,7 @@
     const run=plannerState.run;if(!run)return;
     try {
       if(document.hidden)return plannerStop('탭이 숨겨져 남은 발사를 중단했습니다');
-      if(getGameView()?.ticks()===run.sampledTick) {
+      if(getGameView()?.ticks()===run.sampledTick&&run.rateWaitingTick!==run.sampledTick) {
         if(Date.now()-run.lastTickAt>2000)return plannerStop('게임 진행이 멈춰 남은 발사를 중단했습니다');
         plannerState.timer=setTimeout(plannerPump,40);return;
       }
@@ -341,13 +349,23 @@
             return plannerFinish('이번 공격의 누적 발사 한도에 도달했습니다',current,true);
           const cost=(hydro?current.hydroCost:current.atomCost)*BigInt(action.amount);
           const ready=current.silos.reduce((sum,s)=>sum+(s.building?0:Math.max(0,s.level-s.queue.length)),0);
-          if(rateGate()>0||current.gold<cost||ready-(run.sent-run.confirmed)<action.amount||
+          const rateWait=plannerRateDelay();
+          if(rateWait>0) {
+            // A 40ms poll can reach the next game tick just before the wall-clock
+            // second expires. Retry WITHIN this tick instead of wasting a replan.
+            // If the due tick passes, the normal missed-deadline guard revalidates.
+            run.rateWaitingTick=tick;run.reason='명령 한도 회복 대기 · 같은 틱 안에서 재확인';
+            plannerState.timer=setTimeout(plannerPump,Math.max(1,Math.min(40,Math.ceil(rateWait))));return;
+          }
+          run.rateWaitingTick=null;
+          if(current.gold<cost||ready-(run.sent-run.confirmed)<action.amount||
             (hydro?current.allowed.mixed===false:current.allowed.atomic===false)) {
             run.needsReplan=true;run.reason='골드·발사관·명령 한도 변경 — 남은 발사 보류';plannerReplan(run,current);
           }else {
             // Reserve before emit so a synchronous test adapter cannot race ACK.
             run.outbox.push({type:action.type,amount:action.amount,acked:0,tick});
             run.bus.emit(new run.ctor(action.type,run.tile,run.plan.up,action.amount));rateUse();
+            run.reason='검증된 일정으로 발사 중 · 원자 최대 50발 × 초당 10건';
             run.sent+=action.amount;run.index++;
             if(hydro)run.sentHydros+=action.amount;else run.sentAtoms+=action.amount;
           }

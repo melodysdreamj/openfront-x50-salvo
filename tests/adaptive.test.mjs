@@ -61,7 +61,7 @@ test('motion timing resolves position independently of stale server trajectoryIn
 test('remaining schedule preserves gaps and moves overdue intents beyond compute lead',()=>{
   const p=makePlan(100,100,8),r=remainingPlan(p,1,1000,1010,6);
   assert.equal(r.atoms,50);assert.equal(r.hydros,1);assert.equal(r.actions[0].tick,6);
-  assert.equal(r.actions[1].tick-r.actions[0].tick,10);assert.equal(p.actions[1].tick,5);
+  assert.equal(r.actions[1].tick-r.actions[0].tick,9);assert.equal(p.actions[1].tick,4);
 });
 test('faraway SAM changes are irrelevant, path SAM and own silo changes are observed',()=>{
   const s=fixture({inflight:[]});s.sams.push({id:11,x:0,y:0,level:1,queue:[]});

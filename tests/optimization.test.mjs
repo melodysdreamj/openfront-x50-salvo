@@ -12,10 +12,10 @@ test('exact full simulation output equals v4.1.2 across 160 seeded maps and four
     for(const base of variants)for(const conservative of [false,true]) {const variant={...base,conservative};assert.deepEqual(after.simulate(s,plan,variant),before.simulate(s,plan,variant),'seed '+seed+' '+JSON.stringify(variant));}
   }
 });
-test('completed searches preserve candidate order and every non-clock result',()=>{
+test('legacy cadence searches preserve candidate order and every non-clock result',()=>{
   for(let seed=1;seed<=12;seed++) {
     const {snapshot:s}=scenario(seed);s.sams=s.sams.slice(0,3);s.silos.forEach(u=>{u.level=100;u.queue=[];});
-    const opt={budgetMs:Infinity,maxAtoms:40,maxTicks:500};
+    const opt={budgetMs:Infinity,maxAtoms:40,maxTicks:500,intentIntervalTicks:2};
     const a=before.search(s,opt),b=after.search(s,opt);delete a.elapsedMs;delete b.elapsedMs;
     assert.deepEqual(b,a,'search seed '+seed);
   }

@@ -265,6 +265,29 @@ try {
   console.log('Browser: adaptive deadline expands the next budget and rescues without resetting the hydro cap.');
 
   await load();
+  await page.evaluate(()=>{
+    __x50.planner.stop();
+    Object.assign(__x50.planner.settings,{minAtomHits:1000,maxAtoms:1000,maxHydros:0});
+    fixture.setUnits(Array.from({length:100},(_,i)=>fixture.unit(i+1,'Missile Silo',100+i,500,20,fixture.me)));
+    fixture.wallTimes=[];
+    const bus=fixture.bm.eventBus,emit=bus.emit.bind(bus);
+    bus.emit=e=>{fixture.wallTimes.push(performance.now());emit(e);};
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.sent.length===20,null,{timeout:15000});
+  const burst=await page.evaluate(()=>({sent:fixture.sent,wall:fixture.wallTimes,state:__x50.planner.state()}));
+  assert.equal(burst.sent.reduce((n,e)=>n+e.amount,0),1000);
+  assert.ok(burst.sent.every(e=>e.unit==='Atom Bomb'&&e.amount===50));
+  assert.deepEqual(burst.sent.map(e=>e.tick-burst.sent[0].tick),Array.from({length:20},(_,i)=>i));
+  assert.ok(burst.wall[9]-burst.wall[0]<1000,'first 500 requested within one second');
+  assert.ok(burst.wall[19]-burst.wall[10]<1000,'second 500 requested within one second');
+  for(const t of burst.wall)assert.ok(burst.wall.filter(v=>v>=t&&v<t+1000).length<=10,'rolling second must stay within 10 shared requests');
+  assert.equal(burst.state.replans,0,'wall-clock gate must not waste a replan at the second boundary');
+  await page.keyboard.press('Escape');const sentBefore=await page.evaluate(()=>fixture.sent.length);
+  await page.waitForTimeout(300);assert.equal(await page.evaluate(()=>fixture.sent.length),sentBefore);
+  console.log('Browser: I sends 1000 atoms as twenty consecutive 100ms batches; 500 per second, rolling limit intact, zero replans.');
+
+  await load();
   await page.setViewportSize({width:390,height:844});await page.keyboard.press('F8');
   await page.waitForTimeout(250);
   const sizes=await page.evaluate(()=>{const panel=[...document.querySelectorAll('div')].find(e=>e.id==='of-strike-hud');return {width:panel.getBoundingClientRect().width,page:innerWidth,overflow:document.documentElement.scrollWidth};});

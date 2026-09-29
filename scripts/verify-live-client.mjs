@@ -10,11 +10,13 @@ assert.ok(['127.0.0.1','localhost'].includes(new URL(origin).hostname),'Local cl
 const browser=await chromium.launch({headless:false,executablePath:process.env.CHROME_PATH??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
 const page=await browser.newPage({viewport:{width:1280,height:800}}),errors=[];
 page.on('pageerror',e=>errors.push(e.message));
-const artifact=process.env.SCREENSHOT_DIR,samScenario=process.argv.includes('--sam'),upgradeScenario=process.argv.includes('--upgrade');
+const artifact=process.env.SCREENSHOT_DIR,samScenario=process.argv.includes('--sam'),upgradeScenario=process.argv.includes('--upgrade'),fastScenario=process.argv.includes('--fast');
+assert.ok(!fastScenario||!samScenario,'--fast is a dedicated atomic throughput fixture');
 assert.ok(!upgradeScenario||samScenario,'--upgrade requires --sam');
 try {
  await page.goto(origin);await page.getByRole('button',{name:/^(혼자 하기|Single Player|Singleplayer)$/i}).click();
  await page.evaluate(()=>{const m=document.querySelector('single-player-modal');m.bots=0;m.nations=0;m.randomSpawn=true;m.instantBuild=true;m.infiniteGold=false;m.startingGold=true;m.startingGoldValue=100;m.infiniteTroops=true;m.compactMap=true;});
+ if(fastScenario)await page.evaluate(()=>{document.querySelector('single-player-modal').infiniteGold=true;});
  if(samScenario)await page.evaluate(()=>document.addEventListener('join-lobby',e=>{
   // Two humans in a local-only fixture. The second actor exists solely to
   // supply a real defending structure through the original game worker.
@@ -40,6 +42,17 @@ try {
   throw Error('No buildable silo position');
  });console.log('Live silo request:',built);
  await page.waitForFunction(()=>__x50.getGameView().units('Missile Silo').some(u=>!u.isUnderConstruction()),null,{timeout:15000});
+ if(fastScenario) {
+  await page.evaluate(async()=>{
+    const g=__x50.getGameView(),silo=g.units('Missile Silo')[0];
+    const {SendUpgradeStructureIntentEvent}=await import('/src/client/Transport.ts');
+    for(const amount of [50,50,50,50,50,50,50,50,50,49])
+      __x50.getEventBus().emit(new SendUpgradeStructureIntentEvent(silo.id(),'Missile Silo',amount));
+    Object.assign(__x50.planner.settings,{minAtomHits:500,maxAtoms:500,maxHydros:0});
+  });
+  await page.waitForFunction(()=>{const u=__x50.getGameView().units('Missile Silo')[0];return u.level()===500&&u.missileTimerQueue().length===0;},null,{timeout:80000});
+  console.log('Live client: native Lv500 silo fully reloaded, with host-only infinite gold for throughput fixture.');
+ }
  if(samScenario) {
   await page.evaluate(async()=>{
    const g=__x50.getGameView(),enemy=g.players().find(p=>p.clientID()==='SAMtest123');
@@ -83,9 +96,25 @@ try {
  }
  assert.ok(pointed,'Native camera/mouse must settle on the intended target');
  const snapshot=await page.evaluate(()=>{const s=__x50.planner.snapshot();return {tile:s.tile,prices:[String(s.atomCost),String(s.hydroCost)],silos:s.silos.length,sams:s.sams.length};});
- assert.equal(snapshot.tile,target.tile);assert.deepEqual(snapshot.prices,['750000','5000000']);assert.equal(snapshot.silos,1);
+ assert.equal(snapshot.tile,target.tile);assert.deepEqual(snapshot.prices,fastScenario?['0','0']:['750000','5000000']);assert.equal(snapshot.silos,1);
  assert.equal(snapshot.sams,samScenario?1:0);
- console.log('Live client: cursor snapshot + paid native worker buildables prices:',snapshot);
+ console.log('Live client: cursor snapshot + '+(fastScenario?'host-free':'paid')+' native worker buildables prices:',snapshot);
+ if(fastScenario) {
+  await page.evaluate(()=>{
+    window.__fastSent=[];const bus=__x50.getEventBus(),emit=bus.emit.bind(bus);
+    bus.emit=e=>{if(e.unit==='Atom Bomb')window.__fastSent.push({at:performance.now(),tick:__x50.getGameView().ticks(),amount:e.amount});emit(e);};
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>window.__fastSent.length===10,null,{timeout:30000});
+  await page.waitForFunction(()=>__x50.getGameView().units('Atom Bomb').length===500,null,{timeout:10000});
+  const sent=await page.evaluate(()=>window.__fastSent);
+  assert.ok(sent.every(e=>e.amount===50));
+  assert.deepEqual(sent.map(e=>e.tick-sent[0].tick),[0,1,2,3,4,5,6,7,8,9]);
+  assert.ok(sent[9].at-sent[0].at<1000,'500 atoms requested within one second');
+  await page.keyboard.press('Escape');
+  console.log('PASS: real local I requested 500 atoms in '+Math.round(sent[9].at-sent[0].at)+'ms, ten consecutive game ticks; native worker created all 500 missiles. Arrival timing remains silo-queue dependent.');
+  assert.deepEqual(errors,[]);
+ } else {
  await page.evaluate(()=>{
   window.__liveEvidence={samFired:false};window.__liveSampler=setInterval(()=>{
    const g=__x50.getGameView();if(g.units('SAM Missile').length||g.units('SAM Launcher').some(u=>u.missileTimerQueue().length))window.__liveEvidence.samFired=true;
@@ -107,6 +136,7 @@ try {
  console.log('Live client: actual goal arrival confirmed.',JSON.stringify(final.report));
  assert.deepEqual(errors,[]);
  console.log('PASS: real local rendered client, native prices, '+(upgradeScenario?'in-flight SAM upgrade and revision':samScenario?'SAM defense and mixed salvo':'sea target')+', I launch, worker motion and detonation observation. No public multiplayer match was tested.');
+ }
 } catch(e) {
  console.error('Live state:',await page.evaluate(()=>({state:window.__x50?.planner.state(),body:document.body.innerText.slice(-4000)})).catch(()=>null));
  throw e;

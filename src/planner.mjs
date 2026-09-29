@@ -83,18 +83,18 @@ export function validateSnapshot(s) {
   if (typeof s.gold!=='bigint'||typeof s.atomCost!=='bigint'||typeof s.hydroCost!=='bigint') throw Error('골드 또는 가격 정보를 읽을 수 없습니다');
 }
 
-// One intent every two ticks, <=50 atoms per intent. Sending more intents per
+// One intent per tick by default, <=50 atoms per intent. Sending more intents per
 // second does not remove the per-silo launch queue. Keep explicit timeline data.
-export function makePlan(atoms, hydroAfter=null, gap=0, up=true, initial=3) {
+export function makePlan(atoms, hydroAfter=null, gap=0, up=true, initial=3,intervalTicks=1) {
   const actions=[]; let left=atoms, sent=0, tick=initial, hydro=false;
   while (left>0 || (hydroAfter!==null&&!hydro)) {
     if (!hydro && hydroAfter!==null && sent>=hydroAfter) {
       tick+=gap;
-      actions.push({tick,type:HYDRO,amount:1}); hydro=true; tick+=2;
+      actions.push({tick,type:HYDRO,amount:1}); hydro=true; tick+=intervalTicks;
     } else {
       const count=Math.min(50,left,hydroAfter!==null&&!hydro?hydroAfter-sent:left);
       if (count<=0) break;
-      actions.push({tick,type:ATOM,amount:count}); sent+=count; left-=count; tick+=2;
+      actions.push({tick,type:ATOM,amount:count}); sent+=count; left-=count; tick+=intervalTicks;
     }
   }
   return {actions,atoms,hydros:hydroAfter===null?0:1,up,hydroAfter,gap};
@@ -238,7 +238,7 @@ export function* searchSteps(s, options={}) {
   const began=performance.now(),deadline=began+(options.budgetMs??1800),pathCache=new Map();
   const minHits=Math.max(1,options.minAtomHits??1);
   const cap=Math.min(5000,Math.max(0,options.maxAtoms??2000));
-  const initial=options.initialTicks??3;
+  const initial=options.initialTicks??3,interval=options.intentIntervalTicks??1;
   const committedHydro=s.includeCommitted&&(s.inflight??[]).some(b=>b.committed&&b.owner===s.me&&!b.targeted&&b.type===HYDRO);
   const ready=s.silos.reduce((n,u)=>n+(u.building?0:Math.max(0,u.level-u.queue.length)),0);
   // Estimate capacity only along possible trajectories. Keep all SAMs in the
@@ -278,18 +278,18 @@ export function* searchSteps(s, options={}) {
      for(const atoms of counts) {
       for(const up of [s.preferredUp!==false,s.preferredUp===false]) {
         if(fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {
-          const p=run({...makePlan(atoms,null,0,up,initial),goal:'atomic'}); if(p) result.atomic=p;
+          const p=run({...makePlan(atoms,null,0,up,initial,interval),goal:'atomic'}); if(p) result.atomic=p;
           yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
         }
         if(!result.mixed&&options.allowHydroGoal!==false&&(committedHydro||s.allowed?.mixed!==false)&&(atoms===0||s.allowed?.atomic!==false)) {
           if(atoms===0&&(fraction!==1||gap!==0))continue;
           if(committedHydro&&fraction===1&&gap===0) {
-            const rescue=run({...makePlan(atoms,null,0,up,initial),goal:'hydro'});
+            const rescue=run({...makePlan(atoms,null,0,up,initial,interval),goal:'hydro'});
             if(rescue)result.mixed=rescue;
             yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
           }
           if(!result.mixed&&options.allowNewHydro!==false&&s.allowed?.mixed!==false) {
-            const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial),goal:'hydro'});
+            const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial,interval),goal:'hydro'});
             if(p) result.mixed=p;
             yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
           }
