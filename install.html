@@ -66,8 +66,8 @@
     <li>
       <b>스크립트 설치</b>
       <p>Tampermonkey가 설치된 <b>뒤에</b> 아래 버튼을 누르면 Tampermonkey 설치 화면이 뜹니다 → <b>설치</b> 클릭.</p>
-      <a class="btn" href="/openfront-x50-salvo-v2.8.4.user.js">스크립트 설치 (Tampermonkey)</a>
-      <a class="btn ghost" href="/openfront-x50-salvo-v2.8.4.user.js?dl=1">파일로 다운로드</a>
+      <a class="btn" href="/openfront-x50-salvo-v2.9.0.user.js">스크립트 설치 (Tampermonkey)</a>
+      <a class="btn ghost" href="/openfront-x50-salvo-v2.9.0.user.js?dl=1">파일로 다운로드</a>
       <p class="warn">Tampermonkey 없이 이 버튼을 누르면 코드가 텍스트로 보이기만 합니다. 순서를 지켜주세요.</p>
     </li>
 
@@ -87,7 +87,7 @@
 
   <div class="note">
     설치가 끝나면 이 페이지와 로컬 서버는 더 이상 필요하지 않습니다.<br>
-    파일 경로: <code>~/Documents/OpenFront/openfront-x50-salvo-v2.8.4.user.js</code>
+    파일 경로: <code>~/Documents/OpenFront/openfront-x50-salvo-v2.9.0.user.js</code>
   </div>
 </div>
 
@@ -95,7 +95,7 @@
 document.getElementById('cp').addEventListener('click', async () => {
   const msg = document.getElementById('cpmsg');
   try {
-    const r = await fetch('/openfront-x50-salvo-v2.8.4.user.js');
+    const r = await fetch('/openfront-x50-salvo-v2.9.0.user.js');
     const t = await r.text();
     await navigator.clipboard.writeText(t);
     msg.textContent = ' 복사됨 (' + t.length.toLocaleString() + '자) — 콘솔에 붙여넣으세요';
