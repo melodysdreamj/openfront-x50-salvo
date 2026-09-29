@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      2.8.0
+// @version      2.8.1
 // @description  사설로비용 — x50 원자 살포 · 구조물 대량 업그레이드 · SAM 인식 수소타격(I: 커서 150타일 내 SAM 레벨합×1.2 → 수소 → 후속)
 // @author       local build
 // @match        https://openfront.io/*
@@ -832,6 +832,86 @@
       }
       return { n: out.length, sumLevel, defs: out, range: R, tx, ty, skipped, total: list.length };
     } catch (e) { return null; }
+  }
+
+  // ── 단순 판정 (v2.8.1) ──
+  //   ① 9초 내 발사: 사일로 체인(1발/틱=10발/초)으로 다 나가는가 + 관 부족으로 멈추지 않는가
+  //   ② 수소 착탄: 원자가 적 SAM 슬롯(ΣLv)을 전부 채우면 수소는 막히지 않는다
+  //   ※ 게임 물리: SAM슬롯 1개 = 미사일 1발 = 90틱(9초) 점유. 사일로도 관 1개당 9초 점유.
+  function simpleVerdict(ana, shots, tile) {
+    if (!ana || !(ana.sumLevel > 0) || !(shots > 0)) return null;
+    // ── 내 사일로 (관 수·거리)
+    let tubes = 0, siloN = 0, dMin = Infinity, dMax = 0;
+    try {
+      const silos = mySilos(tile);
+      if (silos && silos.length) {
+        siloN = silos.length;
+        for (let i = 0; i < silos.length; i++) {
+          tubes += Math.max(1, silos[i].level | 0);
+          const d = silos[i].dist;
+          if (Number.isFinite(d)) { if (d < dMin) dMin = d; if (d > dMax) dMax = d; }
+        }
+      }
+    } catch (e) {}
+    // ── 게임 발사 규칙: nukeSpawn 은 '가장 가까운 준비된 사일로'를 고른다.
+    //   → 관이 충분하면 가까운 사일로 몇 기만 쓰고 먼 사일로는 안 쓴다.
+    //   (사일로 목록을 거리순으로 보고, 필요한 만큼만 사용)
+    let usedN = siloN, dUsedMin = dMin, dUsedMax = dMin;
+    if (siloN > 0) {
+      const ds = [];
+      try {
+        const silos = mySilos(tile) || [];
+        for (let i = 0; i < silos.length; i++) {
+          const d = silos[i].dist;
+          if (Number.isFinite(d)) ds.push({ d, lv: Math.max(1, silos[i].level | 0) });
+        }
+      } catch (e) {}
+      ds.sort((a, b) => a.d - b.d);
+      if (ds.length) {
+        dUsedMin = ds[0].d;
+        // 가까운 사일로부터 관을 채워나가, 발수를 감당할 만큼만 사용
+        let acc = 0, k = 0;
+        while (k < ds.length && acc < shots) { acc += ds[k].lv; k++; }
+        usedN = Math.max(1, k);
+        dUsedMax = ds[usedN - 1].d;
+      }
+    }
+    // ── ① 발사(런치) 시간 — 사용 사일로 체인: 1기당 최대 10발/초
+    const rate = 10 * Math.max(1, usedN);
+    const launchSec = siloN > 0 ? shots / rate : null;
+    const tubeOk = siloN > 0 ? shots <= tubes : false;
+    // ── ② 도착 분산 — '사용된' 사일로 거리차 ÷ 핵 속도(100타일/초)
+    const flySpread = (Number.isFinite(dUsedMin) && dUsedMax > dUsedMin) ? (dUsedMax - dUsedMin) / 100 : 0;
+    const flyNear = Number.isFinite(dUsedMin) ? dUsedMin / 100 : 0;
+    // 전체 공격 창 = 발사 시간 + 도착 분산 (마지막 폭탄이 떨어지기까지)
+    const arriveSpan = (launchSec || 0) + flySpread;
+    const in9 = tubeOk && arriveSpan <= 9;
+    // ── ③ 수소 착탄 — 게임 물리(단순 모델)
+    //   · 적 SAM 총 슬롯 = ΣLv. 미사일 1발이 슬롯 1개를 90틱(9초) 점유한다.
+    //   · 원자로 슬롯을 전부 채우면 그 순간 수소는 요격되지 않는다.
+    //   · 단 그 '전부 점유' 상태는 9초만 유지된다 → 공격 창이 9초 안이어야 한다.
+    const slots = ana.sumLevel;
+    const enough = shots >= slots;          // 슬롯을 채울 만큼 원자가 있는가
+    const h2Pass = enough && in9;           // 창 안에 다 들어가야 수소가 산다
+    return { tubes, siloN, usedN, launchSec, tubeOk, arriveSpan, flySpread, flyNear, in9,
+             slots, enough, h2Pass, shots, samSL: ana.sumLevel, samN: ana.n,
+             dUsedMin: Number.isFinite(dUsedMin) ? dUsedMin : null,
+             dUsedMax: Number.isFinite(dUsedMax) ? dUsedMax : null };
+  }
+
+  // 판정 문자열 (HUD·토스트 공용)
+  function verdictText(v) {
+    if (!v) return "";
+    let t9;
+    if (v.siloN === 0) t9 = "⏱ 사일로 없음 → 건설 필요";
+    else if (!v.tubeOk) t9 = `⏱ 관 부족 ❌ (내관Σ${v.tubes} < ${v.shots.toLocaleString()}발 · 사일로 증설)`;
+    else if (v.in9) t9 = `⏱ 9초 내 ✅ (${v.shots.toLocaleString()}발 · 약 ${v.arriveSpan.toFixed(1)}초 · 사일로 ${v.usedN}/${v.siloN}기)`;
+    else t9 = `⏱ 9초 초과 ⚠️ (약 ${v.arriveSpan.toFixed(1)}초 — 사일로 기수↑ 또는 가까운 사일로)`;
+    let h2;
+    if (!v.enough) h2 = `💧 수소 위험 ⚠️ (원자 ${v.shots.toLocaleString()} < 적 슬롯 ${v.slots} · 원자 부족)`;
+    else if (!v.in9) h2 = `💧 수소 위험 ⚠️ (슬롯은 채우나 창이 9초 초과)`;
+    else h2 = `💧 수소 착탄 ✅ (원자 ${v.shots.toLocaleString()} ≥ 적 슬롯 ${v.slots})`;
+    return t9 + "\n" + h2;
   }
 
   // 단순 모드 발사량: ΣLv × 1.2 (최소 1)
@@ -1669,8 +1749,13 @@
       }
     }
 
-    toast(`🎯 수소타격 — 커서 ${ana.range}타일 내 SAM ${ana.n}기 ΣLv${ana.sumLevel} → 원자 ${total.toLocaleString()}발(×${CFG.samSimpleMult})`
-        + ` → 수소 1발 → 후속 ☢${afterA} 💧${afterH}`, "#7ee787");
+    const v0 = simpleVerdict(ana, total, tile);
+    toast(`🎯 수소타격 — SAM ${ana.n}기 ΣLv${ana.sumLevel} → 원자 ${total.toLocaleString()}발 → 💧1발 → 후속 ☢${afterA} 💧${afterH}`
+        + (v0 ? `  [${v0.in9 ? "9초내 OK" : "9초초과"}] [${v0.h2Pass ? "수소착탄 OK" : "수소위험"}]` : ""), "#7ee787");
+    if (v0 && !v0.h2Pass) {
+      const msg = v0.enough ? "슬롯은 채우나 창이 9초 초과 — 사일로 기수 늘리기" : `원자 부족 (${total} < 적슬롯 ${v0.slots}) — 재시도 권장`;
+      toast(`⚠️ ${msg}`, "#ffaa00");
+    }
 
     // 발사 시작 (대기열 펌프 — 창 회전 게이트·버스트 상한·골드/관 가드 전부 적용)
     if (salvoTimer === null) {
@@ -2810,8 +2895,10 @@
           return hudCache;
         }
         const shots = simpleShots(sn);
+        const v = simpleVerdict(sn, shots, tile);
         hudCache = `🎯 SAM ${sn.n}기 ΣLv${sn.sumLevel} (${sn.range}타일 내)\n`
-                 + `☢ ${shots.toLocaleString()}발(×${CFG.samSimpleMult}) → 💧1발 → ${af2}`;
+                 + `☢ ${shots.toLocaleString()}발(×${CFG.samSimpleMult}) → 💧1발 → ${af2}`
+                 + (v ? "\n" + verdictText(v) : "");
         return hudCache;
       }
       const jt = (a.jitterMin !== undefined && a.jitterMax !== undefined) ? `${a.jitterMin}~${a.jitterMax}` : "";
@@ -2936,6 +3023,7 @@
       CFG, setArmed, requestUpgrade, requestWarships, rateGate, rateDelayFor, rateUse, RL,
       fireAtoms, fireHydro, fireMax, fireMirv, startSalvo, salvoStop,
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
+      samsNear, simpleShots, simpleVerdict, verdictText,
       samDiag: (tile) => {
         // 진단: 왜 SAM이 참여/제외됐는지 한눈에 (게임 F12 콘솔)
         try {
