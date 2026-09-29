@@ -2586,95 +2586,106 @@
   //   따라서 여러 척을 띄우려면 build_unit 인텐트를 N번 반복 발송해야 한다.
   //   건조 위치는 서버가 정한다(warshipSpawn): 클릭한 바다와 같은 수역에 있는
   //   내 항구 중 가장 가까운 항구 타일. 항구가 없으면 건조되지 않는다.
-  //   비용은 보유 수 기준 (n+1)×25만, 4척 넘으면 100만 고정.
+  //   비용·수역별 건조 가능 여부는 매 요청 전 공식 buildables 응답으로 확인한다.
   // ═════════════════════════════════════════════
-  function requestWarships() {
-    const game = getGameView();
-    const bus = getEventBus();
-    if (!game || !bus) { toast("❌ 게임 시작 후 사용하세요", "#ff5555"); return; }
-    const me = game.myPlayer();
-    if (!me) { toast("❌ 플레이어 정보 없음", "#ff5555"); return; }
-    const ctor = findNukeEventCtor();   // build_unit 인텐트와 동일 클래스
-    if (!ctor) { toast("❌ 건조 경로 없음 (게임 시작 후 재시도)", "#ff5555"); return; }
-    const tile = computeCursorTile();
-    if (tile === null) { toast("❌ 커서 위치 인식 실패", "#ff5555"); return; }
-
-    // 바다인지 확인 (군함은 물에만 건조 가능)
+  // One FIFO for every click; one unacknowledged build at a time.
+  const warshipQueue=[];
+  let warshipTimer=null,warshipBusy=false,warshipEpoch=0;
+  let warshipProgress={sent:0,confirmed:0,phase:'idle',message:''};
+  function warshipStatus() {
+    const head=warshipQueue[0];
+    return {...warshipProgress,running:warshipQueue.length>0,batches:warshipQueue.length,
+      remaining:warshipQueue.reduce((n,j)=>n+j.want-j.confirmed,0),tile:head?.tile??null};
+  }
+  function cancelWarships(reason='남은 군함 건조를 취소했습니다') {
+    const had=warshipQueue.length>0;
+    warshipEpoch++;clearTimeout(warshipTimer);warshipTimer=null;warshipBusy=false;warshipQueue.length=0;
+    if(had){warshipProgress.phase='stopped';warshipProgress.message=reason;toast(reason+' · 이미 보낸 요청은 유지됩니다','#ffd166');}
+  }
+  window.addEventListener('pagehide',()=>cancelWarships('화면을 떠나 군함 대기열을 중단했습니다'));
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelWarships('탭을 전환해 군함 대기열을 중단했습니다');});
+  function scheduleWarships(delay) {
+    clearTimeout(warshipTimer);
+    warshipTimer=setTimeout(()=>{warshipTimer=null;pumpWarships();},delay);
+  }
+  async function pumpWarships() {
+    if(warshipBusy||!warshipQueue.length)return;
+    warshipBusy=true;
+    const epoch=warshipEpoch,job=warshipQueue[0];let delay=80;
+    const live=()=>epoch===warshipEpoch&&warshipQueue[0]===job;
     try {
-      if (typeof game.isLand === "function" && game.isLand(tile)) {
-        toast("❌ 바다를 클릭하세요 (군함은 육지에 못 띄웁니다)", "#ffaa00");
-        setArmed(false);   // 실패했으면 무장 해제
-        return;
+      if(document.hidden||getGameView()!==job.game||job.game.myPlayer()!==job.me||job.me.isAlive?.()===false) {
+        cancelWarships('게임 상태가 바뀌어 군함 대기열을 중단했습니다');return;
       }
-    } catch (e) {}
-
-    // 항구 보유 확인 — 없으면 서버가 조용히 실패한다
-    let portCount = 0;
-    try {
-      portCount = game.units("Port").filter((u) => {
-        try { return isOwnedByMe(u, me); } catch (e) { return false; }
-      }).length;
-    } catch (e) {}
-    if (portCount === 0) {
-      toast("❌ 항구가 없습니다 — 군함은 항구에서만 건조됩니다", "#ff5555");
-      setArmed(false);   // 실패했으면 무장을 풀어 사용자가 상태를 알 수 있게
-      return;
-    }
-
-    const want = Math.max(1, Math.min(CFG.warshipCount | 0, CFG.warshipMaxCount));
-    const baseDelay = Math.max(110, CFG.warshipDelayMs | 0);   // 초당 10개 제한(100ms) 대비 여유
-
-    // 분당·초당 한도에 여유가 없으면 잠시 기다렸다가 다시 시도한다
-    const room = rateDelayFor(want);
-    if (room.allowed <= 0) {
-      const wait = room.waitSec || rateGate() || 1;
-      // 초당 한도는 짧게 기다리면 풀리므로 자동 재시도 (분당 소진은 길어서 포기)
-      if (wait <= 3) {
-        toast(`⏳ 서버 한도 — ${wait}초 후 자동 재시도`, "#ffd166");
-        setTimeout(() => { try { requestWarships(); } catch (e) {} }, wait * 1000 + 80);
-      } else {
-        toast(`⏳ 서버 한도 소진 — 약 ${wait}초 후 다시 시도하세요`, "#ffaa00");
-        setArmed(false);
-      }
-      return;
-    }
-    const count = room.allowed;
-    // 남은 분당 여유에 맞춰 간격을 늘린다 (최소 간격 유지)
-    const minGap = Math.ceil(60000 / Math.max(1, RL.perMinute - 5));
-    const delay = Math.max(baseDelay, minGap);
-    if (count < want) {
-      toast(`🚢 한도로 ${want}척 중 ${count}척만 건조합니다`, "#ffd166");
-    }
-
-    let sent = 0;
-    for (let i = 0; i < count; i++) {
-      setTimeout(() => {
-        try {
-          // amount 는 서버가 군함에 대해 무시하므로 1로 보낸다
-          bus.emit(new ctor("Warship", tile, undefined, 1));
-          rateUse();
-          sent++;
-          if (sent === count) {
-            toast(`🚢 군함 ${count}척 건조 요청 완료 (항구 ${portCount}곳)`, "#7ee787");
-          }
-        } catch (e) {
-          console.warn("[x50] 군함 건조 emit 실패:", e);
-          toast("❌ 군함 건조 발송 실패", "#ff5555");
+      if(job.pending) {
+        const created=job.game.units('Warship').find(u=>{
+          if(!u.isActive()||!isOwnedByMe(u,job.me)||job.pending.ids.has(u.id()))return false;
+          try{return u.warshipState().patrolTile===job.tile;}catch{return false;}
+        });
+        if(!created) {
+          if(Date.now()-job.pending.at>=5000)cancelWarships('군함 건조 반영을 확인하지 못해 중단했습니다. 자동으로 재전송하지 않습니다');
+          else {warshipProgress.phase='confirming';warshipProgress.message='요청한 군함이 게임에 생성되는지 확인 중';}
+          return;
         }
-      }, i * delay);
+        job.confirmed++;warshipProgress.confirmed++;job.pending=null;
+        if(job.confirmed===job.want) {
+          warshipQueue.shift();
+          if(!warshipQueue.length) {
+            warshipProgress.phase='complete';warshipProgress.message=`군함 ${warshipProgress.confirmed}척 건조 반영 확인`;
+            toast(warshipProgress.message,'#7ee787');return;
+          }
+          warshipProgress.phase='queued';warshipProgress.message='다음 클릭 위치의 군함을 순서대로 건조합니다';return;
+        }
+      }
+      const wait=rateGate();
+      if(wait>0) {
+        delay=wait*1000+80;warshipProgress.phase='rate-wait';
+        warshipProgress.message=`명령 한도 대기 · 약 ${wait}초 후 이어서 건조합니다`;return;
+      }
+      warshipProgress.phase='checking';warshipProgress.message='해당 수역의 항구와 군함 가격 확인 중';
+      let timeout;
+      const query=typeof job.me.buildables==='function'?job.me.buildables(job.tile,['Warship']):job.me.actions?.(job.tile,['Warship']);
+      const result=await Promise.race([Promise.resolve(query),new Promise((_,reject)=>{
+        timeout=setTimeout(()=>reject(Error('군함 건조 조건 조회 시간 초과')),1500);
+      })]).finally(()=>clearTimeout(timeout));
+      if(!live())return;
+      if(document.hidden||getGameView()!==job.game||job.game.myPlayer()!==job.me) {cancelWarships('게임 상태가 바뀌어 군함 대기열을 중단했습니다');return;}
+      const row=(Array.isArray(result)?result:result?.buildableUnits)?.find(u=>u.type==='Warship');
+      if(!row||!((typeof row.cost==='bigint'&&row.cost>=0n)||(Number.isSafeInteger(row.cost)&&row.cost>=0)))
+        throw Error('게임에서 군함 가격을 확인할 수 없습니다');
+      if(BigInt(job.me.gold())<BigInt(row.cost))throw Error(`골드 부족 · 다음 군함에 ${BigInt(row.cost).toLocaleString()}골드 필요`);
+      if(typeof row.canBuild!=='number'||!Number.isInteger(row.canBuild)||row.canBuild<0)
+        throw Error('이 위치에서 군함을 건조할 수 없습니다. 같은 수역의 완성된 항구와 게임 제한을 확인하세요');
+      // Other hotkeys can use capacity while the engine worker answers.
+      const waitAgain=rateGate();
+      if(waitAgain>0){delay=waitAgain*1000+80;warshipProgress.phase='rate-wait';warshipProgress.message='명령 한도 회복 후 이어서 건조합니다';return;}
+      job.pending={at:Date.now(),ids:new Set(job.game.units('Warship').map(u=>u.id()))};
+      job.bus.emit(new job.ctor('Warship',job.tile,undefined,1));rateUse();
+      warshipProgress.sent++;warshipProgress.phase='confirming';warshipProgress.message='요청한 군함이 게임에 생성되는지 확인 중';
+      delay=Math.max(120,CFG.warshipDelayMs|0);
+    } catch(error) {if(live())cancelWarships('군함 건조 중단: '+error.message);}
+    finally {if(epoch===warshipEpoch){warshipBusy=false;if(warshipQueue.length)scheduleWarships(delay);}}
+  }
+  function requestWarships() {
+    if(typeof plannerState!=='undefined'&&(plannerState.run||plannerState.pending?.execute)) {
+      toast('공격 계획 실행 중입니다. Esc로 끝낸 뒤 군함을 건조하세요','#ffd166');return;
     }
-    if (count > 1) toast(`🚢 군함 ${count}척 건조 시작…`, "#7ee787");
+    const game=getGameView(),bus=getEventBus(),me=game?.myPlayer(),ctor=findNukeEventCtor(),tile=computeCursorTile();
+    if(!game||!bus||!me||!ctor){toast('게임 시작 후 군함을 건조하세요','#ffd166');return;}
+    if(tile===null||tile===undefined||game.isLand?.(tile)) {toast('군함을 보낼 바다를 클릭하세요','#ffd166');return;}
+    if(!game.units('Port').some(u=>u.isActive()&&!u.isUnderConstruction()&&isOwnedByMe(u,me))) {
+      toast('사용할 수 있는 완성된 항구가 없습니다','#ffd166');return;
+    }
+    if(warshipQueue.length&&warshipQueue[0].game!==game)cancelWarships('게임이 바뀌어 이전 군함 대기열을 취소했습니다');
+    if(!warshipQueue.length)warshipProgress={sent:0,confirmed:0,phase:'queued',message:''};
+    const want=Math.max(1,Math.min(CFG.warshipCount|0,CFG.warshipMaxCount));
+    warshipQueue.push({game,me,bus,ctor,tile,want,confirmed:0,pending:null});
+    if(typeof plannerCancelJob==='function')plannerCancelJob();
+    toast(`군함 ${want}척 대기열 추가 · 남은 ${warshipStatus().remaining}척 (Esc: 취소)`,'#7ee787');
+    if(!warshipBusy&&warshipTimer===null)pumpWarships();
   }
 
-  // ═════════════════════════════════════════════
-  // 인텐트 속도 제한 (서버와 동일한 규칙을 클라이언트에서 미리 계산)
-  //
-  // 게임 서버(ClientMsgRateLimiter): 초당 10개 AND 분당 150개.
-  // 둘 다 통과해야 하며, 초과분은 통보 없이 조용히 버려진다(킥 아님).
-  // 분당 버킷은 시간이 아니라 '분 경계'에서 리셋되므로, 소진하면
-  // 최대 60초간 아무것도 안 먹히는 것처럼 보인다.
-  //   → 여기서 미리 세어 한도에 닿으면 발사를 막고 남은 시간을 알려준다.
-  // ═════════════════════════════════════════════
+  // 인텐트 속도 제한: 초당·분당 여유를 전송 직전에 확인한다.
   const RL = {
     perSecond: 10,
     perMinute: 150,
@@ -2816,7 +2827,7 @@
   // 무장은 클릭해도 풀리지 않는다 — V/N을 다시 누르거나 Esc 로만 해제.
   // (여러 구조물을 연속으로 올릴 때 매번 키를 다시 누르지 않도록)
   window.addEventListener("pointerdown", (e) => {
-    if (!armed) return;
+    if (!armed || hudEl?.contains(e.target)) return;
     if (e.button !== 0) return;
     lastMouse = { x: e.clientX, y: e.clientY };
     const mode = armedMode;   // 이번 클릭 처리 후에도 유지
@@ -2845,7 +2856,7 @@
     clearTimeout(idleTimer);
     if (v) {
       if (armedMode === "warship") {
-        toast(`🚢 군함 무장 ON — 바다를 클릭하면 ${CFG.warshipCount}척 건조 (N/Esc: 해제)`, "#7ee787");
+        toast(`🚢 군함 무장 ON — 바다를 클릭하면 ${CFG.warshipCount}척 건조 (N: 배치 모드 해제 / Esc: 대기열 취소)`, "#7ee787");
       } else if (armedMode === "upgradeBig") {
         const silo = (CFG.addLevelsByTypeBig && CFG.addLevelsByTypeBig["Missile Silo"]) || CFG.addLevelsBig;
         toast(`🚀 업그레이드(大) 무장 ON — 클릭당 +${CFG.addLevelsBig} (사일로 +${silo}) (X/Esc: 해제)`, "#7ee787");
@@ -2882,7 +2893,7 @@
   window.addEventListener(
     "keydown",
     (e) => {
-      if(e.code==='Escape'){cancelUpgrades();if(armed)setArmed(false);}
+      if(e.code==='Escape'){cancelUpgrades();cancelWarships();if(armed)setArmed(false);}
       if (isTypingTarget(e.target)) return;
       if(e.repeat&&[CFG.hotkeyUpgrade,CFG.hotkeyUpgradeBig,CFG.hotkeyWarship].includes(e.code)) {
         e.preventDefault();e.stopPropagation();return;
@@ -3268,7 +3279,7 @@
   // ── 디버그용 노출 (F12 콘솔: __x50) ──
   try {
     window.__x50 = {
-      CFG, setArmed, requestUpgrade, cancelUpgrades, requestWarships, rateGate, rateDelayFor, rateUse, RL,
+      CFG, setArmed, requestUpgrade, cancelUpgrades, requestWarships, warships:{state:warshipStatus,cancel:cancelWarships}, rateGate, rateDelayFor, rateUse, RL,
       fireAtoms, fireHydro, fireMax, fireMirv, startSalvo, salvoStop,
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
       samsNear, simpleShots, simpleVerdict, verdictText,

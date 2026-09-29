@@ -94,4 +94,9 @@ check('original SAM missile target field identifies interception despite stale n
 const terminal=update(4,HYDRO,1,nuke.tile(),{targetTile:cursor,isActive:false,reachedTarget:true,nukeState:nuke.nukeState()});
 nuke.update(terminal);g.lastUpdate.updates={1:[terminal]};
 check('inactive missiles leave active enumeration but keep actual reachedTarget state',()=>{assert.equal(g.units(HYDRO).length,0);assert.equal(g.unit(4).reachedTarget(),true);assert.equal(g.updatesSinceLastTick()[1][0].reachedTarget,true);});
+check('original UnitView exposes warship patrol target used for creation acknowledgment',()=>{
+ const ship=unit(update(8,'Warship',1,500100,{warshipState:{patrolTile:500700,state:'patrolling'}}));
+ assert.equal(ship.warshipState().patrolTile,500700);
+ assert.ok(g.units('Warship').some(u=>u.id()===8&&u.owner()===me));
+});
 console.log(`Original client/config boundary checks: ${checks} passed. Source: ${root}`);

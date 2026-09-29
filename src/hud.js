@@ -89,6 +89,15 @@
           {name:'발사한 수량',value:`원자 ${run.sentAtoms}발 + 수소 ${run.sentHydros}발`,note:`공격 전체 한도: 원자 ${run.atomLimit}발 · 수소 ${run.hydroLimit}발`},
           {name:'도달 확인',value:`원자 ${run.hitAtoms}발 · 수소 ${run.hitHydros}발`,note:`게임에 반영된 발사 ${run.confirmed}/${run.sent}발 · 계획 수정 ${run.replans}회`}],resources:'',defense:''};
       position=`고정 목표 (${run.current.target.x}, ${run.current.target.y})`;refresh='이미 발사한 미사일은 취소되지 않습니다.';
+    } else if(warshipQueue.length||(armed&&armedMode==='warship')) {
+      const ships=warshipStatus();
+      model={title:ships.running?(ships.phase==='rate-wait'?'군함 건조 · 한도 대기':'군함을 순서대로 건조 중'):'군함 배치 모드',
+        tone:ships.phase==='stopped'?'caution':'ready',reason:ships.message||`바다를 클릭할 때마다 군함 ${CFG.warshipCount}척을 대기열에 추가합니다.`,
+        action:'연속 클릭도 순서대로 처리합니다. Esc로 남은 요청을 취소합니다.',
+        options:[{name:'건조 반영',value:`${ships.confirmed}척 확인 / ${ships.sent}척 요청`,note:'요청 전송과 게임 생성 확인을 구분합니다.'},
+          {name:'남은 수량',value:`${ships.remaining}척 · ${ships.batches}묶음`,note:'클릭한 위치를 저장해 순서대로 처리합니다.'}],resources:'',defense:''};
+      position=ships.tile===null?'':`현재 배치 목표 (${g.x(ships.tile)}, ${g.y(ships.tile)})`;
+      refresh='N: 배치 모드 전환 · Esc: 남은 대기열 취소';
     } else if(p.lastExecution)report=[p.lastExecution,p.advice].filter(Boolean).join('\n');
     const set=(node,text)=>{text=String(text??'');if(node.textContent!==text)node.textContent=text;node.hidden=!text;};
     el.dataset.tone=model.tone;

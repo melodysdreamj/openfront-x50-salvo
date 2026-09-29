@@ -308,7 +308,7 @@
   function startStrike() {
     if(plannerState.run){toast('계획 실행 중입니다. Esc로 남은 발사를 중단할 수 있습니다','#ffd166');return;}
     if(plannerState.pending?.execute){toast('선택한 위치의 발사 계획을 검증 중입니다. Esc로 취소할 수 있습니다','#ffd166');return;}
-    if(upgradeJobs.size||upgradeSelectionPending||salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
+    if(warshipQueue.length||upgradeJobs.size||upgradeSelectionPending||salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
     const game=getGameView(),me=game?.myPlayer(),tile=computeCursorTile();
     if(!game||!me||tile===null){plannerState.error='게임에서 목표 위치에 커서를 올리세요';return;}
     plannerCancelJob();const id=plannerState.job;
@@ -342,7 +342,7 @@
   // still receives a fresh snapshot and I still independently revalidates it.
   function plannerRefreshPreview() {
     const p=plannerState,now=Date.now(),tile=computeCursorTile(),g=getGameView();
-    if(p.run)return;
+    if(p.run||warshipQueue.length||(armed&&armedMode==='warship'))return;
     if(!g?.myPlayer()){p.display=null;p.error='';return;}
     if(!p.pending?.execute&&(tile!==p.tile||g.gameID()!==p.game)) {
       const differentGame=g.gameID()!==p.game;
