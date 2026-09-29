@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      2.9.0
+// @version      3.0.1
 // @description  사설로비용 — x50 원자 살포 · 구조물 대량 업그레이드 · SAM 인식 수소타격(I: 커서 150타일 내 SAM 레벨합×1.2 → 수소 → 후속)
 // @author       local build
 // @match        https://openfront.io/*
@@ -37,6 +37,10 @@
     salvoQueueMaxItems: 50,     // 대기열 최대 건수 (연타 상한)
     salvoStopOnGold: true,      // 골드 소진 시 남은 대기열 중단 (버려질 인텐트 방지)
     salvoWaitForReload: false,  // 발사관 소진 시: false=중단 / true=재장전(9초) 대기 후 자동 재개
+    // ── v2.9.1: 분당 한도 포화 시 동작 ──
+    //   false(기본) = 즉시 중단 (남은 대기열 폐기, 토스트로 알림)
+    //   true        = 분 경계까지 대기 후 자동 재개
+    salvoWaitForMinute: false,
 
     // ── SAM 인식 살포 (v2.5) ──
     // 목표를 지키는 '적 SAM'이 있으면 수소타격으로 전환:
@@ -58,7 +62,15 @@
     // ── v2.9: 원자 N발마다 수소를 '섞어' 쏜다 ──
     //   마지막에 한 번만 쏘면 서버 창이 꽉 찼을 때 드롭(짤림)된다.
     //   살포 중간중간 섞으면 창에 여유가 있을 때 나가므로 안전하다.
-    samHydroEvery: 200,     // 원자 200발마다 수소 1발 (0=끔)
+    samHydroEvery: 200,     // (구) 자동 섞기 주기 — samBlockMode=true면 미사용
+    // ── v3.0: 블록 모드 ──
+    //   I 한 번 = '원자 samBlockAtoms발 + 수소 1발' 블록을 큐에 넣는다.
+    //   연타하면 블록이 쌓여 서버 최대 속력으로 순차 발사된다.
+    //   (SAM 계산은 HUD 표시용으로만 — 발사량은 블록이 결정)
+    samBlockMode: true,
+    samBlockAtoms: 200,     // 블록당 원자 발수
+    samBlockHydro: 1,       // 블록 뒤 수소 발수 (0=없음)
+    samAfterInBlock: false, // 블록 모드에서 후속 산개(원자 몇발+수소 몇발) 사용 여부
     samHydroEveryJitter: 20,// 발수 지터 (200±20 → 인텐트 경계와 정렬 · 티 제거)
     samRangeExtra: 0,       // SAM 참여 판정 직선 여유 (0 = 경로 판정만. 내 사일로를 못 읽으면 150 안전여유)
     samCap: 20000,          // 시뮬레이터 1회 계획의 원자 상한 (오설정 방지)
@@ -434,10 +446,16 @@
   function salvoState() {
     if (salvoQueue.length === 0 && salvoHydro === null && salvoFollow === null) return null;
     const fLeft = salvoFollow ? (salvoFollow.atomsLeft + salvoFollow.hydrosLeft) : 0;
+    // 블록에 남은 수소 (hTotal - hSent)
+    let blkHydroLeft = 0;
+    for (let i = 0; i < salvoQueue.length; i++) {
+      const it = salvoQueue[i];
+      if (it && it.hTotal) blkHydroLeft += Math.max(0, it.hTotal - (it.hSent || 0));
+    }
     return {
       items: salvoQueue.length,
       remaining: salvoPending(),
-      hydroPending: (salvoHydro ? 1 : 0) + (salvoFollow ? salvoFollow.hydrosLeft : 0),
+      hydroPending: blkHydroLeft + (salvoHydro ? 1 : 0) + (salvoFollow ? salvoFollow.hydrosLeft : 0),
       hydroFinished: salvoHydroDone,
       finished: salvoDone,
       followLeft: fLeft,
@@ -458,7 +476,8 @@
     const hFin = salvoHydroDone, hDrop = (salvoHydro ? 1 : 0) + fDrop;
     const hTxt = hFin > 0 ? ` + 수소 ${hFin}발` : "";
     salvoQueue = []; salvoHydro = null;
-    salvoDone = 0; salvoItemsDone = 0; salvoDryWaits = 0; salvoHydroDone = 0; lastStrike = null;
+    salvoDone = 0; salvoItemsDone = 0; salvoDryWaits = 0; salvoHydroDone = 0;
+    // lastStrike 는 '직전 계획'으로 남긴다 (HUD·진단이 참조). 새 살포 시작 시 갱신된다.
     if (msg) {
       toast(`${msg} — ${finished.toLocaleString()}발${hTxt} 발사됨${(dropped + hDrop) > 0 ? ` · 대기 ${(dropped + hDrop).toLocaleString()}발 폐기` : ""}`, "#ffaa00");
     } else {
@@ -1670,7 +1689,8 @@
     const hEvery = CFG.samZPure ? 0 : Math.max(0, CFG.samHydroEvery | 0);
     salvoQueue.push({ tile, total, sent: 0, bus, ctor,
                       hydroEvery: hEvery, hydroSent: 0, hydroJit: 0,
-                      hydroMax: hEvery > 0 ? Math.max(1, Math.floor(total / hEvery) - 1) : 0 });
+                      hydroMax: hEvery > 0 ? Math.max(1, Math.floor(total / hEvery) - 1) : 0,
+                      hTotal: 0, hSent: 0 });
 
     // 수소타격이면: 수소 1발 + 후속 산개를 '예약'한다.
     //   수소 발사 시각은 '첫 원자 배치가 나간 시점'부터 세는 상대 틱이다
@@ -1760,13 +1780,23 @@
   //
   //   SAM이 없으면 수소 1발만. 발사관·골드 가드만 확인한다.
   // ═════════════════════════════════════════════
+  // ═════════════════════════════════════════════
+  // I 키 — 수소타격 (v3.0 블록 모드)
+  //
+  //   한 번 누름 = '원자 200발 + 수소 1발' 블록을 큐에 넣는다.
+  //   연타하면 블록이 쌓여 서버 최대 속력으로 순차 발사된다.
+  //   (원자 200발 = 인텐트 4건, 그 뒤 수소 1건 = 5건 → 초당 10건이면 2블록/초)
+  //
+  //   SAM 계산(samsNear)은 HUD 표시용으로만 쓴다 — 발사량은 블록이 결정한다.
+  //   SAM이 전혀 없으면 수소 1발만 쏜다.
+  // ═════════════════════════════════════════════
   function startStrike() {
     let tile = null, ana = null;
     try {
       tile = computeCursorTile();
       if (tile === null) { toast("❌ 타깃 위에 커서를 올린 뒤 누르세요", "#ffaa00"); return; }
       // 지형 제한 없음 — 게임 nukeSpawn 은 산(isImpassable)만 막는다. 바다도 발사 가능.
-      ana = CFG.samSimpleMode ? samsNear(tile) : samDefenders(tile);
+      ana = samsNear(tile);   // 표시·판정용 (발사량은 블록이 결정)
     } catch (e) {
       toast("⚠️ SAM 정보를 읽을 수 없음 — 확인 실패", "#ffaa00");
       return;
@@ -1776,7 +1806,7 @@
     const bus0 = getEventBus(), ctor0 = findNukeEventCtor();
     if (!bus0 || !ctor0) { toast("❌ 경로 없음 — 게임 시작 후 다시 시도", "#ff5555"); return; }
 
-    // 발사관 가드 (준비된 관이 0이면 서버가 전부 버린다)
+    // 발사관 가드
     let ready0 = null;
     try {
       const g0 = getGameView();
@@ -1787,7 +1817,9 @@
 
     // ── SAM 없음 → 수소 1발만
     if (!(ana.n > 0) || !(ana.sumLevel > 0)) {
-      if ((CFG.samHydroCount | 0) <= 0) { toast("ℹ️ 커버하는 적 SAM 없음 — 수소 미사용 설정", "#ffd166"); return; }
+      if ((CFG.samHydroCount | 0) <= 0 && (CFG.samBlockHydro | 0) <= 0) {
+        toast("ℹ️ 커버하는 적 SAM 없음 — 수소 미사용 설정", "#ffd166"); return;
+      }
       try {
         bus0.emit(new ctor0("Hydrogen Bomb", tile, getRocketDirectionUp(), undefined));
         rateUse();
@@ -1799,47 +1831,44 @@
       return;
     }
 
-    // ── 발사량 = ΣLv × mult (기본 1.2)
-    const shots = simpleShots(ana);
-    const afterA = Math.max(0, (CFG.samAfterMin | 0) + Math.round(Math.random() * Math.max(0, (CFG.samAfterMax | 0) - (CFG.samAfterMin | 0))));
-    const afterH = Math.max(0, (CFG.samAfterHydroMin | 0) + Math.round(Math.random() * Math.max(0, (CFG.samAfterHydroMax | 0) - (CFG.samAfterHydroMin | 0))));
-    const gap0 = Math.max(120, CFG.samAfterGapMinMs | 0), gap1 = Math.max(gap0, CFG.samAfterGapMaxMs | 0);
-    const gapMs = gap0 + Math.round(Math.random() * (gap1 - gap0));
-    const cap = Math.min(CFG.samCap || 20000, 100000);
-    const total = Math.max(1, Math.min(shots, cap));
-
-    // 원자 살포 등록 (기존 대기열 사용 — 창·관·골드 가드 그대로)
+    // ── 블록 1개를 큐에 추가 (연타하면 계속 쌓임) ──
     if (salvoQueue.length >= (CFG.salvoQueueMaxItems || 50)) {
       toast(`⚠️ 대기열 가득 (${salvoQueue.length}건) — 조금 기다린 뒤 다시 누르세요`, "#ffaa00");
       return;
     }
-    const hEvery2 = Math.max(0, CFG.samHydroEvery | 0);
-    // 끝자락 제외: floor(total/간격) - 1 (잔여가 간격의 절반 이상일 때만 유효)
-    const hMax2 = hEvery2 > 0 ? Math.max(1, Math.floor(total / hEvery2) - 1) : (CFG.samHydroCount | 0);
-    salvoQueue.push({ tile, total, sent: 0, bus: bus0, ctor: ctor0,
-                      hydroEvery: hEvery2, hydroSent: 0, hydroJit: 0, hydroMax: hMax2 });
-    lastStrike = { mode: "simple", sumLevel: ana.sumLevel, n: ana.n, shots: total,
-                   mult: CFG.samSimpleMult, tile, hydroEvery: hEvery2, hydroMax: hMax2 };
+    const blkAtoms = Math.max(1, CFG.samBlockAtoms | 0 || 200);
+    const blkHydro = Math.max(0, CFG.samBlockHydro === undefined ? 1 : (CFG.samBlockHydro | 0));
+    // 원자 블록 = 1건(50발 단위 아님 — total로 관리), 수소 = hTotal
+    salvoQueue.push({ tile, total: blkAtoms, sent: 0, bus: bus0, ctor: ctor0,
+                      hydroEvery: 0, hydroSent: 0, hydroJit: 0, hydroMax: 0,
+                      hTotal: blkHydro, hSent: 0 });
 
-    // 후속 산개 예약 (수소는 이제 살포 중간에 섞이므로 마지막 별도 예약 없음 — v2.9)
-    if (salvoFollow === null && (afterA + afterH) > 0) {
-      salvoFollow = { tile: tile, bus: bus0, ctor: ctor0,
-                      atomsLeft: afterA, hydrosLeft: afterH,
-                      atoms0: afterA, hydros0: afterH,
-                      started: false, timer: null, gapMs: gapMs };
+    // 후속 산개 — 블록 모드에서는 기본 끔 (samAfterInBlock=false)
+    //   블록이 이미 원자+수소를 반복하므로 후속 산개가 불필요하고,
+    //   켜면 '수소가 몇 발 더' 나가서 블록 구조가 흐려진다.
+    const afterOn = (CFG.samAfterInBlock === true);
+    if (afterOn && salvoFollow === null) {
+      const a0 = Math.max(0, CFG.samAfterMin | 0), a1 = Math.max(a0, CFG.samAfterMax | 0);
+      const h0 = Math.max(0, CFG.samAfterHydroMin | 0), h1 = Math.max(h0, CFG.samAfterHydroMax | 0);
+      const afterA = a0 + Math.round(Math.random() * (a1 - a0));
+      const afterH = h0 + Math.round(Math.random() * (h1 - h0));
+      const g0 = Math.max(120, CFG.samAfterGapMinMs | 0), g1 = Math.max(g0, CFG.samAfterGapMaxMs | 0);
+      if (afterA + afterH > 0) {
+        salvoFollow = { tile: tile, bus: bus0, ctor: ctor0,
+                        atomsLeft: afterA, hydrosLeft: afterH,
+                        atoms0: afterA, hydros0: afterH,
+                        started: false, timer: null,
+                        gapMs: g0 + Math.round(Math.random() * (g1 - g0)) };
+      }
     }
 
-    const v0 = simpleVerdict(ana, total, tile);
-    const hEvT = Math.max(0, CFG.samHydroEvery | 0);
-    const hCntT = hEvT > 0 ? Math.ceil(total / hEvT) : 1;
-    toast(`🎯 수소타격 — SAM ${ana.n}기 ΣLv${ana.sumLevel} → 원자 ${total.toLocaleString()}발 + 💧${hCntT}발(200발마다) → 후속 ☢${afterA} 💧${afterH}`
-        + (v0 ? `  [${v0.in9 ? "9초내 OK" : "9초초과"}] [${v0.h2Pass ? "수소착탄 OK" : "수소위험"}]` : ""), "#7ee787");
-    if (v0 && !v0.h2Pass) {
-      const msg = v0.enough ? "슬롯은 채우나 창이 9초 초과 — 사일로 기수 늘리기" : `원자 부족 (${total} < 적슬롯 ${v0.slots}) — 재시도 권장`;
-      toast(`⚠️ ${msg}`, "#ffaa00");
-    }
+    const qn = salvoQueue.length;
+    const totalQ = salvoPending();
+    lastStrike = { mode: "block", tile, blockAtoms: blkAtoms, blockHydro: blkHydro,
+                   samN: ana.n, samSL: ana.sumLevel, queued: qn, pending: totalQ };
+    toast(`☢️ 수소타격 블록 — 원자 ${blkAtoms}발 + 💧${blkHydro}발  (대기 ${qn}블록 · ${totalQ.toLocaleString()}발)`, "#7ee787");
 
-    // 발사 시작 (대기열 펌프 — 창 회전 게이트·버스트 상한·골드/관 가드 전부 적용)
+    // 발사 시작
     if (salvoTimer === null) {
       try { salvoPump(); } catch (e) { console.warn("[x50] 살포 시작 실패:", e); }
     }
@@ -2009,23 +2038,32 @@
       RL.minWindow = RL.minWindow.filter((t) => now - t < 60000);
       minuteRoom = RL.perMinute - 5 - RL.minWindow.length;
       if (minuteRoom <= 0) {
-        const wait = 60000 - (now - (RL.minWindow[0] || now)) + 50;
-        toast(`⏳ 서버 분당 한도(${RL.perMinute}건) — 남은 ${Math.ceil(wait / 1000)}초 대기 후 자동 재개`, "#ffaa00");
-        salvoTimer = setTimeout(salvoPump, Math.max(1000, wait));
+        // v3.0.1: 큐를 내부 관리하므로 '중단'하지 않는다.
+        //   분당 한도 여유가 없으면 → 분 경계까지 대기 후 자동 재개 (포화 = 드롭 0).
+        const wait = Math.max(1000, 60000 - (now - (RL.minWindow[0] || now)) + 80);
+        const remain = salvoPending();
+        toast(`⏳ 서버 분당 한도(${RL.perMinute}건) — ${Math.ceil(wait / 1000)}초 후 자동 재개 (남은 ${remain.toLocaleString()}발)`, "#ffaa00");
+        salvoTimer = setTimeout(salvoPump, wait);
         return;
       }
     } catch (e) {}
 
     const per = SALVO_MAX_PER_INTENT;
 
-    // 창 회전 게이트 (v2.4): 최근 1초 안에 다른 발송(업그레이드 X 등)이 있었다면
-    // 그 창이 닫힐 때까지 기다린다 → 두 작업이 창을 나눠 써서 드롭 0.
+    // ── v3.0.1 창 관리: '여유가 있으면 즉시, 꽉 찼으면 회전 대기' (최대 속력) ──
+    //   이전(v2.4)은 창에 1건이라도 있으면 무조건 1050ms를 기다려서 속력이 떨어졌다.
+    //   이제는 남은 여유(perSecond - 사용량)만큼 바로 보내고, 꽉 찼을 때만 창 회전을 기다린다.
+    let secRoom = null;   // 이번 초 창의 남은 여유 (null=확인 불가)
     try {
       const now2 = Date.now();
       RL.secWindow = RL.secWindow.filter((x) => now2 - x < 1000);
-      if (RL.secWindow.length > 0) {
-        const wait = RL.secWindow[RL.secWindow.length - 1] + 1050 - now2;
-        if (wait > 0) { salvoTimer = setTimeout(salvoPump, wait); return; }
+      secRoom = Math.max(0, RL.perSecond - RL.secWindow.length);
+      if (secRoom <= 0) {
+        // 꽉 찼다 → 가장 오래된 건이 창을 벗어나는 시각까지 대기 (그때 여유가 생긴다)
+        const oldest = RL.secWindow[0];
+        const wait = Math.max(30, oldest + 1010 - now2);
+        salvoTimer = setTimeout(salvoPump, wait);
+        return;
       }
     } catch (e) {}
 
@@ -2058,6 +2096,8 @@
     // 분당 한도의 '남은 여유'도 이번 창의 상한이다
     //   → 한도 직전에 몰아 보내 조용히 버려지는 것을 막는다
     if (minuteRoom !== null && minuteRoom < batch) batch = Math.max(1, minuteRoom);
+    // 초당 창의 잔여 여유만큼만 (넘기면 서버가 버린다 = 포화)
+    if (secRoom !== null && secRoom < batch) batch = Math.max(1, secRoom);
 
     // ── 골드 가드 ──
     // 서버는 폭탄 '1발 단위'로 골드를 검사한다(canBuildUnitType: _gold < cost).
@@ -2129,7 +2169,26 @@
         salvoHydro.armedAt = Date.now();
         try { armHydroTimer(); } catch (e) {}
       }
-      if (item.sent >= item.total) {   // 이 건 완료 → 같은 창에서 다음 건으로 '즉시' 이어감
+      // ── 블록의 수소 (hTotal): 원자가 다 나간 뒤 수소를 1발씩 발사 ──
+      //   창에 여유가 있을 때만 (없으면 다음 창에서 재시도)
+      if (item.sent >= item.total && item.hSent < item.hTotal) {
+        let roomH = true;
+        try {
+          const nw2 = Date.now();
+          RL.secWindow = RL.secWindow.filter((x) => nw2 - x < 1000);
+          if (RL.secWindow.length >= RL.perSecond) roomH = false;
+        } catch (e) {}
+        if (roomH) {
+          try {
+            item.bus.emit(new item.ctor("Hydrogen Bomb", item.tile, getRocketDirectionUp(), undefined));
+            rateUse();
+            item.hSent++;
+            salvoHydroDone++;
+            n++;
+          } catch (e) { console.warn("[x50] 블록 수소 emit 실패:", e); }
+        }
+      }
+      if (item.sent >= item.total && item.hSent >= item.hTotal) {   // 이 건 완료 → 다음 건으로 즉시
         salvoQueue.shift();
         salvoItemsDone++;
       }
@@ -2148,7 +2207,18 @@
       salvoClear(null); return;
     }
     toast(`☢️ 대량 발사 누적 ${salvoDone.toLocaleString()}발 · 남은 ${salvoPending().toLocaleString()}발 (대기열 ${salvoQueue.length}건)`, "#ffd166");
-    salvoTimer = setTimeout(salvoPump, salvoPeriodMs());
+    // v3.0.1: 이번 창에 여유가 남았으면 즉시 다음 묶음을 보낸다 (최대 속력).
+    //   꽉 찼으면 창 회전까지 대기.
+    let nextWait = 40;
+    try {
+      const now3 = Date.now();
+      RL.secWindow = RL.secWindow.filter((x) => now3 - x < 1000);
+      const room3 = RL.perSecond - RL.secWindow.length;
+      if (room3 <= 0 && RL.secWindow.length > 0) {
+        nextWait = Math.max(30, RL.secWindow[0] + 1010 - now3);
+      }
+    } catch (e) { nextWait = salvoPeriodMs(); }
+    salvoTimer = setTimeout(salvoPump, nextWait);
   }
 
   // ═════════════════════════════════════════════
@@ -3004,6 +3074,16 @@
             if (all > 0) hint = ` (지도에 ${all}기 — 반경 밖/아군)`;
           } catch (e) {}
           hudCache = `🎯 SAM 없음 (${CFG.samSimpleRange}타일 내) — I=수소 1발${hint}`;
+          return hudCache;
+        }
+        // ── v3.0 블록 모드: I 1회 = 원자 N + 수소 M, 연타로 누적 ──
+        if (CFG.samBlockMode) {
+          const bA = Math.max(1, CFG.samBlockAtoms | 0 || 200);
+          const bH = Math.max(0, CFG.samBlockHydro === undefined ? 1 : (CFG.samBlockHydro | 0));
+          const qn = salvoQueue.length, pend = salvoPending();
+          const qTxt = qn > 0 ? `\n📦 대기 ${qn}블록 · ${pend.toLocaleString()}발` : "";
+          hudCache = `🎯 SAM ${sn.n}기 ΣLv${sn.sumLevel} (${sn.range}타일 내)\n`
+                   + `I 1회 = ☢ ${bA}발 + 💧${bH}발 (연타=누적 최대속력)${qTxt}`;
           return hudCache;
         }
         const shots = simpleShots(sn);
