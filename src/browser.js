@@ -1,7 +1,9 @@
   // Predictive I/HUD integration. The old manual H/J/Z/etc. remain available.
-  const plannerSettings = {maxAtoms:2000,minAtomHits:1,budgetMs:1800,maxTicks:1200,details:false};
+  const plannerSettings = {maxAtoms:2000,maxHydros:1,minAtomHits:1,budgetMs:1800,maxTicks:1200,
+    adaptiveBudgetMs:350,maxReplans:12,details:false};
   const plannerState = {worker:null,job:0,pending:null,tile:null,game:null,result:null,
-    snapshot:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:''};
+    snapshot:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
+  const plannerPaths=new WeakMap();
 
   function plannerSnapshot(tile) {
     const g=getGameView(), me=g?.myPlayer();
@@ -50,15 +52,19 @@
     const allowedFor=type=>!cfg.isUnitDisabled(type)&&!ownTeam&&!teamStructures.some(u=>dist2(target,{x:g.x(u.tile()),y:g.y(u.tile())})<=cfg.nukeMagnitudes(type).outer**2);
     const allowed={atomic:allowedFor(ATOM),mixed:allowedFor(HYDRO)};
     const inflight=[];
+    const samTargets=new Set(g.units('SAM Missile').filter(u=>u.isActive()).map(u=>u.state?.targetUnitId??u.targetUnit?.()?.id?.()));
     for(const type of [ATOM,HYDRO,'MIRV Warhead']) for(const u of g.units(type)) {
       if(!u.isActive()) continue;
-      // Flight state is recorded for diagnostics. Validation does not depend on
-      // these missiles draining enemy SAM slots; only observed cooldowns count.
+      // Only confirmed launches from this operation are credited during adaptation.
       let ns; try{ns=u.nukeState();}catch{continue;}
       const p=ns.trajectory??[];
-      inflight.push({id:u.id(),type,owner:u.owner().smallID(),targeted:!!ns.targetedBySam,
-        index:ns.trajectoryIndex??0,waitTicks:ns.waitTicks??0,target:target,
-        path:p.map(v=>({tile:{x:g.x(v.tile),y:g.y(v.tile)},targetable:v.targetable}))});
+      let path=plannerPaths.get(p);
+      if(!path){path=p.map(v=>({tile:{x:g.x(v.tile),y:g.y(v.tile)},targetable:v.targetable}));plannerPaths.set(p,path);}
+      const targetTile=u.targetTile();let progress=null,progressError='';
+      try{progress=flightProgress(path,{x:g.x(u.tile()),y:g.y(u.tile())},ns,g.motionPlans?.().get(u.id()),tick);}catch(e){progressError=e.message;}
+      inflight.push({id:u.id(),type,owner:u.owner().smallID(),targeted:!!ns.targetedBySam||samTargets.has(u.id()),
+        index:progress?.index??0,waitTicks:progress?.waitTicks??0,progressError,
+        targetTile,target:{x:g.x(targetTile),y:g.y(targetTile)},path});
     }
     const s={tick,game,tile,target,width:g.width(),height:g.height(),me:me.smallID(),rules,silos,sams,inflight,
       gold:BigInt(me.gold()),atomCost:price(ATOM),hydroCost:price(HYDRO),allowed,preferredUp:getRocketDirectionUp(),
@@ -71,8 +77,10 @@
       s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building]),s.sams.map(u=>[u.id,u.x,u.y,u.level,u.building,u.upgrade])]);
   }
   function plannerStop(reason='사용자가 남은 발사를 중단했습니다') {
+    plannerCancelJob();
     if(plannerState.timer!==null) clearTimeout(plannerState.timer);
     const run=plannerState.run;
+    if(run)plannerState.report={sentAtoms:run.sentAtoms,sentHydros:run.sentHydros,hitAtoms:run.hitAtoms,hitHydros:run.hitHydros,replans:run.replans,history:[...run.history]};
     plannerState.run=null;plannerState.timer=null;
     plannerState.lastExecution=reason;
     if(run) toast(reason+' · 이미 발사한 미사일은 유지됩니다','#ffd166');
@@ -83,6 +91,7 @@
     plannerState.pending=null; plannerState.job++;
   }
   function plannerCompute(snapshot,execute=false) {
+    if(plannerState.run)return;
     plannerCancelJob();
     const id=plannerState.job;
     plannerState.error='';plannerState.result=null;plannerState.snapshot=snapshot;
@@ -108,91 +117,183 @@
         plannerExecute(snapshot,result);
       }
     };
-    worker.postMessage({id,snapshot,options:{...plannerSettings,budgetMs}});
+    worker.postMessage({id,snapshot,options:{...plannerSettings,budgetMs,allowNewHydro:plannerSettings.maxHydros>0}});
   }
 
-  // A plan is revalidated from a fresh snapshot immediately before the first
-  // intent. It then follows game ticks, never delayed wall-clock catch-up bursts.
+  function plannerJob(kind,data,budget,done,fail) {
+    plannerCancelJob();
+    const id=plannerState.job,url=URL.createObjectURL(new Blob([PLANNER_WORKER_SOURCE],{type:'text/javascript'}));
+    let worker;
+    try{worker=new Worker(url);}catch(e){URL.revokeObjectURL(url);fail(e.message);return;}
+    URL.revokeObjectURL(url);plannerState.worker=worker;
+    const failed=message=>{if(id!==plannerState.job)return;plannerCancelJob();fail(message);};
+    plannerState.pending={id,execute:true,kind,timeout:setTimeout(()=>failed('계산 시간 초과'),budget+1500)};
+    worker.onerror=e=>failed(e.message);
+    worker.onmessage=e=>{
+      if(id!==plannerState.job)return;
+      clearTimeout(plannerState.pending.timeout);plannerState.pending=null;plannerState.worker=null;worker.terminate();
+      if(e.data.error)fail(e.data.error);else done(e.data.result);
+    };
+    worker.postMessage({id,kind,...data});
+  }
+
+  // Freeze limits for the whole operation, including every later revision.
   function plannerExecute(snapshot,result) {
     let fresh;
-    try { fresh=plannerSnapshot(snapshot.tile); }catch(e){plannerState.error=e.message;return;}
+    try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
     if(plannerFingerprint(fresh)!==plannerFingerprint(snapshot)) {
       plannerState.error='계산 중 구조물·규칙이 바뀌었습니다. I로 다시 분석하세요';return;
     }
-    // Exact simulation is expensive; run this last validation off the UI thread.
-    const blob=new Blob([PLANNER_WORKER_SOURCE.replace(/self\.onmessage = e =>[\s\S]*$/,
-      'self.onmessage = e => {try { self.postMessage(assess(e.data.snapshot,e.data.plan,{minAtomHits:e.data.minHits,deadline:performance.now()+2500})); } catch(e){self.postMessage({ok:false,error:e.message});}};')],{type:'text/javascript'});
-    const url=URL.createObjectURL(blob);let worker;
-    try{worker=new Worker(url);}catch(e){URL.revokeObjectURL(url);plannerState.error='발사 검증을 시작할 수 없습니다: '+e.message;return;}
-    URL.revokeObjectURL(url);
-    const id=++plannerState.job;plannerState.worker=worker;
-    const timeout=setTimeout(()=>{if(id===plannerState.job){plannerCancelJob();plannerState.error='발사 직전 검증 시간 초과 — 발사하지 않았습니다';}},3500);
-    plannerState.pending={id,execute:true,timeout};
-    worker.onerror=e=>{if(id===plannerState.job){plannerCancelJob();plannerState.error='발사 검증 오류: '+e.message;}};
-    worker.onmessage=e=>{
-      if(id!==plannerState.job)return;
-      clearTimeout(timeout);worker.terminate();plannerState.worker=null;plannerState.pending=null;
-      if(!e.data.ok){plannerState.error='현재 상태에서 계획이 유효하지 않습니다. I로 다시 분석하세요';return;}
-      let current;try{current=plannerSnapshot(snapshot.tile);}catch(err){plannerState.error=err.message;return;}
+    plannerJob('assess',{snapshot:fresh,plan:result.chosen,options:{minAtomHits:plannerSettings.minAtomHits,budgetMs:2500}},2500,check=>{
+      if(!check.ok){plannerState.error='현재 상태에서 계획이 유효하지 않습니다. I로 다시 분석하세요';return;}
+      let current;try{current=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
       if(current.tick-fresh.tick>2||plannerFingerprint(current)!==plannerFingerprint(fresh)||
         JSON.stringify(current.silos.map(s=>s.queue))!==JSON.stringify(fresh.silos.map(s=>s.queue))||
         JSON.stringify(current.sams.map(s=>s.queue))!==JSON.stringify(fresh.sams.map(s=>s.queue))) {
         plannerState.error='발사 직전 상태가 변했습니다. I로 다시 분석하세요';return;
       }
-      const plan=result.chosen;
-      if(current.gold<plan.cost||rateGate()>0){plannerState.error='골드 또는 명령 한도가 부족합니다. 회복 후 I로 다시 분석하세요';return;}
-      const bus=getEventBus(),ctor=findNukeEventCtor();
+      const plan=result.chosen,bus=getEventBus(),ctor=findNukeEventCtor();
+      if(current.gold<plan.cost||rateGate()>0){plannerState.error='골드 또는 명령 한도가 부족합니다';return;}
       if(!bus||!ctor){plannerState.error='게임 발사 이벤트를 찾지 못했습니다';return;}
       const ids=new Set(getGameView().units(ATOM,HYDRO).map(u=>u.id()));
-      plannerState.run={plan,tile:snapshot.tile,game:snapshot.game,me:snapshot.me,fingerprint:plannerFingerprint(current),
-        baseTick:current.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,observed:new Set(),lastSendTick:0,
-        startedAt:Date.now(),lastTick:current.tick,lastTickAt:Date.now(),bus,ctor};
-      plannerState.lastExecution='';
+      const run={plan,tile:snapshot.tile,game:snapshot.game,me:snapshot.me,rules:JSON.stringify(current.rules),
+        baseTick:current.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,tracked:new Map(),outbox:[],
+        atomLimit:Math.min(5000,Math.max(0,plannerSettings.maxAtoms)),hydroLimit:Math.max(0,plannerSettings.maxHydros),
+        minHits:Math.max(1,plannerSettings.minAtomHits),goal:plan.goal??(plan.hydros?'hydro':'atomic'),
+        hitAtoms:0,hitHydros:0,replans:0,phase:'firing',reason:'검증된 계획 실행',needsReplan:false,
+        startedTick:current.tick,lastTick:current.tick,lastTickAt:Date.now(),bus,ctor,current,
+        signature:defenseSignature(current),risk:'',history:[]};
+      plannerState.run=run;plannerState.lastExecution='';plannerState.advice=null;plannerState.report=null;
       plannerPump();
-    };
-    worker.postMessage({snapshot:fresh,plan:result.chosen,minHits:plannerSettings.minAtomHits});
+    },message=>{plannerState.error='발사 검증 오류: '+message;});
+  }
+
+  function plannerObserve(run,current) {
+    const g=getGameView(),records=new Map();
+    for(const u of g.units(ATOM,HYDRO))records.set(u.id(),{id:u.id(),unitType:u.type(),ownerID:u.owner().smallID(),
+      targetTile:u.targetTile(),isActive:u.isActive(),reachedTarget:u.reachedTarget?.()??false});
+    // Capture terminal states even when the active-unit list already dropped it.
+    for(const entries of Object.values(g.updatesSinceLastTick?.()??{}))if(Array.isArray(entries))
+      for(const u of entries)if([ATOM,HYDRO].includes(u.unitType))records.set(u.id,u);
+    for(const [id] of run.tracked)if(!records.has(id)) {
+      const u=g.unit?.(id);
+      if(u)records.set(id,{id,unitType:u.type(),ownerID:u.owner().smallID(),targetTile:u.targetTile(),isActive:u.isActive(),reachedTarget:u.reachedTarget?.()??false});
+    }
+    for(const u of records.values()) {
+      if(run.ids.has(u.id)||u.ownerID!==run.me)continue;
+      if(!run.tracked.has(u.id)) {
+        const request=run.outbox.find(v=>v.type===u.unitType&&v.acked<v.amount);
+        if(u.targetTile!==run.tile||!request)throw Error('계획 외 발사가 감지되었습니다');
+        request.acked++;run.confirmed++;
+        run.tracked.set(u.id,{id:u.id,type:u.unitType,active:true,hit:false,missing:false});
+      }
+      const entry=run.tracked.get(u.id);
+      entry.active=u.isActive;
+      if(u.reachedTarget&&!entry.hit){entry.hit=true;if(entry.type===HYDRO)run.hitHydros++;else run.hitAtoms++;}
+    }
+    const activeIds=new Set(current.inflight.map(b=>b.id));
+    for(const entry of run.tracked.values())if(entry.active&&!activeIds.has(entry.id)) {
+      entry.active=false;entry.missing=true; // disappearance is never a confirmed hit
+    }
+    for(const b of current.inflight) {
+      b.committed=run.tracked.has(b.id)&&b.owner===run.me&&b.targetTile===run.tile;
+      if(b.committed&&b.progressError)throw Error(b.progressError);
+    }
+    current.includeCommitted=true;current.confirmedAtomHits=run.hitAtoms;current.confirmedHydroHits=run.hitHydros;
+    run.current=current;
+    const pending=run.outbox.find(v=>v.acked<v.amount);
+    if(pending&&current.tick-pending.tick>12)throw Error('발사 요청의 게임 반영을 확인하지 못했습니다');
+  }
+  function plannerRisk(s) {
+    return JSON.stringify([s.confirmedAtomHits,s.confirmedHydroHits,
+      s.inflight.filter(b=>b.committed).map(b=>[b.id,b.targeted])]);
+  }
+  function plannerFinish(reason,s,advice=false) {
+    const run=plannerState.run;
+    plannerStop(reason);
+    if(!advice||!run)return;
+    plannerState.advice='다음 공격에 필요한 조건을 확인 중…';
+    plannerJob('advice',{snapshot:s,options:{maxAtoms:run.atomLimit,minAtomHits:run.minHits,budgetMs:800,allowNewHydro:run.hydroLimit>0}},800,result=>{
+      plannerState.advice=result.text;
+    },message=>{plannerState.advice='구체적인 레벨업 조건을 확인하지 못했습니다: '+message;});
+  }
+  function plannerReplan(run,s) {
+    if(run.sent!==run.confirmed){run.phase='waiting-ack';return;}
+    if(run.replans>=plannerSettings.maxReplans)return plannerFinish('방어 변화가 반복되어 재계산 한도에 도달했습니다',s,true);
+    run.replans++;run.phase='adapting';run.needsReplan=false;
+    const budget=Math.max(50,Math.min(1500,plannerSettings.adaptiveBudgetMs)),lead=Math.ceil(budget/100)+2;
+    const signature=defenseSignature(s),risk=plannerRisk(s);
+    const remaining=remainingPlan(run.plan,run.index,run.baseTick,s.tick,lead);
+    plannerJob('adapt',{snapshot:s,request:{remaining,goal:run.goal,atomLimit:run.atomLimit,hydroLimit:run.hydroLimit,
+      sentAtoms:run.sentAtoms,sentHydros:run.sentHydros},options:{minAtomHits:run.minHits,maxTicks:plannerSettings.maxTicks,budgetMs:budget,initialTicks:lead}},budget,result=>{
+      if(plannerState.run!==run)return;
+      let fresh;
+      try{fresh=plannerSnapshot(run.tile);plannerObserve(run,fresh);}catch(e){return plannerFinish(e.message,run.current,false);}
+      const first=result.chosen?.actions[0];
+      if(signature!==defenseSignature(fresh)||risk!==plannerRisk(fresh)||(first&&s.tick+first.tick<=fresh.tick)||fresh.tick-s.tick>lead) {
+        run.phase='waiting-ack';run.needsReplan=true;run.reason='계산 중 상태가 바뀌어 다시 검증';return;
+      }
+      if(!result.chosen)return plannerFinish('남은 발사 중단: '+result.reason,fresh,true);
+      run.plan=result.chosen;run.baseTick=s.tick;run.index=0;run.signature=signature;
+      run.goal=run.plan.goal??(run.plan.hydros?'hydro':'atomic');
+      run.phase=run.plan.actions.length?'firing':'observing';run.reason=result.reason;
+      run.history.push({tick:fresh.tick,decision:result.decision,atoms:run.plan.atoms,hydros:run.plan.hydros,reason:result.reason});
+      run.needsReplan=false;
+    },message=>{if(plannerState.run===run)plannerFinish('재계산 실패로 남은 발사 중단: '+message,run.current,true);});
   }
 
   function plannerPump() {
     plannerState.timer=null;
     const run=plannerState.run;if(!run)return;
     try {
-      if(document.hidden) return plannerStop('탭이 숨겨져 남은 발사를 중단했습니다');
+      if(document.hidden)return plannerStop('탭이 숨겨져 남은 발사를 중단했습니다');
+      if(getGameView()?.ticks()===run.sampledTick) {
+        if(Date.now()-run.lastTickAt>2000)return plannerStop('게임 진행이 멈춰 남은 발사를 중단했습니다');
+        plannerState.timer=setTimeout(plannerPump,40);return;
+      }
       const current=plannerSnapshot(run.tile),tick=current.tick;
-      if(current.game!==run.game||current.me!==run.me||plannerFingerprint(current)!==run.fingerprint)
-        return plannerStop('구조물·소유권·발사 조건이 바뀌어 남은 발사를 중단했습니다');
+      run.sampledTick=tick;
+      if(current.game!==run.game||current.me!==run.me||JSON.stringify(current.rules)!==run.rules)
+        return plannerStop('게임·플레이어·규칙이 바뀌어 남은 발사를 중단했습니다');
       if(tick!==run.lastTick){run.lastTick=tick;run.lastTickAt=Date.now();}
       if(Date.now()-run.lastTickAt>2000)return plannerStop('게임 진행이 멈춰 남은 발사를 중단했습니다');
-      for(const u of getGameView().units(ATOM,HYDRO)) {
-        if(run.ids.has(u.id())||run.observed.has(u.id())||u.owner().smallID()!==run.me)continue;
-        run.observed.add(u.id());
-        if(u.targetTile()!==run.tile)return plannerStop('다른 위치의 발사를 감지해 계획을 중단했습니다');
-        run.confirmed++;
+      if(tick-run.startedTick>plannerSettings.maxTicks)return plannerFinish('공격 관측 제한 시간에 도달했습니다',current,false);
+      plannerObserve(run,current);
+      if(run.hitHydros>=1||(run.goal==='atomic'&&run.hitAtoms>=run.minHits))
+        return plannerFinish(`목표 도달 확인: 수소 ${run.hitHydros}발 · 원자 ${run.hitAtoms}발`,current,false);
+      const signature=defenseSignature(current);
+      if(signature!==run.signature){run.needsReplan=true;run.reason='SAM·사일로 변화 감지 — 남은 발사 보류';}
+      for(const b of current.inflight)if(b.committed&&b.type===HYDRO&&b.targeted&&!run.tracked.get(b.id).targeted) {
+        run.tracked.get(b.id).targeted=true;run.needsReplan=true;run.reason='수소탄에 요격 미사일 배정 감지';
       }
-      if(run.confirmed>run.sent)return plannerStop('계획 외 발사를 감지해 남은 발사를 중단했습니다');
-      if(run.sent>run.confirmed&&tick-run.lastSendTick>12)return plannerStop('발사 요청의 게임 반영을 확인하지 못해 중단했습니다');
-      const action=run.plan.actions[run.index];
-      if(!action) {
-        if(run.confirmed===run.sent) {
-          plannerState.lastExecution=`발사 반영 확인: 원자 ${run.sentAtoms}발 · 수소 ${run.sentHydros}발 (명중 확인 아님)`;
-          plannerState.run=null;plannerState.updated=0;return;
-        }
-      } else {
-        const due=run.baseTick+action.tick;
-        if(tick>due)return plannerStop('예정 시각을 놓쳐 남은 발사를 중단했습니다');
-        if(tick>=due) {
-          if(rateGate()>0)return plannerStop('명령 한도에 도달해 남은 발사를 중단했습니다');
-          const cost=(action.type===HYDRO?current.hydroCost:current.atomCost)*BigInt(action.amount);
+      if(run.phase!=='adapting') {
+        const action=run.plan.actions[run.index];
+        if(action&&tick>run.baseTick+action.tick){run.needsReplan=true;run.reason='예정 발사 시각을 놓쳐 일정 재검증';}
+        if(run.needsReplan)plannerReplan(run,current);
+        else if(action&&tick>=run.baseTick+action.tick) {
+          const hydro=action.type===HYDRO;
+          if((hydro?run.sentHydros+action.amount>run.hydroLimit:run.sentAtoms+action.amount>run.atomLimit))
+            return plannerFinish('이번 공격의 누적 발사 한도에 도달했습니다',current,true);
+          const cost=(hydro?current.hydroCost:current.atomCost)*BigInt(action.amount);
           const ready=current.silos.reduce((sum,s)=>sum+(s.building?0:Math.max(0,s.level-s.queue.length)),0);
-          // Reserve sent but not yet acknowledged requests to prevent overbooking.
-          if(current.gold<cost||ready-(run.sent-run.confirmed)<action.amount)return plannerStop('골드·준비된 발사관이 계획보다 부족해 중단했습니다');
-          run.bus.emit(new run.ctor(action.type,run.tile,run.plan.up,action.amount));rateUse();
-          run.sent+=action.amount;run.index++;run.lastSendTick=tick;
-          if(action.type===HYDRO)run.sentHydros+=action.amount;else run.sentAtoms+=action.amount;
+          if(rateGate()>0||current.gold<cost||ready-(run.sent-run.confirmed)<action.amount||
+            (hydro?current.allowed.mixed===false:current.allowed.atomic===false)) {
+            run.needsReplan=true;run.reason='골드·발사관·명령 한도 변경 — 남은 발사 보류';plannerReplan(run,current);
+          }else {
+            // Reserve before emit so a synchronous test adapter cannot race ACK.
+            run.outbox.push({type:action.type,amount:action.amount,acked:0,tick});
+            run.bus.emit(new run.ctor(action.type,run.tile,run.plan.up,action.amount));rateUse();
+            run.sent+=action.amount;run.index++;
+            if(hydro)run.sentHydros+=action.amount;else run.sentAtoms+=action.amount;
+          }
+        }else if(!action) {
+          run.phase=run.sent===run.confirmed?'observing':'waiting-ack';
+          if(run.sent===run.confirmed&&!current.inflight.some(b=>b.committed))
+            return plannerFinish(`비행 종료 · 목표 도달 확인 부족 (수소 ${run.hitHydros}, 원자 ${run.hitAtoms})`,current,true);
         }
       }
     }catch(e){return plannerStop('상태 확인 실패로 중단: '+e.message);}
-    plannerState.timer=setTimeout(plannerPump,40);
+    if(plannerState.run===run)plannerState.timer=setTimeout(plannerPump,40);
   }
 
   function startStrike() {
@@ -222,7 +323,11 @@
   }
   function hudTargetLine() {
     const p=plannerState,now=Date.now(),tile=computeCursorTile(),g=getGameView();
-    if(p.run)return `공격 실행 중 · Esc: 남은 발사 중단\n원자 ${p.run.sentAtoms}/${p.run.plan.atoms} · 수소 ${p.run.sentHydros}/${p.run.plan.hydros}\n게임 반영 ${p.run.confirmed}/${p.run.sent}발\n목표 고정: (${p.snapshot.target.x}, ${p.snapshot.target.y})`;
+    if(p.run) {
+      const run=p.run,phase={firing:'발사 중',adapting:'변화 감지 · 재계산 중',observing:'비행 관측 중','waiting-ack':'발사 반영 대기'}[run.phase];
+      return `${phase} · Esc: 남은 발사 중단\n${run.reason}\n누적 원자 ${run.sentAtoms}/${run.atomLimit} · 수소 ${run.sentHydros}/${run.hydroLimit}\n남은 계획: 원자 ${run.plan.actions.slice(run.index).filter(a=>a.type===ATOM).reduce((n,a)=>n+a.amount,0)} · 수소 ${run.plan.actions.slice(run.index).filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)}\n게임 반영 ${run.confirmed}/${run.sent} · 수정 ${run.replans}회\n도달 확인: 원자 ${run.hitAtoms} · 수소 ${run.hitHydros}\n목표 고정: (${run.current.target.x}, ${run.current.target.y})`;
+    }
+    const report=[p.lastExecution,p.advice].filter(Boolean).join('\n');
     if(!g?.myPlayer())return '공격 분석 · 게임에서 목표에 커서를 올리세요';
     if(!p.pending?.execute&&(tile!==p.tile||g.gameID()!==p.game)) {
       plannerCancelJob();p.tile=tile;p.game=g.gameID();p.result=null;p.error='';p.stableAt=now;p.updated=0;
@@ -230,10 +335,10 @@
     if(!p.pending && !document.hidden && now-p.stableAt>350 && now-p.updated>2500) {
       try{plannerCompute(plannerSnapshot(tile));}catch(e){p.error=e.message;p.updated=now;}
     }
-    if(p.pending)return `${p.pending.execute?'발사 전 검증':'공격 분석'} 중…\n${p.pending.execute?'선택한 목표 고정 · Esc로 취소':'커서를 잠시 멈추면 두 공격 방식을 비교합니다'}`;
-    if(p.error)return '판정 불가 · '+p.error;
+    if(p.pending)return `${report?report+'\n':''}${p.pending.kind==='advice'?'중단 후 조언':p.pending.execute?'발사 전 검증':'공격 분석'} 중…\n${p.pending.execute?'선택한 목표 고정 · Esc로 취소':'커서를 잠시 멈추면 두 공격 방식을 비교합니다'}`;
+    if(p.error)return [report,'판정 불가 · '+p.error].filter(Boolean).join('\n');
     const r=p.result;
-    if(!r)return '공격 분석 · 목표에 커서를 잠시 멈추세요';
+    if(!r)return [report,'공격 분석 · 목표에 커서를 잠시 멈추세요'].filter(Boolean).join('\n');
     const title=r.chosen?(r.mode==='mixed'?'수소 혼합 추천':'원자 집중 추천'):(r.limited?'계산 미완료':'현재 탐색 범위에서 돌파 어려움');
     const used=r.chosen?.usedSilos.length??0;
     const lines=[title+' · 현재 상태 기준 예측',
@@ -255,10 +360,10 @@
     }
     lines.push('F8: 배치 상세 '+(plannerSettings.details?'접기':'보기'));
     if(hudEl){hudEl.style.pointerEvents=plannerSettings.details?'auto':'none';hudEl.style.overflowY=plannerSettings.details?'auto':'hidden';}
-    if(p.lastExecution)lines.push(p.lastExecution);
+    if(report)lines.unshift(report);
     return lines.join('\n');
   }
   const plannerDebug={settings:plannerSettings,snapshot:()=>plannerSnapshot(computeCursorTile()),
     result:()=>plannerState.result,stop:()=>{plannerCancelJob();plannerStop();},
-    analyze:()=>plannerCompute(plannerSnapshot(computeCursorTile())),execute:startStrike,simulate,search,state:()=>({pending:!!plannerState.pending,running:!!plannerState.run,error:plannerState.error}),
+    analyze:()=>plannerCompute(plannerSnapshot(computeCursorTile())),execute:startStrike,simulate,search,trajectory,state:()=>({pending:!!plannerState.pending,running:!!plannerState.run,error:plannerState.error,phase:plannerState.run?.phase,reason:plannerState.run?.reason,lastExecution:plannerState.lastExecution,advice:plannerState.advice,report:plannerState.report,replans:plannerState.run?.replans,history:plannerState.run?.history}),
     inspect:()=>({snapshot:plannerState.snapshot,result:plannerState.result})};

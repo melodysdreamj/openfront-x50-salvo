@@ -3,7 +3,7 @@
 <style>body{margin:0;background:#1b2b35;color:#e6edf3;font:16px/1.5 system-ui}main{margin:28px;max-width:600px}h1{font-size:24px}p{color:#bdcbd5}#map{position:fixed;inset:160px 20px 20px;border:1px solid #52716c;background:#2c4e43}#map:after{content:"모의 지도 · 커서 목표";position:absolute;right:10%;top:30%;color:#f3d7a5}build-menu{display:none}</style>
 <main><h1>공격 계산기 검증 화면</h1><p>실제 게임이 아닌 브라우저 통합 테스트용 모의 상태입니다. I: 분석·발사 / Esc: 취소 / F8: 상세</p></main><div id="map"></div><build-menu></build-menu>
 <script>
-let tick=1000,nextId=50,gold=10000000000n;
+let tick=1000,nextId=50,gold=10000000000n;const motions=new Map();let updates=[];
 const me={smallID:()=>1,id:()=>"me",isPlayer:()=>true,isAlive:()=>true,isOnSameTeam:()=>false,gold:()=>gold};
 const enemy={smallID:()=>2,id:()=>"enemy",isPlayer:()=>true,isOnSameTeam:()=>false};
 function unit(id,type,x,y,lv,owner){let q=[];return {id:()=>id,type:()=>type,tile:()=>y*1000+x,owner:()=>owner,level:()=>lv,missileTimerQueue:()=>q,isActive:()=>true,isUnderConstruction:()=>false,state:{samUpgradeStartTick:null},targetTile:()=>null};}
@@ -13,12 +13,20 @@ unitInfo:type=>({cost:()=>type==='Hydrogen Bomb'?5000000n:750000n}),isUnitDisabl
 class BuildUnitIntentEvent{constructor(unit,tile,rocketDirectionUp,amount){Object.assign(this,{unit,tile,rocketDirectionUp,amount});}}
 const sent=[];const bus={listeners:new Map([[BuildUnitIntentEvent,[]]]),emit(e){sent.push({tick,...e});setTimeout(()=>{
   for(let i=0;i<(e.amount??1);i++){const silo=units.find(u=>u.type()==='Missile Silo'&&u.missileTimerQueue().length<u.level());if(!silo)break;silo.missileTimerQueue().push(tick);gold-=e.unit==='Hydrogen Bomb'?5000000n:750000n;
-    const u=unit(nextId++,e.unit,100,500,1,me);u.targetTile=()=>e.tile;u.nukeState=()=>({trajectory:[],targetedBySam:false,waitTicks:0,trajectoryIndex:0});units.push(u);}
+    const u=unit(nextId++,e.unit,game.x(silo.tile()),game.y(silo.tile()),1,me);
+    const path=__x50.planner.trajectory({x:game.x(silo.tile()),y:game.y(silo.tile())},{x:game.x(e.tile),y:game.y(e.tile)},1000,e.rocketDirectionUp,10,150);
+    const wait=silo.missileTimerQueue().length-1;u.active=true;u.hit=false;u.index=0;u.targeted=false;
+    u.targetTile=()=>e.tile;u.isActive=()=>u.active;u.reachedTarget=()=>u.hit;
+    u.tile=()=>path[u.index].tile.y*1000+path[u.index].tile.x;
+    u.nukeState=()=>({trajectory:path.map(v=>({tile:v.tile.y*1000+v.tile.x,targetable:v.targetable})),targetedBySam:u.targeted,waitTicks:Math.max(0,tick+wait-tick),trajectoryIndex:0});
+    motions.set(u.id(),{startTick:tick+wait,ticksPerStep:1,path});units.push(u);}
 },200);}};
 const game={myPlayer:()=>me,config:()=>cfg,ticks:()=>tick,gameID:()=>"fixture-game",inSpawnPhase:()=>false,isSpawnImmunityActive:()=>false,isImpassable:()=>false,
 x:t=>t%1000,y:t=>Math.floor(t/1000),ref:(x,y)=>y*1000+x,width:()=>1000,height:()=>1000,isValidCoord:(x,y)=>x>=0&&y>=0&&x<1000&&y<1000,isValidRef:t=>Number.isInteger(t)&&t>=0&&t<1000000,owner:()=>enemy,
-units:(...types)=>units.filter(u=>!types.length||types.includes(u.type()))};
+unit:id=>units.find(u=>u.id()===id),motionPlans:()=>motions,updatesSinceLastTick:()=>({1:updates}),
+units:(...types)=>units.filter(u=>u.isActive()&&(!types.length||types.includes(u.type())))};
 const bm=document.querySelector('build-menu');Object.assign(bm,{game,eventBus:bus,transformHandler:{screenToWorldCoordinates:()=>({x:700,y:500})},uiState:{rocketDirectionUp:true}});
-const ticking=setInterval(()=>{tick++;for(const u of units){const q=u.missileTimerQueue();if(q[0]<=tick-90)q.shift();}},100);
+const ticking=setInterval(()=>{tick++;updates=[];for(const u of units){const q=u.missileTimerQueue();if(q[0]<=tick-90)q.shift();
+const m=motions.get(u.id());if(m&&u.active){u.index=Math.min(m.path.length-1,Math.max(0,tick-m.startTick));if(u.index===m.path.length-1){u.active=false;u.hit=!u.targeted;updates.push({id:u.id(),unitType:u.type(),ownerID:1,isActive:false,reachedTarget:u.hit,targetTile:u.targetTile()});}}}},100);
 window.fixture={sent,game,me,enemy,unit,bm,units:()=>units,setUnits:a=>units=a,setGold:n=>gold=BigInt(n),stopTicks:()=>clearInterval(ticking)};
 </script><script src="/openfront-x50-salvo.user.js"></script></html>

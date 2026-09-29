@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import {trajectory,simulate,assess,search,makePlan,ATOM,HYDRO} from '../src/planner.mjs';
+import {adapt,flightProgress} from '../src/adaptive.mjs';
 const root=path.resolve(process.argv[2]??'../OpenFrontIO');
 const deps={Math,PathStatus:{NEXT:0,COMPLETE:2},within:(x,a,b)=>Math.max(a,Math.min(b,x)),atan2:Math.atan2,
   UnitType:{AtomBomb:ATOM,HydrogenBomb:HYDRO,MIRVWarhead:'MIRV Warhead',MIRV:'MIRV',MissileSilo:'Missile Silo',SAMLauncher:'SAM Launcher',SAMMissile:'SAM Missile'},
@@ -43,9 +44,10 @@ class Unit {
   targetedBySAM(){return this.ns.targetedBySam;}setTargetedBySAM(v){this.ns.targetedBySam=v;}setTargetable(){}
   targetTile(){return this._params.targetTile;}targetUnit(){return this._params.targetUnit;}delete(){this.active=false;}
 }
-function engineRun(s,plan) {
+function engineRun(s,plan,transition=null) {
+  plan=structuredClone(plan);let adapted=null;
   const W=s.width,ref=(x,y)=>y*W+x,x=t=>t%W,y=t=>Math.floor(t/W),man=(a,b)=>Math.abs(x(a)-x(b))+Math.abs(y(a)-y(b));
-  const all=[],execs=[],queued=[];let gold=s.gold,atomHits=0,hydroHits=0;
+  const all=[],execs=[],queued=[],motions=new Map();let gold=s.gold,atomHits=0,hydroHits=0;
   const cfg={nukeSpeed:t=>t===HYDRO?s.rules.hydroSpeed:s.rules.atomSpeed,defaultNukeTargetableRange:()=>s.rules.targetRange,
     maxSamRange:()=>s.rules.maxSamRange,defaultSamMissileSpeed:()=>s.rules.samSpeed,SAMCooldown:()=>s.rules.samCooldown,SiloCooldown:()=>s.rules.siloCooldown,
     nukeMagnitudes:()=>({inner:1,outer:1}),nukeAllianceBreakThreshold:()=>100,gameConfig:()=>({gameType:'Singleplayer'}),
@@ -62,18 +64,48 @@ function engineRun(s,plan) {
     nearbyUnits:(tile,range,types,predicate=()=>true)=>all.filter(u=>u.active&&(Array.isArray(types)?types.includes(u.type()):types===u.type()))
       .map(unit=>({unit,distSquared:(x(tile)-x(unit.tile()))**2+(y(tile)-y(unit.tile()))**2})).filter(v=>v.distSquared<=range**2&&predicate(v)),
     unitCount:type=>all.filter(u=>u.active&&u.type()===type).length,owner:()=>neutral,hasOwner:()=>false,getWinner:()=>null,
-    addExecution:(...e)=>queued.push(...e),stats:()=>({bombLaunch(){},bombIntercept(){}}),recordMotionPlan(){},displayMessage(){},playerBySmallID:()=>enemy};
+    addExecution:(...e)=>queued.push(...e),stats:()=>({bombLaunch(){},bombIntercept(){}}),recordMotionPlan(p){motions.set(p.unitId,p);},displayMessage(){},playerBySmallID:()=>enemy};
   currentGame=game;
   for(const d of s.silos){const u=me.buildUnit('Missile Silo',ref(d.x,d.y),{});u.lv=d.level;u.q=[...d.queue];const e=new deps.MissileSiloExecution(u);e.init(game,game.time);execs.push(e);}
   for(const d of s.sams){const u=enemy.buildUnit('SAM Launcher',ref(d.x,d.y),{});u.lv=d.level;u.q=[...d.queue];const e=new deps.SAMLauncherExecution(enemy,null,u);e.init(game,game.time);execs.push(e);}
   let a=0;
   for(;game.time<s.tick+1200;game.time++) {
+    if(transition&&game.time===s.tick+transition.at) {
+      const sent=plan.actions.slice(0,a);
+      assert.ok(sent.every(v=>s.tick+v.tick+2<game.time),'transition after ACK');
+      for(const u of all.filter(u=>u.type()==='SAM Launcher')) {
+        const startRange=cfg.dynamicSamRange(u,game.time);u.lv+=transition.add;
+        u.upgrade={upgradeStartTick:game.time,startRange,targetLevel:u.lv,duration:45};
+      }
+      if(transition.nearSilo) {
+        const u=me.buildUnit('Missile Silo',ref(550,500),{});u.lv=50;
+        const e=new deps.MissileSiloExecution(u);e.init(game,game.time);execs.push(e);
+      }
+      const structs=type=>all.filter(u=>u.active&&u.type()===type).map(u=>({id:u.id(),x:x(u.tile()),y:y(u.tile()),level:u.lv,queue:[...u.q],
+        upgrade:u.upgrade?{startTick:u.upgrade.upgradeStartTick,startRange:u.upgrade.startRange,targetLevel:u.upgrade.targetLevel,duration:u.upgrade.duration}:null}));
+      const inflight=all.filter(u=>u.active&&[ATOM,HYDRO].includes(u.type())).map(u=>({id:u.id(),type:u.type(),owner:1,committed:true,
+        targeted:u.targetedBySAM(),index:u.trajectoryIndex(),waitTicks:u.ns.waitTicks,target:s.target,
+        path:u.trajectory().map(p=>({tile:{x:x(p.tile),y:y(p.tile)},targetable:p.targetable}))}));
+      for(const b of inflight) {
+        const unit=all.find(u=>u.id()===b.id),motion=motions.get(b.id);
+        const observed=flightProgress(b.path,{x:x(unit.tile()),y:y(unit.tile())},unit.ns,motion,game.time);
+        assert.equal(observed.index,b.index,'client-derived flight index agrees with original engine');
+        assert.equal(observed.waitTicks,b.waitTicks,'client-derived departure tick agrees with original engine');
+      }
+      const live={...s,tick:game.time,gold,silos:structs('Missile Silo'),sams:structs('SAM Launcher'),inflight,includeCommitted:true,
+        confirmedAtomHits:atomHits,confirmedHydroHits:hydroHits};
+      const count=t=>sent.filter(v=>v.type===t).reduce((n,v)=>n+v.amount,0);
+      adapted=adapt(live,{remaining:{...makePlan(0),goal:'hydro'},goal:'hydro',atomLimit:80,sentAtoms:count(ATOM),hydroLimit:1,sentHydros:count(HYDRO)},
+        {budgetMs:1000,initialTicks:6});
+      const extra=adapted.chosen?.actions.map(v=>({...v,tick:game.time-s.tick+v.tick,up:adapted.chosen.up}))??[];
+      plan.actions=[...sent,...extra];
+    }
     for(const e of execs)if(e.isActive())e.tick(game.time);
     // Nuke init on input+1, first spawn on input+2, matching ConstructionExecution.
     while(a<plan.actions.length&&game.time===s.tick+plan.actions[a].tick+1) {
       const intent=plan.actions[a++];
       for(let n=0;n<intent.amount;n++) {
-        const e=new deps.NukeExecution(intent.type,me,ref(s.target.x,s.target.y),null,-1,0,plan.up);
+        const e=new deps.NukeExecution(intent.type,me,ref(s.target.x,s.target.y),null,-1,0,intent.up??plan.up);
         e.detonate=function(){if(this.nuke.type()===HYDRO)hydroHits++;else atomHits++;this.nuke.delete();this.active=false;};
         queued.push(e);
       }
@@ -81,7 +113,7 @@ function engineRun(s,plan) {
     for(const e of queued){e.init(game,game.time);execs.push(e);}queued.length=0;
     if(a===plan.actions.length&&!execs.some(e=>e instanceof deps.NukeExecution&&e.isActive())&&!all.some(u=>u.active&&[ATOM,HYDRO,'SAM Missile'].includes(u.type())))break;
   }
-  return {atomHits,hydroHits};
+  return {atomHits,hydroHits,adapted};
 }
 const base={tick:1000,me:1,target:{x:700,y:500},width:1000,height:1000,
   rules:{tickMs:100,samCooldown:90,siloCooldown:90,atomSpeed:10,hydroSpeed:10,samSpeed:12,targetRange:150,maxSamRange:150},
@@ -106,3 +138,16 @@ for(let i=0;i<90;i++) {
   if(prediction.ok){accepted++;assert.ok(p.hydros?actual.hydroHits>=1:actual.atomHits>=1,JSON.stringify({i,actual,p}));}
 }
 console.log(`Upstream varied geometry/cooldowns: ${extra} scenarios; all ${accepted} recommendations achieved the hit criterion.`);
+
+let adaptiveCases=0,adaptiveAccepted=0,rescued=0,switched=0;
+for(const at of [12,35,55])for(const add of [1,3,10,40])for(const nearSilo of [false,true]) {
+  const s={...base,sams:[{id:10,x:695,y:500,level:1,queue:[]}]};
+  const actual=engineRun(s,makePlan(2,2),{at,add,nearSilo});adaptiveCases++;
+  const r=actual.adapted;
+  if(r?.chosen){adaptiveAccepted++;
+    assert.ok(r.chosen.goal==='hydro'?actual.hydroHits>=1:actual.atomHits>=1,JSON.stringify({at,add,nearSilo,decision:r.decision,actual},(_,v)=>typeof v==='bigint'?v.toString():v));
+    if(r.decision==='rescue')rescued++;if(r.decision==='atomic')switched++;
+  }
+}
+assert.ok(rescued>0&&switched>0);
+console.log(`Upstream in-flight SAM upgrades: ${adaptiveCases} scenarios; ${adaptiveAccepted} accepted revisions achieved the criterion (${rescued} hydro rescues, ${switched} atomic switches).`);
