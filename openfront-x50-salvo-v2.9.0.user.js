@@ -2136,9 +2136,15 @@
     }
 
     if (salvoQueue.length === 0) {
-      // (v2.9) 수소는 살포 중간에 섞이므로 '마지막 수소 대기'가 없다 — 바로 다음 단계로.
-      // 후속 산개(원자 수십발·수소 몇발)가 남아 있어도 보류 — 그쪽 타이머가 마무리한다
-      if (salvoFollow) return;
+      // (v2.9) 수소는 살포 중간에 섞이므로 '마지막 수소 대기'가 없다.
+      //   대신 후속 산개가 아직 시작 안 됐으면 여기서 시작한다 (원자 살포 완료 시점).
+      if (salvoFollow && !salvoFollow.started) { try { armFollow(); } catch (e) {} }
+      // 후속 산개(원자 수십발·수소 몇발)가 남아 있으면 그쪽 타이머가 마무리한다.
+      //   단 'started'가 아니면(아직 시작 전) 지금 시작하고 보류 — 무한 대기 방지.
+      if (salvoFollow) {
+        if (!salvoFollow.started) { try { armFollow(); } catch (e) {} }
+        if (salvoFollow) return;
+      }
       salvoClear(null); return;
     }
     toast(`☢️ 대량 발사 누적 ${salvoDone.toLocaleString()}발 · 남은 ${salvoPending().toLocaleString()}발 (대기열 ${salvoQueue.length}건)`, "#ffd166");
