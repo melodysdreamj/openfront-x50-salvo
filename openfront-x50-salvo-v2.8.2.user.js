@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      2.8.1
+// @version      2.8.2
 // @description  사설로비용 — x50 원자 살포 · 구조물 대량 업그레이드 · SAM 인식 수소타격(I: 커서 150타일 내 SAM 레벨합×1.2 → 수소 → 후속)
 // @author       local build
 // @match        https://openfront.io/*
@@ -52,7 +52,7 @@
     //   (Z는 수소를 섞지 않고 예전처럼 최대 속도로 순수 원자 살포 — salvoSamAware 무시)
     samSimpleMode: true,    // true=단순 규칙 / false=기존 정밀 시뮬레이터
     samSimpleRange: 150,    // 커서 기준 SAM 수집 반경 (타일)
-    samSimpleMult: 1.2,     // ΣLv × 이 배수 = 발사량
+    samSimpleMult: 1.5,     // ΣLv × 이 배수 = 발사량 (50% 더)
     samZPure: true,         // Z 살포는 수소 미포함 · 순수 원자 최대속도
     samHydroCount: 1,       // 뚫기에 섞을 수소폭탄 수 (1발 고정 — 0이면 끔)
     samRangeExtra: 0,       // SAM 참여 판정 직선 여유 (0 = 경로 판정만. 내 사일로를 못 읽으면 150 안전여유)
@@ -812,25 +812,37 @@
       const R2 = R * R;
       const list = g.units("SAM Launcher") || [];
       const out = [];
-      let sumLevel = 0, skipped = 0;
+      let sumLevel = 0, skipped = 0, mine = 0, building = 0;
+      const myId = me.id();
       for (let i = 0; i < list.length; i++) {
         const u = list[i];
+        // ── 반경 안이면 '무조건' 카운트한다 (오탐 방지 최우선) ──
+        //   제외는 단 두 가지뿐: ① 내 SAM ② 아군 SAM
+        //   건설 중·소유자 판독 실패 등은 전부 '포함'(보수적 = 더 많이 쏨)
+        let ux = null, uy = null, d = null;
+        try {
+          const ut = u.tile();
+          ux = g.x(ut); uy = g.y(ut);
+          if (Number.isFinite(ux) && Number.isFinite(uy)) {
+            const dx = ux - tx, dy = uy - ty;
+            d = Math.sqrt(dx * dx + dy * dy);
+            if (d > R) continue;                        // 반경 밖만 제외
+          } else { skipped++; }                          // 좌표 못 읽음 → 포함
+        } catch (e) { skipped++; }                       // 타일 못 읽음 → 포함
+        // 내 것/아군인가? (판독 실패는 '적'으로 간주 = 포함)
         try {
           const o = typeof u.owner === "function" ? u.owner() : null;
-          if (!o || typeof o.id !== "function") { skipped++; continue; }
-          if (o.id() === me.id()) continue;                                  // 내 SAM
-          if (typeof o.isFriendly === "function" && o.isFriendly(me)) continue; // 아군
-          if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) { skipped++; continue; }
-          const ut = u.tile();
-          const ux = g.x(ut), uy = g.y(ut);
-          const dx = ux - tx, dy = uy - ty;
-          if (dx * dx + dy * dy > R2) continue;                              // 반경 밖
-          const lv = Math.max(1, (typeof u.level === "function" ? (u.level() || 1) : 1));
-          sumLevel += lv;
-          out.push({ lv, x: ux, y: uy, d: Math.sqrt(dx * dx + dy * dy), rng: samRangeAtLevel(lv) });
-        } catch (e) { skipped++; }
+          if (o && typeof o.id === "function") {
+            if (o.id() === myId) { mine++; continue; }
+            if (typeof o.isFriendly === "function" && o.isFriendly(me)) { mine++; continue; }
+          }
+        } catch (e) {}
+        try { if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) building++; } catch (e) {}
+        const lv = Math.max(1, (typeof u.level === "function" ? (u.level() || 1) : 1));
+        sumLevel += lv;
+        out.push({ lv, x: ux, y: uy, d, rng: samRangeAtLevel(lv) });
       }
-      return { n: out.length, sumLevel, defs: out, range: R, tx, ty, skipped, total: list.length };
+      return { n: out.length, sumLevel, defs: out, range: R, tx, ty, skipped, mine, building, total: list.length };
     } catch (e) { return null; }
   }
 
@@ -2891,7 +2903,13 @@
         const af2 = (CFG.samAfterMin | 0) + (CFG.samAfterMax | 0) + (CFG.samAfterHydroMin | 0) + (CFG.samAfterHydroMax | 0) > 0
           ? `+후속 ☢${CFG.samAfterMin}~${CFG.samAfterMax} 💧${CFG.samAfterHydroMin}~${CFG.samAfterHydroMax}` : "";
         if (!sn || sn.n === 0) {
-          hudCache = `🎯 SAM 없음 (${CFG.samSimpleRange}타일 내) — I=수소 1발`;
+          // 왜 0기인지 힌트 (지도 전체에 SAM이 있는데 0기면 좌표/판독 문제)
+          let hint = "";
+          try {
+            const all = (getGameView().units("SAM Launcher") || []).length;
+            if (all > 0) hint = ` (지도에 ${all}기 — 반경 밖/아군)`;
+          } catch (e) {}
+          hudCache = `🎯 SAM 없음 (${CFG.samSimpleRange}타일 내) — I=수소 1발${hint}`;
           return hudCache;
         }
         const shots = simpleShots(sn);
@@ -3025,20 +3043,34 @@
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
       samsNear, simpleShots, simpleVerdict, verdictText,
       samDiag: (tile) => {
-        // 진단: 왜 SAM이 참여/제외됐는지 한눈에 (게임 F12 콘솔)
+        // 진단: 커서 반경 내 SAM 판독 상태 (게임 F12 콘솔에서 __x50.samDiag())
         try {
           const g = getGameView();
           const t0 = (tile === undefined || tile === null) ? computeCursorTile() : tile;
-          if (t0 === null || t0 === undefined) return "커서 좌표 없음";
-          const ana = samDefenders(t0);
-          const sil = mySilos(t0);
+          if (t0 === null || t0 === undefined) return "커서 좌표 없음 (영토 위에 커서를)";
+          const myId = g.myPlayer() ? g.myPlayer().id() : "?";
           const all = g.units("SAM Launcher") || [];
+          const sn = samsNear(t0);
           const lines = [];
-          lines.push(`목표 tile=${t0} (${g.x(t0)},${g.y(t0)})`);
-          lines.push(`내 사일로: ${sil ? sil.length + "기 [" + sil.slice(0,3).map(s=>`(${s.x},${s.y})Lv${s.level}`).join(" ") + (sil.length>3?" …":"") + "]" : "읽기 실패"}`);
-          lines.push(`전체 SAM: ${all.length}기 · 참여 ${ana ? ana.n : "?"}기 ΣLv${ana ? ana.sumLevel : "?"}`);
-          if (ana && ana._diag) lines.push(`  진단: 후보0 — 제외사유 ${JSON.stringify(ana._diag.rej.slice(0,5))} · 사일로${ana._diag.silN}기`);
-          if (ana && ana.defs) ana.defs.forEach((d) => lines.push(`  참여: (${d.x},${d.y}) Lv${d.lv} rng${d.rng.toFixed(0)} via=${d.via}`));
+          lines.push(`목표 tile=${t0} (${g.x(t0)},${g.y(t0)}) · 반경 ${CFG.samSimpleRange}`);
+          lines.push(`나: ${myId}`);
+          lines.push(`전체 SAM: ${all.length}기`);
+          if (sn) {
+            lines.push(`반경 내 적 SAM: ${sn.n}기 ΣLv${sn.sumLevel} → 발사 ${simpleShots(sn)}발 (×${CFG.samSimpleMult})`);
+            lines.push(`  제외: 내것 ${sn.mine}기 · 판독실패 ${sn.skipped}기 · 건설중(포함) ${sn.building}기`);
+            sn.defs.slice(0, 6).forEach((d) => lines.push(`  포함: (${d.x},${d.y}) Lv${d.lv} d=${d.d == null ? "?" : d.d.toFixed(0)}`));
+          } else lines.push("samsNear=null (게임 뷰 없음)");
+          // 전체 SAM 목록 (왜 빠졌는지 판독)
+          lines.push("전체 목록(첫 8기):");
+          all.slice(0, 8).forEach((u) => {
+            try {
+              const ut = u.tile();
+              const ux = g.x(ut), uy = g.y(ut);
+              const d = Math.hypot(ux - g.x(t0), uy - g.y(t0)).toFixed(0);
+              const o = u.owner();
+              lines.push(`  (${ux},${uy}) Lv${u.level()} 거리${d} owner=${o ? o.id() : "?"}${o && o.id() === myId ? " ←나" : ""}`);
+            } catch (e) { lines.push(`  판독오류: ${e.message}`); }
+          });
           return lines.join("\n");
         } catch (e) { return "진단 오류: " + e.message; }
       },
