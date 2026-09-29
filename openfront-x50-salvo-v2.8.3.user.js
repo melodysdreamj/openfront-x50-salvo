@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      2.8.2
+// @version      2.8.3
 // @description  사설로비용 — x50 원자 살포 · 구조물 대량 업그레이드 · SAM 인식 수소타격(I: 커서 150타일 내 SAM 레벨합×1.2 → 수소 → 후속)
 // @author       local build
 // @match        https://openfront.io/*
@@ -168,6 +168,25 @@
     } catch (e) {}
     return null;
   }
+  // ── 소유자 판정 (v2.8.3) ──
+  //   게임 내부는 smallID(숫자)로 플레이어를 비교한다. PlayerView.id()는 문자열(클라이언트 ID)이라
+  //   직접 비교하면 어긋날 수 있다. 두 값을 모두 시도하고, 판독 실패는 '내 것 아님'으로 본다.
+  function isOwnedByMe(u, me) {
+    try {
+      if (!u || !me) return false;
+      const o = (typeof u.owner === "function") ? u.owner() : null;
+      if (!o) return false;
+      let oS = null, mS = null;
+      try { if (typeof o.smallID === "function") oS = o.smallID(); } catch (e) {}
+      try { if (typeof me.smallID === "function") mS = me.smallID(); } catch (e) {}
+      if (oS !== null && oS !== 0 && mS !== null && oS === mS) return true;
+      if (typeof o.id === "function" && typeof me.id === "function") {
+        try { return o.id() === me.id(); } catch (e) {}
+      }
+    } catch (e) {}
+    return false;
+  }
+
   function getTransform() {
     try {
       const bm = getBuildMenu();
@@ -703,7 +722,14 @@
         try {
           const o = (typeof u.owner === "function") ? u.owner() : null;
           if (!o || typeof o.id !== "function") continue;
-          if (o.id() === me.id()) continue;
+          { let eq = false;
+            try { let oS = null, mS = null;
+              if (typeof o.smallID === "function") oS = o.smallID();
+              if (typeof me.smallID === "function") mS = me.smallID();
+              if (oS !== null && oS !== 0 && mS !== null && oS === mS) eq = true;
+              if (!eq && typeof o.id === "function" && typeof me.id === "function") eq = (o.id() === me.id());
+            } catch (e) {}
+            if (eq) continue; }
           if (typeof o.isFriendly === "function" && o.isFriendly(me)) { rej.push({ id: u.id ? u.id() : "?", why: "friendly" }); continue; }
           if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) { rej.push({ id: u.id ? u.id() : "?", why: "building" }); continue; }
           const lv = Math.max(1, (typeof u.level === "function" ? (u.level() || 1) : 1));
@@ -771,11 +797,21 @@
       if (!Number.isFinite(tx) || !Number.isFinite(ty)) return null;
       const list = g.units("Missile Silo") || [];
       const out = [];
+      // 게임 내부는 smallID(숫자)로 소유자를 비교한다 — id()는 문자열(클라이언트 ID).
+      let mySmall = null, myId = null;
+      try { if (typeof me.smallID === "function") mySmall = me.smallID(); } catch (e) {}
+      try { if (typeof me.id === "function") myId = me.id(); } catch (e) {}
       for (let i = 0; i < list.length; i++) {
         const u = list[i];
         try {
           const o = typeof u.owner === "function" ? u.owner() : null;
-          if (!o || typeof o.id !== "function" || o.id() !== me.id()) continue;
+          if (!o) continue;
+          let ok = false;
+          let oSmall = null;
+          try { if (typeof o.smallID === "function") oSmall = o.smallID(); } catch (e) {}
+          if (oSmall !== null && oSmall !== 0 && mySmall !== null && oSmall === mySmall) ok = true;
+          if (!ok && myId !== null) { try { if (typeof o.id === "function" && o.id() === myId) ok = true; } catch (e) {} }
+          if (!ok) continue;
           if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) continue;
           const ut = u.tile();
           const ux = g.x(ut), uy = g.y(ut);
@@ -813,7 +849,10 @@
       const list = g.units("SAM Launcher") || [];
       const out = [];
       let sumLevel = 0, skipped = 0, mine = 0, building = 0;
-      const myId = me.id();
+      // ── 내 식별자 (게임 내부는 smallID(숫자)로 비교한다 — id()는 문자열) ──
+      let mySmall = null, myId = null;
+      try { if (typeof me.smallID === "function") mySmall = me.smallID(); } catch (e) {}
+      try { if (typeof me.id === "function") myId = me.id(); } catch (e) {}
       for (let i = 0; i < list.length; i++) {
         const u = list[i];
         // ── 반경 안이면 '무조건' 카운트한다 (오탐 방지 최우선) ──
@@ -829,14 +868,34 @@
             if (d > R) continue;                        // 반경 밖만 제외
           } else { skipped++; }                          // 좌표 못 읽음 → 포함
         } catch (e) { skipped++; }                       // 타일 못 읽음 → 포함
-        // 내 것/아군인가? (판독 실패는 '적'으로 간주 = 포함)
+        // ── 내 것/아군인가? ──
+        //   주의: owner()는 ① 무주지(smallID 0)면 TerraNullius를 반환하고
+        //         ② 못 찾으면 예외를 던진다. 둘 다 '적 취급'으로 포함해야 한다.
+        let isMine = false;
         try {
           const o = typeof u.owner === "function" ? u.owner() : null;
-          if (o && typeof o.id === "function") {
-            if (o.id() === myId) { mine++; continue; }
-            if (typeof o.isFriendly === "function" && o.isFriendly(me)) { mine++; continue; }
+          if (o) {
+            // smallID 비교 (게임 내부와 동일 기준)
+            let oSmall = null;
+            try { if (typeof o.smallID === "function") oSmall = o.smallID(); } catch (e) {}
+            if (oSmall !== null && oSmall !== 0 && mySmall !== null && oSmall === mySmall) isMine = true;
+            // id() 비교 (문자열) — 둘 다 있을 때만
+            if (!isMine && myId !== null) {
+              try { if (typeof o.id === "function" && o.id() === myId) isMine = true; } catch (e) {}
+            }
+            // 아군 판정 — 단, 무주지(ZF)나 isPlayer()가 아닌 객체는 아군이 아니다
+            if (!isMine && typeof o.isPlayer === "function") {
+              try {
+                const pl = o.isPlayer();
+                if (pl && typeof o.isFriendly === "function" && o.isFriendly(me)) isMine = true;
+              } catch (e) {}
+            } else if (!isMine && typeof o.isFriendly === "function") {
+              // isPlayer가 없으면 isFriendly만으로 판단 (기존 동작)
+              try { if (o.isFriendly(me)) isMine = true; } catch (e) {}
+            }
           }
-        } catch (e) {}
+        } catch (e) {}   // 판독 예외 → 포함(적 취급)
+        if (isMine) { mine++; continue; }
         try { if (typeof u.isUnderConstruction === "function" && u.isUnderConstruction()) building++; } catch (e) {}
         const lv = Math.max(1, (typeof u.level === "function" ? (u.level() || 1) : 1));
         sumLevel += lv;
@@ -2213,7 +2272,7 @@
   function nearestOwn(game, me, tile, types, maxDist) {
     try {
       const list = game.units(...types).filter((u) => {
-        try { return u.owner().id() === me.id(); } catch (e) { return false; }
+        try { return isOwnedByMe(u, me); } catch (e) { return false; }
       });
       let best = null, bestD = Infinity;
       for (const u of list) {
@@ -2412,7 +2471,7 @@
     let portCount = 0;
     try {
       portCount = game.units("Port").filter((u) => {
-        try { return u.owner().id() === me.id(); } catch (e) { return false; }
+        try { return isOwnedByMe(u, me); } catch (e) { return false; }
       }).length;
     } catch (e) {}
     if (portCount === 0) {
