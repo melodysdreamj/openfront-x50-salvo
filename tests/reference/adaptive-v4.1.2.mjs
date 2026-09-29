@@ -1,11 +1,4 @@
-import {ATOM,HYDRO,assess,search} from './planner.mjs';
-
-// The conservative planner never credits unrelated flights. Keep them in the
-// live observer, but do not repeatedly clone their full paths into each Worker.
-export function workerSnapshot(s) {
-  return {...s,observedFlights:s.observedFlights??(s.inflight??[]).length,
-    inflight:(s.inflight??[]).filter(b=>s.includeCommitted&&b.committed&&b.owner===s.me&&!b.targeted)};
-}
+import {ATOM,HYDRO,assess,search} from './planner-v4.1.2.mjs';
 
 // Decode authoritative motion-plan time instead of the nukeState index, which
 // may be stale when the client derives motion without per-tick unit updates.
@@ -34,24 +27,6 @@ export function remainingPlan(plan,index,baseTick,snapshotTick,leadTicks=6) {
     hydros:actions.filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)};
 }
 
-// Paths are immutable within a snapshot/observer. Retain only weak references;
-// one suffix table replaces path slicing and four scans on every game tick.
-const suffixBoundsCache=new WeakMap();
-function suffixBounds(path,index) {
-  let bounds=suffixBoundsCache.get(path);
-  if(!bounds) {
-    bounds=new Float64Array(path.length*4);
-    let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
-    for(let i=path.length-1;i>=0;i--) {
-      const p=path[i].tile;
-      minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);
-      bounds.set([minX,maxX,minY,maxY],i*4);
-    }
-    suffixBoundsCache.set(path,bounds);
-  }
-  return bounds.subarray(index*4,index*4+4);
-}
-
 // Cheap geometric broad phase for the observer. Every potentially relevant SAM
 // stays in the simulator. Changes well outside every possible path need not
 // interrupt a precisely timed volley.
@@ -63,10 +38,9 @@ export function defenseSignature(s) {
       Math.min(silo.y,s.target.y)-h-r,Math.max(silo.y,s.target.y)+h+r]);
   }
   for(const b of s.inflight??[])if(b.committed&&b.path?.length) {
-    if(b.index<b.path.length) {
-      const [x0,x1,y0,y1]=suffixBounds(b.path,b.index);
-      boxes.push([x0-r,x1+r,y0-r,y1+r]);
-    }
+    const p=b.path.slice(b.index).map(v=>v.tile);
+    if(p.length)boxes.push([Math.min(...p.map(v=>v.x))-r,Math.max(...p.map(v=>v.x))+r,
+      Math.min(...p.map(v=>v.y))-r,Math.max(...p.map(v=>v.y))+r]);
   }
   return JSON.stringify([
     s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner]),s.allowed,

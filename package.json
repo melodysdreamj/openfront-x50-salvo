@@ -1,7 +1,7 @@
 {
   "name": "openfront-predictive-strike",
   "private": true,
-  "version": "4.1.2",
+  "version": "4.2.0",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -9,7 +9,9 @@
     "test:browser": "node scripts/build.mjs && node tests/browser.integration.mjs && node tests/upgrade.browser.mjs",
     "test:upstream": "node scripts/verify-upstream.mjs",
     "test:client": "node scripts/verify-client.mjs",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "benchmark": "node scripts/benchmark.mjs",
+    "test:live": "node scripts/verify-live-client.mjs"
   },
   "engines": {
     "node": ">=24"

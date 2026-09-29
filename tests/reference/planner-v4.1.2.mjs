@@ -1,5 +1,5 @@
 // The physics and target selector are pinned in src/vendor. No browser objects here.
-import {DistanceBasedBezierCurve, SAMTargetingSystem} from './vendor/engine.mjs';
+import {DistanceBasedBezierCurve, SAMTargetingSystem} from '../../src/vendor/engine.mjs';
 
 export const ATOM = 'Atom Bomb', HYDRO = 'Hydrogen Bomb';
 const manhattan = (a,b) => Math.abs(a.x-b.x)+Math.abs(a.y-b.y);
@@ -14,50 +14,6 @@ export function trajectory(from, to, height, up, speed, targetRange) {
     {x:from.x+dx*3/4,y:clamp(from.y+dy*3/4+h,0,height-1)},to,speed);
   return curve.getAllPoints().map(p => ({tile:p,
     targetable:dist2(p,from)<targetRange**2 || dist2(p,to)<targetRange**2}));
-}
-
-// Geometry is independent of silo ID and weapon name; speed, map height and
-// targetability are part of the key. Reuse the exact same integer path in search.
-function cachedPath(cache,s,silo,up,speed) {
-  const key=[silo.x,silo.y,s.target.x,s.target.y,s.height,up,speed,s.rules.targetRange].join(':');
-  let path=cache.get(key);
-  if(!path) {path=trajectory(silo,s.target,s.height,up,speed,s.rules.targetRange);cache.set(key,path);}
-  return path;
-}
-
-// Exact broad phase. Rebuild once at the SAM phase, then reuse the sorted
-// neighbouring cells for SAMs in the same cell. Insertion order is significant
-// for score ties and the original selector's interception cache.
-function missileIndex(bombs,now,spawnFirst,cellSize) {
-  const cells=new Map(), neighbourhoods=new Map();
-  for(const b of bombs) {
-    if(b.done||b.targeted||!(b.spawn<now||spawnFirst))continue;
-    const tile=b.unit.tile(),x=Math.floor(tile.x/cellSize),y=Math.floor(tile.y/cellSize),key=x+':'+y;
-    let cell=cells.get(key);if(!cell)cells.set(key,cell=[]);
-    cell.push({b,tile});
-  }
-  return (tile,range,_types,predicate)=>{
-    const x=Math.floor(tile.x/cellSize),y=Math.floor(tile.y/cellSize),span=Math.ceil(range/cellSize),key=x+':'+y+':'+span;
-    let nearby=neighbourhoods.get(key);
-    if(!nearby) {
-      nearby=[];
-      for(let dx=-span;dx<=span;dx++)for(let dy=-span;dy<=span;dy++) {
-        const cell=cells.get((x+dx)+':'+(y+dy));if(cell)for(const item of cell)nearby.push(item);
-      }
-      nearby.sort((a,b)=>a.b.id-b.b.id);neighbourhoods.set(key,nearby);
-    }
-    const found=[],rangeSq=range*range;
-    for(const item of nearby) {
-      // Earlier SAMs in this very phase may already have assigned the missile.
-      if(item.b.targeted)continue;
-      const distance=dist2(item.tile,tile);
-      if(distance<=rangeSq) {
-        const candidate={unit:item.b.unit,distSquared:distance};
-        if(predicate(candidate))found.push(candidate);
-      }
-    }
-    return found;
-  };
 }
 
 export function rangeAt(sam,tick,rules) {
@@ -125,7 +81,8 @@ export function simulate(s,plan,opt={}) {
   const config={defaultSamMissileSpeed:()=>r.samSpeed,maxSamRange:()=>r.maxSamRange,
     dynamicSamRange:(sam,t)=>rangeAt(sam.data,t,r),gameConfig:()=>({gameType:'Singleplayer'})};
   const game={config:()=>config,getWinner:()=>null,manhattanDist:manhattan,euclideanDistSquared:dist2,
-    nearbyUnits:null};
+    nearbyUnits:(tile,range,_types,predicate)=>bombs.filter(b=>!b.done&&(b.spawn<now||opt.spawnFirst)&&dist2(b.unit.tile(),tile)<=range**2)
+      .map(b=>({unit:b.unit,distSquared:dist2(b.unit.tile(),tile)})).filter(predicate)};
   for (const sam of sams) {
     sam.unit={data:sam,id:()=>sam.id,tile:()=>sam,level:()=>sam.level,owner:()=>defenders};
     sam.selector=new SAMTargetingSystem(game,sam.unit);
@@ -149,7 +106,7 @@ export function simulate(s,plan,opt={}) {
   for (now=start;now<=end;now++) {
     if ((now-start)%8===0 && performance.now()>deadline) throw Error('SEARCH_TIMEOUT');
     // Silo reloads one slot per tick. SAM reloads every expired slot in a tick.
-    for (const silo of silos) if(silo.queue.length&&now-silo.queue[0]>=r.siloCooldown) {silo.queue.shift();silo.lastDep=undefined;}
+    for (const silo of silos) if(silo.queue.length&&now-silo.queue[0]>=r.siloCooldown) silo.queue.shift();
     while (ai<actions.length&&actions[ai].at<=now) {
       const a=actions[ai++];
       for(let n=0;n<a.amount;n++) {
@@ -157,14 +114,13 @@ export function simulate(s,plan,opt={}) {
         const cost=a.type===HYDRO?s.hydroCost:s.atomCost;
         if (!silo||gold<cost) { dropped++;if(!silo)tubeShortage++;if(gold<cost)goldShortage++;continue; }
         gold-=cost; used.add(silo.id);
-        if(silo.lastDep===undefined) {
-          silo.lastDep=0;
-          for(const launchTick of silo.queue)silo.lastDep=Math.max(launchTick+1,silo.lastDep+1);
-        }
-        const lastDep=silo.lastDep;
+        let lastDep=0;
+        for(const launchTick of silo.queue) lastDep=Math.max(launchTick+1,lastDep+1);
         const moveAt=now+Math.max(0,lastDep-now)+1;
-        silo.queue.push(now);silo.lastDep=Math.max(now+1,lastDep+1);
-        const path=cachedPath(cache,s,silo,plan.up,a.type===HYDRO?r.hydroSpeed:r.atomSpeed);
+        silo.queue.push(now);
+        const key=[silo.id,silo.x,silo.y,s.target.x,s.target.y,plan.up,a.type].join(':');
+        let path=cache.get(key);
+        if(!path) { path=trajectory(silo,s.target,s.height,plan.up,a.type===HYDRO?r.hydroSpeed:r.atomSpeed,r.targetRange); cache.set(key,path); }
         const b={id:nextId++,type:a.type,owner:me,path,index:0,spawn:now,now,moveAt,target:s.target,targeted:false,done:false,ours:true,silo:silo.id};
         b.unit=bombUnit(b); bombs.push(b);byUnit.set(b.unit,b);
         launches.push({action:a.order,silo:silo.id,type:a.type,spawn:now-start,depart:moveAt-start});
@@ -185,7 +141,6 @@ export function simulate(s,plan,opt={}) {
       for(const b of bombs)b.afterMove=true;
     };
     if(opt.moveFirst) move();
-    game.nearbyUnits=missileIndex(bombs,now,opt.spawnFirst,r.maxSamRange*4);
     for(const sam of sams) {
       while(sam.queue.length&&now-sam.queue[0]>=r.samCooldown) sam.queue.shift();
       // Treat construction as completed for conservative planning. This avoids
@@ -235,14 +190,14 @@ export function search(s, options={}) {
   const ready=s.silos.reduce((n,u)=>n+(u.building?0:Math.max(0,u.level-u.queue.length)),0);
   // Estimate capacity only along possible trajectories. Keep all SAMs in the
   // actual simulation; this filter is solely a search-order optimization.
-  const paths=s.silos.filter(u=>!u.building).flatMap(u=>[true,false].map(up=>cachedPath(pathCache,s,u,up,s.rules.atomSpeed)));
+  const paths=s.silos.filter(u=>!u.building).flatMap(u=>[true,false].map(up=>trajectory(u,s.target,s.height,up,s.rules.atomSpeed,s.rules.targetRange)));
   const relevant=s.sams.filter(u=>paths.some(path=>path.some(p=>p.targetable&&dist2(p.tile,u)<=s.rules.maxSamRange**2)));
   const slots=relevant.reduce((n,u)=>n+u.level,0);
   const result={mixed:null,atomic:null,chosen:null,tested:0,limited:false,reason:'',
     snapshotTick:s.tick,minAtomHits:minHits,maxAtoms:cap,ready,slots,
     silos:s.silos.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),
     sams:s.sams.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),
-    existingFlights:s.observedFlights??(s.inflight??[]).length};
+    existingFlights:(s.inflight??[]).length};
   if(!s.includeCommitted&&!s.silos.some(u=>!u.building)) {result.reason='완성된 사일로가 없습니다'; return result;}
   if(!s.includeCommitted&&s.intentBudget===0) {result.reason='남은 명령 한도가 없습니다. 회복 후 다시 분석하세요';return result;}
   if(!s.includeCommitted&&s.gold<s.atomCost&&s.gold<s.hydroCost) {result.reason='원자·수소 1발을 구매할 골드가 부족합니다';return result;}

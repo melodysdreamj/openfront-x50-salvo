@@ -25,11 +25,20 @@
     // Fail visibly when the pinned curve/targeting model's range law changes.
     if([1,5,20].some(l=>Math.abs(cfg.samRange(l)-(rules.maxSamRange-480/(l+5)))>1e-7))
       throw Error('SAM 사거리 규칙이 변경되어 계산기 업데이트가 필요합니다');
+    // GameView.units filters the whole unit map on every call. Enumerate once
+    // and preserve game order inside each type for all snapshot consumers.
+    const unitsByType=new Map();
+    for(const u of g.units()) {
+      if(!u.isActive())continue;
+      const type=u.type();let group=unitsByType.get(type);
+      if(!group)unitsByType.set(type,group=[]);group.push(u);
+    }
+    const units=type=>unitsByType.get(type)??[];
     const structural=u=>({id:u.id(),x:g.x(u.tile()),y:g.y(u.tile()),level:u.level(),
       queue:[...read(u,'missileTimerQueue')],building:u.isUnderConstruction(),owner:u.owner().smallID()});
-    const silos=g.units('Missile Silo').filter(u=>u.isActive()&&isOwnedByMe(u,me)).map(structural);
+    const silos=units('Missile Silo').filter(u=>u.isActive()&&isOwnedByMe(u,me)).map(structural);
     const sams=[];
-    for(const u of g.units('SAM Launcher')) {
+    for(const u of units('SAM Launcher')) {
       if(!u.isActive()||isOwnedByMe(u,me)||me.isOnSameTeam(u.owner())) continue;
       const sam=structural(u), state=u.state;
       // Include allies as potential defenders; nuclear blasts can break alliances.
@@ -45,13 +54,13 @@
     }
     const price=type=>prices[type];
     const structures=['City','Factory','Port','Missile Silo','SAM Launcher','Defense Post'];
-    const teamStructures=structures.flatMap(type=>g.units(type)).filter(u=>u.isActive()&&me.isOnSameTeam(u.owner()));
+    const teamStructures=structures.flatMap(type=>units(type)).filter(u=>u.isActive()&&me.isOnSameTeam(u.owner()));
     const owner=g.owner(tile), ownTeam=owner?.isPlayer?.()&&me.isOnSameTeam(owner);
     const allowedFor=type=>!cfg.isUnitDisabled(type)&&!ownTeam&&!teamStructures.some(u=>dist2(target,{x:g.x(u.tile()),y:g.y(u.tile())})<=cfg.nukeMagnitudes(type).outer**2);
     const allowed={atomic:allowedFor(ATOM),mixed:allowedFor(HYDRO)};
     const inflight=[];
-    const samTargets=new Set(g.units('SAM Missile').filter(u=>u.isActive()).map(u=>u.state?.targetUnitId??u.targetUnit?.()?.id?.()));
-    for(const type of [ATOM,HYDRO,'MIRV Warhead']) for(const u of g.units(type)) {
+    const samTargets=new Set(units('SAM Missile').filter(u=>u.isActive()).map(u=>u.state?.targetUnitId??u.targetUnit?.()?.id?.()));
+    for(const type of [ATOM,HYDRO,'MIRV Warhead']) for(const u of units(type)) {
       if(!u.isActive()) continue;
       // Only confirmed launches from this operation are credited during adaptation.
       let ns; try{ns=u.nukeState();}catch{continue;}
@@ -115,7 +124,7 @@
         plannerExecute(snapshot,result);
       }
     };
-    worker.postMessage({id,snapshot,options:{...plannerSettings,budgetMs,allowNewHydro:plannerSettings.maxHydros>0}});
+    worker.postMessage({id,snapshot:workerSnapshot(snapshot),options:{...plannerSettings,budgetMs,allowNewHydro:plannerSettings.maxHydros>0}});
   }
 
   function plannerJob(kind,data,budget,done,fail) {
@@ -132,7 +141,7 @@
       clearTimeout(plannerState.pending.timeout);plannerState.pending=null;plannerState.worker=null;worker.terminate();
       if(e.data.error)fail(e.data.error);else done(e.data.result);
     };
-    worker.postMessage({id,kind,...data});
+    worker.postMessage({id,kind,...data,snapshot:workerSnapshot(data.snapshot)});
   }
 
   // Freeze limits for the whole operation, including every later revision.
