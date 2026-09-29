@@ -7,7 +7,9 @@
     "build": "node scripts/build.mjs",
     "test": "node scripts/build.mjs && node --test tests/*.test.mjs",
     "test:browser": "node scripts/build.mjs && node tests/browser.integration.mjs && node tests/upgrade.browser.mjs",
-    "test:upstream": "node scripts/verify-upstream.mjs"
+    "test:upstream": "node scripts/verify-upstream.mjs",
+    "test:client": "node scripts/verify-client.mjs",
+    "verify": "node scripts/verify.mjs"
   },
   "engines": {
     "node": ">=24"

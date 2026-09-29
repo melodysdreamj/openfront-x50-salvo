@@ -93,11 +93,17 @@ npm ci --ignore-scripts
 npm test
 npm run test:browser
 node scripts/verify-upstream.mjs /path/to/OpenFrontIO
+node scripts/verify-client.mjs /path/to/OpenFrontIO
+npm run verify -- /path/to/OpenFrontIO
 ```
 
 브라우저 테스트는 Chrome이 필요합니다. macOS 기본 경로 이외에는 `CHROME_PATH`를 지정하세요. `SCREENSHOT_DIR`를 주면 검증 화면 이미지를 저장합니다.
 
+배포 전에는 `npm run verify -- /path/to/OpenFrontIO` 한 명령으로 빌드 → 단위/회귀 → 원본 클라이언트 API → 원본 엔진 실행 → 공격 브라우저 흐름 → 업그레이드 브라우저 흐름을 모두 실행합니다. 어느 단계라도 실패하면 실패 상태로 종료합니다. 참조 엔진 커밋이 다르거나 원본 체크아웃이 없으면 검증을 생략하지 않고 중단합니다.
+
 검증 범위:
+
+- 원본 `Config`, `PlayerView`, `UnitView`, `GameView`, `PlayerImpl`의 해당 메서드를 직접 실행하는 **클라이언트 연결 검사 11개**. 이전 가격 호출의 `unitsOwned` 오류 재현, 수정된 공식 가격 경로, 호스트 전용 무료 가격, SAM 업그레이드·재장전, 팀 제한, 바다와 발사 지점의 SAM, 클라이언트 비행 위치, 요격 배정, 도달 상태를 확인합니다. 지도와 Worker 통신은 최소 어댑터이며 전체 웹 클라이언트를 구동한 검증은 아닙니다.
 
 - 계산기·적응 실행 회귀 테스트 **46개**: 경로, 발사관 큐, 거리 순서, SAM 재장전, 수소 우선순위, 자원·비활성화·시간 제한 등.
 - Chrome 모의 게임 통합 테스트 **17개**: 실제 Blob Worker 계산, I 발사 이벤트, 목표 고정, Esc 취소, SAM 강화 후 원자 보완, 요격 배정 후 원자 전환, 누적 수소 한도, 도달 관측, 중단 후 조언, 계산 중 취소, 반복 변화의 낡은 결과 폐기, 골드 부족, 지원하지 않는 상태, 좁은 화면 표시.
