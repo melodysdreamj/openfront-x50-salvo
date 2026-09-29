@@ -288,6 +288,71 @@ try {
   console.log('Browser: I sends 1000 atoms as twenty consecutive 100ms batches; 500 per second, rolling limit intact, zero replans.');
 
   await load();
+  await page.evaluate(()=>{
+    fixture.searches=0;fixture.checks=0;
+    fixture.units()[0].missileTimerQueue().push(fixture.game.ticks()-88);
+    const Native=window.Worker;
+    window.Worker=class extends Native {
+      postMessage(d,...rest){
+        if(d.options?.continuous){fixture.searches++;fixture.searchLead=d.options.initialTicks;}
+        if(d.kind==='assess'){
+          fixture.checks++;fixture.appointment=d.snapshot.tick+d.plan.actions[0].tick;
+          if(!fixture.battle){
+            const path=__x50.planner.trajectory({x:400,y:400},{x:700,y:500},1000,true,10,150);
+            const trajectory=path.map(p=>({tile:p.tile.y*1000+p.tile.x,targetable:p.targetable}));let index=0;
+            const bomb=fixture.unit(900,'Atom Bomb',400,400,1,fixture.enemy);
+            bomb.tile=()=>trajectory[index].tile;bomb.targetTile=()=>500700;
+            bomb.nukeState=()=>({trajectory,trajectoryIndex:index,waitTicks:0});fixture.units().push(bomb);
+            fixture.battle=setInterval(()=>{
+              index=Math.min(index+1,path.length-1);
+              const q=fixture.units()[1].missileTimerQueue();q.splice(0,q.length,fixture.game.ticks());
+            },60);
+          }
+          setTimeout(()=>{try{super.postMessage(d,...rest);}catch{}},400);return;
+        }
+        super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.sent.length>0,null,{timeout:12000});
+  const stable=await page.evaluate(()=>({searches:fixture.searches,checks:fixture.checks,tick:fixture.sent[0].tick,appointment:fixture.appointment,searchLead:fixture.searchLead,error:__x50.planner.state().error}));
+  assert.equal(stable.searchLead,10);assert.equal(stable.searches,1);assert.equal(stable.checks,1);assert.equal(stable.tick,stable.appointment);assert.equal(stable.error,'');
+  await page.keyboard.press('Escape');await page.evaluate(()=>clearInterval(fixture.battle));
+  console.log('Browser: continuous enemy missile movement/SAM firing and own natural reload retain one search, one validation and the absolute launch appointment.');
+
+  await load();
+  await page.evaluate(()=>{
+    const Native=window.Worker;
+    window.Worker=class extends Native {
+      constructor(...args){
+        super(...args);this.addEventListener('message',e=>{
+          if(this.jobKind==='adapt'&&!fixture.savedCandidate&&e.data.result?.chosen){
+            fixture.savedCandidate=e.data.result.chosen;fixture.units()[1].level=()=>4;
+          }
+        });
+      }
+      postMessage(d,...rest){
+        this.jobKind=d.kind;
+        if(d.kind==='adapt'&&fixture.savedCandidate)fixture.nextRemaining=d.request.remaining;
+        super.postMessage(d,...rest);
+      }
+    };
+  });
+  await page.keyboard.press('KeyI');
+  await page.waitForFunction(()=>fixture.units().some(u=>u.type()==='Hydrogen Bomb'));
+  await page.evaluate(()=>{
+    fixture.units()[1].level=()=>3;
+    fixture.units().push(fixture.unit(3,'Missile Silo',550,500,50,fixture.me));
+  });
+  await page.waitForFunction(()=>!!fixture.nextRemaining,null,{timeout:10000});
+  const kept=await page.evaluate(()=>({candidate:fixture.savedCandidate,next:fixture.nextRemaining}));
+  assert.ok(kept.candidate.atoms>0);assert.equal(kept.next.atoms,kept.candidate.atoms);assert.equal(kept.next.up,kept.candidate.up);
+  assert.deepEqual(kept.next.actions.map(a=>[a.type,a.amount]),kept.candidate.actions.map(a=>[a.type,a.amount]));
+  await page.keyboard.press('Escape');
+  console.log('Browser: a second SAM upgrade retains the newly computed rescue candidate for revalidation instead of restarting from the old plan.');
+
+  await load();
   await page.setViewportSize({width:390,height:844});await page.keyboard.press('F8');
   await page.waitForTimeout(250);
   const sizes=await page.evaluate(()=>{const panel=[...document.querySelectorAll('div')].find(e=>e.id==='of-strike-hud');return {width:panel.getBoundingClientRect().width,page:innerWidth,overflow:document.documentElement.scrollWidth};});

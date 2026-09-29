@@ -52,7 +52,7 @@
 <body>
 <div class="wrap">
   <h1>OpenFront x50 스크립트 설치</h1>
-  <p class="sub">v4.2.4 · 커서 위치의 <b>수소 혼합 / 원자 집중</b> 공격을 비교하고, 발사 중 방어 변화에 대응합니다.<br>
+  <p class="sub">v4.2.5 · 커서 위치의 <b>수소 혼합 / 원자 집중</b> 공격을 비교하고, 발사 중 방어 변화에 대응합니다.<br>
   <b>I</b>: 선택한 위치를 재검증한 후 추천 계획 실행 · <b>Esc</b>: 남은 발사 취소 · <b>F8</b>: 사일로·SAM 배치 상세<br>사설·연습 로비용. 표시 결과는 현재 상태를 바탕으로 한 예측입니다.</p>
 
   <ol>
@@ -67,16 +67,16 @@
     <li>
       <b>스크립트 설치</b>
       <p>Tampermonkey가 설치된 <b>뒤에</b> 아래 버튼을 누르면 Tampermonkey 설치 화면이 뜹니다 → <b>설치</b> 클릭.</p>
-      <a class="btn" href="./openfront-x50-salvo-v4.2.4.user.js">스크립트 설치 (Tampermonkey)</a>
-      <a class="btn ghost" href="./openfront-x50-salvo-v4.2.4.user.js?dl=1">파일로 다운로드</a>
+      <a class="btn" href="./openfront-x50-salvo-v4.2.5.user.js">스크립트 설치 (Tampermonkey)</a>
+      <a class="btn ghost" href="./openfront-x50-salvo-v4.2.5.user.js?dl=1">파일로 다운로드</a>
       <p class="warn">Tampermonkey 없이 이 버튼을 누르면 코드가 텍스트로 보이기만 합니다. 순서를 지켜주세요.</p>
     </li>
 
     <li>
       <b>확인</b>
-      <p>기존 스크립트를 v4.2.4으로 교체하고 게임 탭을 새로고침하세요. 여러 버전을 동시에 켜지 마세요.<br>
+      <p>기존 스크립트를 v4.2.5으로 교체하고 게임 탭을 새로고침하세요. 여러 버전을 동시에 켜지 마세요.<br>
       커서를 목표에 멈추면 결론과 이유, 다음 행동이 표시됩니다. 재분석 중에는 직전 결과를 유지하고 아래에 갱신 상태만 표시합니다. 커서를 옮긴 경우 이전 결과에는 이전 위치라고 표시합니다. 비용·방향·배치 근거는 F8에서 확인하세요.<br>
-      <b>I</b>를 한 번 누르면 해당 위치를 고정하여 다시 검증하고 추천 계획을 실행합니다. 계산이 길어도 후보를 끝까지 검토하고, 상태가 달라지면 자동 재검증합니다. 수소 혼합이 검증되면 우선 선택하고, 그렇지 않으면 검증된 원자 집중 계획을 사용합니다.<br>
+      <b>I</b>를 한 번 누르면 해당 위치를 고정하여 다시 검증하고 추천 계획을 실행합니다. 계산이 길어도 후보를 끝까지 검토하고, 외부 미사일 이동·SAM 발사로는 계획을 초기화하지 않습니다. 중요한 구조물 변경은 기존 후보부터 재검증합니다. 수소 혼합이 검증되면 우선 선택하고, 그렇지 않으면 검증된 원자 집중 계획을 사용합니다.<br>
       <b>Esc</b>는 계산과 남은 발사를 취소합니다. 이미 발사한 미사일은 취소되지 않습니다.<br>
       <b>F8</b>로 사일로와 SAM의 좌표·레벨·준비 수량을 확인합니다. 상세가 길면 표시창 안에서 스크롤하세요.<br>
       발사 중 SAM이 강화되면 남은 발사를 보류하고 다시 계산합니다. 가능하면 원자탄으로 수소탄을 보완하고, 수소 보완이 안 되면 원자 집중으로 전환합니다. 대응 계획이 없으면 중단하고 재장전·사일로 레벨업 후보 등을 안내합니다.<br>
@@ -99,7 +99,7 @@
 document.getElementById('cp').addEventListener('click', async () => {
   const msg = document.getElementById('cpmsg');
   try {
-    const r = await fetch('./openfront-x50-salvo-v4.2.4.user.js');
+    const r = await fetch('./openfront-x50-salvo-v4.2.5.user.js');
     const t = await r.text();
     await navigator.clipboard.writeText(t);
     msg.textContent = ' 복사됨 (' + t.length.toLocaleString() + '자) — 콘솔에 붙여넣으세요';

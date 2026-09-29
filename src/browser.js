@@ -110,7 +110,7 @@
     }
   }
 
-  function plannerCompute(snapshot,execute=false) {
+  function plannerCompute(snapshot,execute=false,validationLead=10) {
     if(plannerState.run)return;
     plannerCancelJob();
     const id=plannerState.job;
@@ -134,21 +134,22 @@
       if(error){plannerState.error='판정 불가: '+error;plannerState.updated=Date.now();return;}
       if(execute&&!(await plannerFreshPrices(id)))return;
       if(getGameView()?.gameID()!==snapshot.game || (!execute&&computeCursorTile()!==snapshot.tile)) return;
+      if(execute)result.validationLead=validationLead;
       plannerState.result=result;plannerState.updated=Date.now();
       plannerState.display={result,snapshot,updated:plannerState.updated};
       if(execute) {
         if(!result.chosen) {
           let fresh;try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
           if(fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
-          if(preflightKey(fresh)!==preflightKey(snapshot)) {
-            plannerRetry(snapshot,null,'계산 중 상태 변경 · 최신 상태에서 후보를 다시 탐색합니다');return;
+          if(planningStructureKey(fresh)!==planningStructureKey(snapshot,fresh.tick)) {
+            plannerRetry(snapshot,null,'계산 중 상태 변경 · 최신 상태에서 후보를 다시 탐색합니다',100,validationLead);return;
           }
           toast(result.reason,'#ffd166');return;
         }
         plannerExecute(snapshot,result);
       }
     };
-    worker.postMessage({id,snapshot:workerSnapshot(snapshot),options:{...plannerSettings,budgetMs,continuous:execute,allowNewHydro:plannerSettings.maxHydros>0}});
+    worker.postMessage({id,snapshot:workerSnapshot(snapshot),options:{...plannerSettings,budgetMs,continuous:execute,initialTicks:execute?validationLead:3,allowNewHydro:plannerSettings.maxHydros>0}});
   }
 
   function plannerJob(kind,data,budget,done,fail) {
@@ -180,7 +181,7 @@
 
   // Retry the fixed I target without allowing a late response to resurrect an
   // Esc-cancelled operation. A state change is a revalidation, not a user error.
-  function plannerRetry(snapshot,result,message,delay=100) {
+  function plannerRetry(snapshot,result,message,delay=100,validationLead=10) {
     plannerCancelJob();const id=plannerState.job;
     plannerState.pending={id,execute:true,kind:'retry',message,started:Date.now(),timeout:setTimeout(()=>{
       if(id!==plannerState.job)return;
@@ -188,7 +189,7 @@
       try {
         const fresh=plannerSnapshot(snapshot.tile);
         if(document.hidden||fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
-        if(result)plannerExecute(fresh,result);else plannerCompute(fresh,true);
+        if(result)plannerExecute(fresh,result);else plannerCompute(fresh,true,validationLead);
       }catch(e){plannerState.error=e.message;}
     },delay)};
   }
@@ -199,14 +200,22 @@
     try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
     if(document.hidden||fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
     if(result.chosen.actions.some(a=>a.type===HYDRO?fresh.allowed.mixed===false:fresh.allowed.atomic===false)){plannerRetry(snapshot,null,'목표의 발사 제한 변경 · 가능한 공격을 다시 확인합니다');return;}
-    plannerJob('assess',{snapshot:fresh,plan:result.chosen,options:{minAtomHits:plannerSettings.minAtomHits,maxTicks:plannerSettings.maxTicks,budgetMs:Infinity}},Infinity,check=>{
+    const planToCheck=scheduledCandidate(result.chosen,result.validationLead??10);
+    plannerJob('assess',{snapshot:fresh,plan:planToCheck,options:{minAtomHits:plannerSettings.minAtomHits,maxTicks:plannerSettings.maxTicks,budgetMs:Infinity}},Infinity,check=>{
       let current;try{current=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
       if(document.hidden||current.game!==snapshot.game||current.me!==snapshot.me)return;
-      if(preflightKey(current)!==preflightKey(fresh)) {
-        plannerRetry(snapshot,result,'재장전·SAM·사일로 변경 · 같은 후보를 최신 상태로 재검증합니다');return;
+      if(planningStructureKey(current)!==planningStructureKey(fresh,current.tick)||!ownQueuesFollowClock(fresh,current)) {
+        plannerRetry(snapshot,result,'구조물·내 발사관 변경 · 기존 후보를 유지하며 재검증합니다');return;
       }
-      if(!check.ok){plannerRetry(snapshot,null,'기존 후보가 방어를 통과하지 못해 다른 수량·순서를 탐색합니다');return;}
-      const plan={...result.chosen,...check.result},bus=getEventBus(),ctor=findNukeEventCtor();
+      if(!check.ok){
+        const alternative=[result.mixed,result.atomic].find(p=>p&&p!==result.chosen);
+        if(alternative){plannerRetry(snapshot,{...result,mixed:null,atomic:null,chosen:alternative},'기존의 다른 후보를 재검증합니다');return;}
+        plannerRetry(snapshot,null,'기존 후보의 검증 실패 · 변경된 방어에 맞는 대안을 탐색합니다',100,result.validationLead??10);return;
+      }
+      if(planToCheck.actions[0]&&fresh.tick+planToCheck.actions[0].tick<=current.tick) {
+        plannerRetry(snapshot,{...result,validationLead:Math.max(result.validationLead??10,(current.tick-fresh.tick)*2+3)},'기존 후보 유지 · 계산 시간에 맞춰 발사 시각만 조정합니다');return;
+      }
+      const plan={...planToCheck,...check.result},bus=getEventBus(),ctor=findNukeEventCtor();
       if(current.gold<plan.cost){plannerState.error='계획을 실행할 골드가 부족합니다';return;}
       const rateWait=plannerRateDelay();
       if(rateWait>0||plan.actions.length>current.intentBudget) {
@@ -215,12 +224,12 @@
       if(!bus||!ctor){plannerState.error='게임 발사 이벤트를 찾지 못했습니다';return;}
       const ids=new Set(getGameView().units(ATOM,HYDRO).map(u=>u.id()));
       const run={plan,tile:snapshot.tile,game:snapshot.game,me:snapshot.me,rules:JSON.stringify(current.rules),
-        baseTick:current.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,tracked:new Map(),outbox:[],
+        baseTick:fresh.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,tracked:new Map(),outbox:[],
         atomLimit:Math.min(5000,Math.max(0,plannerSettings.maxAtoms)),hydroLimit:Math.max(0,plannerSettings.maxHydros),
         minHits:Math.max(1,plannerSettings.minAtomHits),goal:plan.goal??(plan.hydros?'hydro':'atomic'),
         hitAtoms:0,hitHydros:0,replans:0,phase:'firing',reason:'검증된 계획 실행',needsReplan:false,
         startedTick:current.tick,lastTick:current.tick,lastTickAt:Date.now(),bus,ctor,current,
-        signature:defenseSignature(current),risk:'',history:[]};
+        signature:defenseSignature(current),candidate:null,history:[]};
       plannerState.run=run;plannerState.lastExecution='';plannerState.advice=null;plannerState.report=null;
       plannerPump();
     },message=>{plannerState.error='발사 검증 오류: '+message;});
@@ -262,10 +271,6 @@
     const pending=run.outbox.find(v=>v.acked<v.amount);
     if(pending&&current.tick-pending.tick>12)throw Error('발사 요청의 게임 반영을 확인하지 못했습니다');
   }
-  function plannerRisk(s) {
-    return JSON.stringify([s.confirmedAtomHits,s.confirmedHydroHits,
-      s.inflight.filter(b=>b.committed).map(b=>[b.id,b.targeted])]);
-  }
   function plannerFinish(reason,s,advice=false) {
     const run=plannerState.run;
     plannerStop(reason);
@@ -290,24 +295,26 @@
       run.phase='waiting-ack';run.needsReplan=true;
       run.reason='재계산 시간이 더 필요해 계산 시간을 늘려 다시 확인합니다 · 남은 발사 보류';
     };
-    const signature=defenseSignature(s),risk=plannerRisk(s);
-    const remaining=remainingPlan(run.plan,run.index,run.baseTick,s.tick,lead);
-    plannerJob('adapt',{snapshot:s,request:{remaining,goal:run.goal,atomLimit:run.atomLimit,hydroLimit:run.hydroLimit,
+    const signature=defenseSignature(s);
+    const candidate=run.candidate;
+    const remaining=candidate?remainingPlan(candidate.plan,0,candidate.baseTick,s.tick,lead):remainingPlan(run.plan,run.index,run.baseTick,s.tick,lead);
+    plannerJob('adapt',{snapshot:s,request:{remaining,goal:candidate?.plan.goal??run.goal,atomLimit:run.atomLimit,hydroLimit:run.hydroLimit,
       sentAtoms:run.sentAtoms,sentHydros:run.sentHydros},options:{minAtomHits:run.minHits,maxTicks:plannerSettings.maxTicks,budgetMs:budget,initialTicks:lead}},budget,result=>{
       if(plannerState.run!==run)return;
       let fresh;
       try{fresh=plannerSnapshot(run.tile);plannerObserve(run,fresh);}catch(e){return plannerFinish(e.message,run.current,false);}
       const first=result.chosen?.actions[0];
       if(result.limited&&!result.chosen){continueComputing();return;}
-      if(signature!==defenseSignature(fresh)||risk!==plannerRisk(fresh)||(first&&s.tick+first.tick<=fresh.tick)||fresh.tick-s.tick>lead) {
-        run.phase='waiting-ack';run.needsReplan=true;run.reason='계산 중 상태가 바뀌어 다시 검증';return;
+      if(signature!==defenseSignature(fresh)||newHydrogenThreat(s,fresh)||(first&&s.tick+first.tick<=fresh.tick)||fresh.tick-s.tick>lead) {
+        if(result.chosen)run.candidate={plan:result.chosen,baseTick:s.tick};
+        run.phase='waiting-ack';run.needsReplan=true;run.reason='변경 사항 확인 · 기존 후보를 유지하며 재검증';return;
       }
       if(!result.chosen)return plannerFinish('남은 발사 중단: '+result.reason,fresh,true);
       run.plan=result.chosen;run.baseTick=s.tick;run.index=0;run.signature=signature;
       run.goal=run.plan.goal??(run.plan.hydros?'hydro':'atomic');
       run.phase=run.plan.actions.length?'firing':'observing';run.reason=result.reason;
       run.history.push({tick:fresh.tick,decision:result.decision,atoms:run.plan.atoms,hydros:run.plan.hydros,reason:result.reason});
-      run.needsReplan=false;run.adaptiveBudget=plannerSettings.adaptiveBudgetMs;
+      run.needsReplan=false;run.candidate=null;run.adaptiveBudget=plannerSettings.adaptiveBudgetMs;
     },message=>{
       if(plannerState.run!==run)return;
       if(message==='계산 시간 초과'){continueComputing();return;}

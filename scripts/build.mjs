@@ -5,7 +5,7 @@ const write = (p,s) => writeFileSync(new URL('../'+p, import.meta.url),s);
 const version=JSON.parse(read('package.json')).version;
 const vendor = ['Line','SAMTargeting'].map(n => ts.transpileModule(read('src/vendor/'+n+'.ts'), {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText).join('\n');
 write('src/vendor/engine.mjs', vendor);
-const engine = vendor.replaceAll('export class ', 'class ') + '\n' + ['src/planner.mjs','src/adaptive.mjs'].map(p=>read(p).replace(/^import .*;$/mg,'').replace(/^export /mg,'')).join('\n');
+const engine = vendor.replaceAll('export class ', 'class ') + '\n' + ['src/planner.mjs','src/adaptive.mjs','src/stability.mjs'].map(p=>read(p).replace(/^import .*;$/mg,'').replace(/^export /mg,'')).join('\n');
 const worker = engine + `
 self.onmessage = e => {
   const d=e.data;
