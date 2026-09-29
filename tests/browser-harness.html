@@ -9,7 +9,8 @@ const enemy={smallID:()=>2,id:()=>"enemy",isPlayer:()=>true,isOnSameTeam:()=>fal
 function unit(id,type,x,y,lv,owner){let q=[];return {id:()=>id,type:()=>type,tile:()=>y*1000+x,owner:()=>owner,level:()=>lv,missileTimerQueue:()=>q,isActive:()=>true,isUnderConstruction:()=>false,state:{samUpgradeStartTick:null},targetTile:()=>null};}
 let units=[unit(1,'Missile Silo',100,500,50,me),unit(2,'SAM Launcher',695,500,1,enemy)];
 const cfg={msPerTick:()=>100,SAMCooldown:()=>90,SiloCooldown:()=>90,nukeSpeed:()=>10,defaultSamMissileSpeed:()=>12,defaultNukeTargetableRange:()=>150,maxSamRange:()=>150,samRange:l=>150-480/(l+5),samUpgradeDuration:()=>45,
-unitInfo:type=>({cost:()=>type==='Hydrogen Bomb'?5000000n:750000n}),isUnitDisabled:()=>false,nukeMagnitudes:type=>({outer:type==='Hydrogen Bomb'?100:30}),infiniteGold:()=>false};
+unitInfo:type=>({cost:(g,p)=>{p.unitsOwned(type);return type==='Hydrogen Bomb'?5000000n:750000n;}}),isUnitDisabled:()=>false,nukeMagnitudes:type=>({outer:type==='Hydrogen Bomb'?100:30}),infiniteGold:()=>false};
+me.buildables=async(tile,types)=>types.map(type=>({type,cost:type==='Hydrogen Bomb'?5000000n:750000n,canBuild:false,canUpgrade:false}));
 class BuildUnitIntentEvent{constructor(unit,tile,rocketDirectionUp,amount){Object.assign(this,{unit,tile,rocketDirectionUp,amount});}}
 class SendUpgradeStructureIntentEvent{constructor(unitId,unitType,amount){Object.assign(this,{unitId,unitType,amount});}}
 const sent=[];const bus={listeners:new Map([[BuildUnitIntentEvent,[]],[SendUpgradeStructureIntentEvent,[]]]),emit(e){sent.push({tick,...e});

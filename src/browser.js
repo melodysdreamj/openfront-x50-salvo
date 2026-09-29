@@ -4,11 +4,13 @@
   const plannerState = {worker:null,job:0,pending:null,tile:null,game:null,result:null,
     snapshot:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
   const plannerPaths=new WeakMap();
+  const plannerPrices=createPriceReader({onUpdate:()=>{plannerState.updated=0;}});
 
   function plannerSnapshot(tile) {
     const g=getGameView(), me=g?.myPlayer();
     if(!g||!me||tile===null||tile===undefined) throw Error('게임에서 목표 위치에 커서를 올리세요');
     const cfg=g.config(), tick=g.ticks();
+    const prices=plannerPrices.read(g,me);
     if(typeof cfg.isReplay==='function'&&cfg.isReplay()) throw Error('리플레이에서는 공격을 실행하지 않습니다');
     if(g.inSpawnPhase()||g.isSpawnImmunityActive()) throw Error('시작 보호 시간이 끝난 후 분석합니다');
     if(g.isImpassable(tile)) throw Error('이 지형에는 핵무기를 발사할 수 없습니다');
@@ -41,11 +43,7 @@
       } else throw Error('SAM 업그레이드 상태를 읽을 수 없습니다. 현재 클라이언트는 지원되지 않습니다');
       sams.push(sam);
     }
-    const price=type=>{
-      const value=cfg.unitInfo(type).cost(g,me);
-      if(typeof value!=='bigint'&&!(typeof value==='number'&&Number.isSafeInteger(value))) throw Error('무기 가격을 읽을 수 없습니다');
-      return BigInt(value);
-    };
+    const price=type=>prices[type];
     const structures=['City','Factory','Port','Missile Silo','SAM Launcher','Defense Post'];
     const teamStructures=structures.flatMap(type=>g.units(type)).filter(u=>u.isActive()&&me.isOnSameTeam(u.owner()));
     const owner=g.owner(tile), ownTeam=owner?.isPlayer?.()&&me.isOnSameTeam(owner);
@@ -300,7 +298,20 @@
     if(plannerState.run){toast('계획 실행 중입니다. Esc로 남은 발사를 중단할 수 있습니다','#ffd166');return;}
     if(plannerState.pending?.execute){toast('선택한 위치의 발사 계획을 검증 중입니다. Esc로 취소할 수 있습니다','#ffd166');return;}
     if(upgradeJobs.size||upgradeSelectionPending||salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
-    try{plannerCompute(plannerSnapshot(computeCursorTile()),true);}catch(e){plannerState.error=e.message;toast(e.message,'#ffd166');}
+    const game=getGameView(),me=game?.myPlayer(),tile=computeCursorTile();
+    if(!game||!me||tile===null){plannerState.error='게임에서 목표 위치에 커서를 올리세요';return;}
+    plannerCancelJob();const id=plannerState.job;
+    plannerState.error='';
+    plannerState.pending={id,execute:true,kind:'prices',timeout:null};
+    plannerPrices.refresh(game,me,true).then(()=>{
+      if(id!==plannerState.job)return;
+      plannerState.pending=null;
+      if(document.hidden||getGameView()!==game)return;
+      plannerCompute(plannerSnapshot(tile),true);
+    }).catch(e=>{
+      if(id!==plannerState.job)return;
+      plannerState.pending=null;plannerState.error=e.message;toast('무기 가격 확인 실패: '+e.message,'#ffd166');
+    });
   }
   function plannerKeyGuard(e) {
     if(e.code==='F8'&&!e.repeat){plannerSettings.details=!plannerSettings.details;e.preventDefault();return true;}
@@ -335,7 +346,7 @@
     if(!p.pending && !document.hidden && now-p.stableAt>350 && now-p.updated>2500) {
       try{plannerCompute(plannerSnapshot(tile));}catch(e){p.error=e.message;p.updated=now;}
     }
-    if(p.pending)return `${report?report+'\n':''}${p.pending.kind==='advice'?'중단 후 조언':p.pending.execute?'발사 전 검증':'공격 분석'} 중…\n${p.pending.execute?'선택한 목표 고정 · Esc로 취소':'커서를 잠시 멈추면 두 공격 방식을 비교합니다'}`;
+    if(p.pending)return `${report?report+'\n':''}${p.pending.kind==='prices'?'무기 가격 확인':p.pending.kind==='advice'?'중단 후 조언':p.pending.execute?'발사 전 검증':'공격 분석'} 중…\n${p.pending.execute?'선택한 목표 고정 · Esc로 취소':'커서를 잠시 멈추면 두 공격 방식을 비교합니다'}`;
     if(p.error)return [report,'판정 불가 · '+p.error].filter(Boolean).join('\n');
     const r=p.result;
     if(!r)return [report,'공격 분석 · 목표에 커서를 잠시 멈추세요'].filter(Boolean).join('\n');
