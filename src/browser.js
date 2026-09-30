@@ -6,6 +6,8 @@
   const plannerPaths=new WeakMap();
   const plannerPrices=createPriceReader({onUpdate:()=>{plannerState.updated=0;}});
 
+  const plannerConstructionEpoch=new WeakMap();
+
   function plannerSnapshot(tile) {
     const g=getGameView(), me=g?.myPlayer();
     if(!g||!me||tile===null||tile===undefined) throw Error('게임에서 목표 위치에 커서를 올리세요');
@@ -19,7 +21,7 @@
     const read=(obj,name)=>{if(typeof obj[name]!=='function')throw Error('현재 게임에서 '+name+' 정보를 제공하지 않습니다');return obj[name]();};
     const rules={tickMs:read(cfg,'msPerTick'),samCooldown:read(cfg,'SAMCooldown'),siloCooldown:read(cfg,'SiloCooldown'),
       atomSpeed:cfg.nukeSpeed(ATOM),hydroSpeed:cfg.nukeSpeed(HYDRO),samSpeed:read(cfg,'defaultSamMissileSpeed'),
-      targetRange:read(cfg,'defaultNukeTargetableRange'),maxSamRange:read(cfg,'maxSamRange')};
+      targetRange:read(cfg,'defaultNukeTargetableRange'),maxSamRange:read(cfg,'maxSamRange'),atomBlastRadius:cfg.nukeMagnitudes(ATOM).outer};
     if(rules.tickMs!==100||![rules.atomSpeed,rules.hydroSpeed,rules.samSpeed].every(v=>Number.isInteger(v)&&v>0))
       throw Error('틱·미사일 속도 규칙이 변경되어 계산기 업데이트가 필요합니다');
     // Fail visibly when the pinned curve/targeting model's range law changes.
@@ -33,6 +35,9 @@
       const type=u.type();let group=unitsByType.get(type);
       if(!group)unitsByType.set(type,group=[]);group.push(u);
     }
+    // Establish the baseline only after a complete, usable client snapshot.
+    // A price-loading or spawn-phase read must not make rejoined units look new.
+    if(!plannerConstructionEpoch.has(g))plannerConstructionEpoch.set(g,tick);
     const units=type=>unitsByType.get(type)??[];
     const structural=u=>({id:u.id(),x:g.x(u.tile()),y:g.y(u.tile()),level:u.level(),
       queue:[...read(u,'missileTimerQueue')],building:u.isUnderConstruction(),owner:u.owner().smallID()});
@@ -41,6 +46,14 @@
     for(const u of units('SAM Launcher')) {
       if(!u.isActive()||isOwnedByMe(u,me)||me.isOnSameTeam(u.owner())) continue;
       const sam=structural(u), state=u.state;
+      const start=state?.constructionStartTick;
+      // UnitView records first appearance, not server construction progress.
+      // Only starts after our baseline in this GameView are trusted. Reloaded
+      // or already-building structures remain conservatively active now.
+      if(sam.building&&Number.isInteger(start)&&start>plannerConstructionEpoch.get(g)&&start<=tick) {
+        const duration=cfg.unitInfo('SAM Launcher').constructionDuration;
+        if(Number.isInteger(duration)&&duration>=0)sam.readyTick=start+duration+2;
+      }
       // Include allies as potential defenders; nuclear blasts can break alliances.
       // SAMs anywhere on the map are considered, not only the target's 150 tiles.
       if(typeof u.samLauncherState==='function') {
@@ -227,7 +240,7 @@
         baseTick:fresh.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,tracked:new Map(),outbox:[],
         atomLimit:Math.min(5000,Math.max(0,plannerSettings.maxAtoms)),hydroLimit:Math.max(0,plannerSettings.maxHydros),
         minHits:Math.max(1,plannerSettings.minAtomHits),goal:plan.goal??(plan.hydros?'hydro':'atomic'),
-        hitAtoms:0,hitHydros:0,replans:0,phase:'firing',reason:'검증된 계획 실행',needsReplan:false,
+        hitAtoms:0,hitHydros:0,destroyedSAMs:new Set(),replans:0,phase:'firing',reason:'검증된 계획 실행',needsReplan:false,
         startedTick:current.tick,lastTick:current.tick,lastTickAt:Date.now(),bus,ctor,current,
         signature:defenseSignature(current),candidate:null,history:[]};
       plannerState.run=run;plannerState.lastExecution='';plannerState.advice=null;plannerState.report=null;
@@ -236,7 +249,7 @@
   }
 
   function plannerObserve(run,current) {
-    const g=getGameView(),records=new Map();
+    const g=getGameView(),records=new Map(),previousHits=run.hitAtoms;
     for(const u of g.units(ATOM,HYDRO))records.set(u.id(),{id:u.id(),unitType:u.type(),ownerID:u.owner().smallID(),
       targetTile:u.targetTile(),isActive:u.isActive(),reachedTarget:u.reachedTarget?.()??false});
     // Capture terminal states even when the active-unit list already dropped it.
@@ -266,6 +279,13 @@
       b.committed=run.tracked.has(b.id)&&b.owner===run.me&&b.targetTile===run.tile;
       if(b.committed&&b.progressError)throw Error(b.progressError);
     }
+    // A previous hit cannot destroy a newly built SAM. Credit only an observed
+    // new atomic arrival together with an explicit inactive SAM state; a team
+    // or owner change must never be mistaken for structural destruction.
+    if(run.hitAtoms>previousHits)for(const id of atomicSAMTargets(run.current)) {
+      if(g.unit?.(id)?.isActive()===false)run.destroyedSAMs.add(id);
+    }
+    current.confirmedDestroyedSAMs=[...run.destroyedSAMs];
     current.includeCommitted=true;current.confirmedAtomHits=run.hitAtoms;current.confirmedHydroHits=run.hitHydros;
     run.current=current;
     const pending=run.outbox.find(v=>v.acked<v.amount);
@@ -276,7 +296,7 @@
     plannerStop(reason);
     if(!advice||!run)return;
     plannerState.advice='다음 공격에 필요한 조건을 확인 중…';
-    plannerJob('advice',{snapshot:s,options:{maxAtoms:run.atomLimit,minAtomHits:run.minHits,budgetMs:800,allowNewHydro:run.hydroLimit>0}},800,result=>{
+    plannerJob('advice',{snapshot:s,options:{requireSamDestruction:run.goal==='hydro'||!!run.plan.targetSAMIds,maxAtoms:run.atomLimit,minAtomHits:run.minHits,budgetMs:800,allowNewHydro:run.hydroLimit>0}},800,result=>{
       plannerState.advice=result.text;
     },message=>{plannerState.advice='구체적인 레벨업 조건을 확인하지 못했습니다: '+message;});
   }
@@ -339,8 +359,9 @@
       if(Date.now()-run.lastTickAt>2000)return plannerStop('게임 진행이 멈춰 남은 발사를 중단했습니다');
       if(tick-run.startedTick>plannerSettings.maxTicks)return plannerFinish('공격 관측 제한 시간에 도달했습니다',current,false);
       plannerObserve(run,current);
-      if(run.hitHydros>=1||(run.goal==='atomic'&&run.hitAtoms>=run.minHits))
-        return plannerFinish(`목표 도달 확인: 수소 ${run.hitHydros}발 · 원자 ${run.hitAtoms}발`,current,false);
+      const atomicDone=run.goal==='atomic'&&run.hitAtoms>=run.minHits&&(!run.plan.targetSAMIds||run.plan.targetSAMIds.every(id=>run.destroyedSAMs.has(id))&&atomicSAMTargets(current).length===0);
+      if(run.hitHydros>=1||atomicDone)
+        return plannerFinish(`목표 도달 확인: 수소 ${run.hitHydros}발 · 원자 ${run.hitAtoms}발${atomicDone&&run.plan.targetSAMIds?` · 목표 SAM ${run.plan.targetSAMIds.length}기 제거 확인`:''}`,current,false);
       const signature=defenseSignature(current);
       if(signature!==run.signature){run.needsReplan=true;run.reason='SAM·사일로 변화 감지 — 남은 발사 보류';}
       for(const b of current.inflight)if(b.committed&&b.type===HYDRO&&b.targeted&&!run.tracked.get(b.id).targeted) {
@@ -379,7 +400,7 @@
         }else if(!action) {
           run.phase=run.sent===run.confirmed?'observing':'waiting-ack';
           if(run.sent===run.confirmed&&!current.inflight.some(b=>b.committed))
-            return plannerFinish(`비행 종료 · 목표 도달 확인 부족 (수소 ${run.hitHydros}, 원자 ${run.hitAtoms})`,current,true);
+            return plannerFinish(run.plan.targetSAMIds?`비행 종료 · 원자 ${run.hitAtoms}발 도달, 목표 SAM 제거 확인 ${run.plan.targetSAMIds.filter(id=>run.destroyedSAMs.has(id)).length}/${run.plan.targetSAMIds.length}기`:`비행 종료 · 목표 도달 확인 부족 (수소 ${run.hitHydros}, 원자 ${run.hitAtoms})`,current,true);
         }
       }
     }catch(e){return plannerStop('상태 확인 실패로 중단: '+e.message);}

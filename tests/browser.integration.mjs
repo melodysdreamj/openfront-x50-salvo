@@ -77,6 +77,20 @@ try {
   assert.equal(await page.evaluate(()=>fixture.sent.filter(e=>e.unit==='Hydrogen Bomb').length),1);
   await page.keyboard.press('Escape');
   console.log('Browser: assigned hydro interceptor triggers atomic fallback without a second hydro.');
+  for(const blast of [false,true]) {
+    await load();
+    await page.evaluate(blast=>{fixture.blast=blast;},blast);
+    await page.keyboard.press('KeyI');
+    await page.waitForFunction(()=>fixture.units().some(u=>u.type()==='Hydrogen Bomb'));
+    await page.evaluate(()=>{fixture.units().find(u=>u.type()==='Hydrogen Bomb').targeted=true;});
+    await page.waitForFunction(()=>__x50.planner.state().history?.some(h=>h.decision==='atomic'));
+    await page.waitForFunction(()=>!__x50.planner.state().running,null,{timeout:15000});
+    const outcome=await page.evaluate(()=>__x50.planner.state().lastExecution);
+    if(blast)assert.match(outcome,/목표 SAM 1기 제거 확인/);
+    else assert.doesNotMatch(outcome,/목표 도달 확인:/);
+    assert.equal(await page.evaluate(()=>fixture.sent.filter(e=>e.unit==='Hydrogen Bomb').length),1);
+    console.log(`Browser: atomic fallback ${blast?'confirms arrival and actual target SAM removal':'does not report success for arrival alone with a surviving SAM'}.`);
+  }
   await load();
   await page.evaluate(()=>fixture.units().push(fixture.unit(3,'SAM Launcher',0,0,1,fixture.enemy)));
   await page.keyboard.press('KeyI');

@@ -1,6 +1,7 @@
 // Run with a checkout of the pinned engine: node scripts/verify-upstream.mjs ../OpenFrontIO
 // Actual upstream execution classes run against a minimal map/player adapter.
-// Terrain explosions are counted instead of applied (the planner likewise keeps SAMs alive).
+// Baseline cases count impacts while retaining SAMs conservatively. Extra blast
+// cases run native structural deletion, isolating only terrain mutation.
 import ts from 'typescript';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -32,11 +33,12 @@ load('execution/SAMMissileExecution.ts',['SAMMissileExecution']);
 load('execution/SAMLauncherExecution.ts',['SAMLauncherExecution']);
 load('execution/MissileSiloExecution.ts',['MissileSiloExecution']);
 load('execution/NukeExecution.ts',['NukeExecution']);
+load('execution/ConstructionExecution.ts',['ConstructionExecution']);
 let currentGame;
 class Unit {
   constructor(owner,type,tile,params={}) {this._owner=owner;this._type=type;this._tile=tile;this._params=params;this.q=[];this.lv=1;this.active=true;this._id=++currentGame.nextId;this.ns={trajectory:params.trajectory??[],trajectoryIndex:0,waitTicks:0,targetedBySam:false};}
   id(){return this._id;} owner(){return this._owner;} type(){return this._type;} tile(){return this._tile;}
-  move(t){this._tile=t;}isActive(){return this.active;}isUnderConstruction(){return false;}level(){return this.lv;}
+  move(t){this._tile=t;}isActive(){return this.active;}isUnderConstruction(){return !!this.building;}setUnderConstruction(v){this.building=v;}setReachedTarget(){this.reached=true;}level(){return this.lv;}
   missileTimerQueue(){return this.q;}isInCooldown(){return this.q.length===this.lv;}launch(){this.q.push(currentGame.time);}
   reloadMissile(){this.q.shift();}samLauncherState(){return this.upgrade;}
   nukeState(){return this.ns;}updateNukeState(s){Object.assign(this.ns,s);}trajectory(){return this.ns.trajectory;}
@@ -44,13 +46,13 @@ class Unit {
   targetedBySAM(){return this.ns.targetedBySam;}setTargetedBySAM(v){this.ns.targetedBySam=v;}setTargetable(){}
   targetTile(){return this._params.targetTile;}targetUnit(){return this._params.targetUnit;}delete(){this.active=false;}
 }
-function engineRun(s,plan,transition=null) {
+function engineRun(s,plan,transition=null,blast=false) {
   plan=structuredClone(plan);let adapted=null;
   const W=s.width,ref=(x,y)=>y*W+x,x=t=>t%W,y=t=>Math.floor(t/W),man=(a,b)=>Math.abs(x(a)-x(b))+Math.abs(y(a)-y(b));
   const all=[],execs=[],queued=[],motions=new Map();let gold=s.gold,atomHits=0,hydroHits=0;
   const cfg={nukeSpeed:t=>t===HYDRO?s.rules.hydroSpeed:s.rules.atomSpeed,defaultNukeTargetableRange:()=>s.rules.targetRange,
     maxSamRange:()=>s.rules.maxSamRange,defaultSamMissileSpeed:()=>s.rules.samSpeed,SAMCooldown:()=>s.rules.samCooldown,SiloCooldown:()=>s.rules.siloCooldown,
-    nukeMagnitudes:()=>({inner:1,outer:1}),nukeAllianceBreakThreshold:()=>100,gameConfig:()=>({gameType:'Singleplayer'}),
+    nukeMagnitudes:()=>({inner:1,outer:blast?(s.rules.atomBlastRadius??30):1}),nukeAllianceBreakThreshold:()=>100,gameConfig:()=>({gameType:'Singleplayer'}),
     dynamicSamRange:(u,t)=>{const z=u.upgrade;const r=l=>150-480/(l+5);return !z?r(u.lv):t-z.upgradeStartTick>=z.duration?r(z.targetLevel):z.startRange+(r(z.targetLevel)-z.startRange)*(t-z.upgradeStartTick)/z.duration;}};
   const player=id=>({id:()=>id,smallID:()=>id,displayName:()=>String(id),isPlayer:()=>true,isFriendly:()=>false,isOnSameTeam:()=>false,
     incomingAllianceRequests:()=>[],allianceWith:()=>null,updateRelation:()=>{},
@@ -64,10 +66,10 @@ function engineRun(s,plan,transition=null) {
     nearbyUnits:(tile,range,types,predicate=()=>true)=>all.filter(u=>u.active&&(Array.isArray(types)?types.includes(u.type()):types===u.type()))
       .map(unit=>({unit,distSquared:(x(tile)-x(unit.tile()))**2+(y(tile)-y(unit.tile()))**2})).filter(v=>v.distSquared<=range**2&&predicate(v)),
     unitCount:type=>all.filter(u=>u.active&&u.type()===type).length,owner:()=>neutral,hasOwner:()=>false,getWinner:()=>null,
-    addExecution:(...e)=>queued.push(...e),stats:()=>({bombLaunch(){},bombIntercept(){}}),recordMotionPlan(p){motions.set(p.unitId,p);},displayMessage(){},playerBySmallID:()=>enemy};
+    addExecution:(...e)=>queued.push(...e),units:()=>all.filter(u=>u.active),stats:()=>({bombLaunch(){},bombIntercept(){},bombLand(){}}),recordMotionPlan(p){motions.set(p.unitId,p);},displayMessage(){},playerBySmallID:()=>enemy};
   currentGame=game;
   for(const d of s.silos){const u=me.buildUnit('Missile Silo',ref(d.x,d.y),{});u.lv=d.level;u.q=[...d.queue];const e=new deps.MissileSiloExecution(u);e.init(game,game.time);execs.push(e);}
-  for(const d of s.sams){const u=enemy.buildUnit('SAM Launcher',ref(d.x,d.y),{});u.lv=d.level;u.q=[...d.queue];const e=new deps.SAMLauncherExecution(enemy,null,u);e.init(game,game.time);execs.push(e);}
+  for(const d of s.sams){const u=enemy.buildUnit('SAM Launcher',ref(d.x,d.y),{});u.sourceId=d.id;u.lv=d.level;u.q=[...d.queue];u.building=!!d.building;u.readyTick=d.readyTick;const e=new deps.SAMLauncherExecution(enemy,null,u);e.init(game,game.time);execs.push(e);}
   let a=0;
   for(;game.time<s.tick+1200;game.time++) {
     if(transition&&game.time===s.tick+transition.at) {
@@ -100,23 +102,26 @@ function engineRun(s,plan,transition=null) {
       const extra=adapted.chosen?.actions.map(v=>({...v,tick:game.time-s.tick+v.tick,up:adapted.chosen.up}))??[];
       plan.actions=[...sent,...extra];
     }
+    for(const u of all)if(u.building&&u.readyTick<=game.time)u.building=false;
     for(const e of execs)if(e.isActive())e.tick(game.time);
     // Nuke init on input+1, first spawn on input+2, matching ConstructionExecution.
     while(a<plan.actions.length&&game.time===s.tick+plan.actions[a].tick+1) {
       const intent=plan.actions[a++];
       for(let n=0;n<intent.amount;n++) {
         const e=new deps.NukeExecution(intent.type,me,ref(s.target.x,s.target.y),null,-1,0,intent.up??plan.up);
-        e.detonate=function(){if(this.nuke.type()===HYDRO)hydroHits++;else atomHits++;this.nuke.delete();this.active=false;};
+        if(blast){e.tilesToDestroy=()=>new Set();e.redrawBuildings=()=>{};}
+        const nativeDetonate=e.detonate;
+        e.detonate=function(){if(blast)nativeDetonate.call(this);if(this.nuke.type()===HYDRO)hydroHits++;else atomHits++;this.nuke.delete();this.active=false;};
         queued.push(e);
       }
     }
     for(const e of queued){e.init(game,game.time);execs.push(e);}queued.length=0;
     if(a===plan.actions.length&&!execs.some(e=>e instanceof deps.NukeExecution&&e.isActive())&&!all.some(u=>u.active&&[ATOM,HYDRO,'SAM Missile'].includes(u.type())))break;
   }
-  return {atomHits,hydroHits,adapted};
+  return {atomHits,hydroHits,adapted,destroyedSAMs:all.filter(u=>u.type()==='SAM Launcher'&&!u.active).map(u=>u.sourceId)};
 }
 const base={tick:1000,me:1,target:{x:700,y:500},width:1000,height:1000,
-  rules:{tickMs:100,samCooldown:90,siloCooldown:90,atomSpeed:10,hydroSpeed:10,samSpeed:12,targetRange:150,maxSamRange:150},
+  rules:{atomBlastRadius:30,tickMs:100,samCooldown:90,siloCooldown:90,atomSpeed:10,hydroSpeed:10,samSpeed:12,targetRange:150,maxSamRange:150},
   silos:[{id:1,x:100,y:500,level:50,queue:[]}],sams:[],gold:10_000_000_000n,atomCost:750000n,hydroCost:5000000n};
 let comparisons=0,verified=0;
 for(const samLevel of [0,1,3,10,30]) for(const up of [true,false]) for(const atoms of [0,4,15,40]) {
@@ -165,3 +170,35 @@ for(const level of [0,50,150])for(const up of [true,false]) {
 }
 assert.ok(fastAccepted>=2);
 console.log(`Upstream fast salvo: ${fastCases} scenarios with 500 atoms at 100ms cadence; ${fastAccepted} verified plans reached their hit goals.`);
+
+// Native construction countdown, execution activation and full structural blast
+// deletion. Terrain mutation is irrelevant to structure radius and isolated here.
+{
+ let now=1000,building=null,activatedAt=null;const queued=[];
+ const owner={canBuild:()=>10,buildUnit:()=>building={tile:()=>10,isActive:()=>true,owner:()=>owner,setUnderConstruction(v){this.building=v;}}};
+ const game={ticks:()=>now,config:()=>({isUnitDisabled:()=>false}),isValidRef:()=>true,
+   unitInfo:()=>({constructionDuration:300}),addExecution:e=>queued.push(e)};
+ const e=new deps.ConstructionExecution(owner,'SAM Launcher',10);e.init(game,now);
+ e.tick(now);assert.equal(building.building,true);
+ for(now=1001;now<=1300;now++){e.tick(now);assert.equal(building.building,true);assert.equal(queued.length,0);}
+ e.tick(1301);assert.equal(building.building,false);assert.equal(queued.length,1);
+ assert.ok(queued[0] instanceof deps.SAMLauncherExecution);
+ // GameImpl initializes queued executions at tick end; first tick is 1302.
+ activatedAt=1302;assert.equal(activatedAt,1000+300+2);
+ console.log('Upstream construction: SAM completes at start + duration + 1; launcher runs on the next tick.');
+}
+let blastCases=0;
+for(const level of [1,25,500])for(const offset of [29,30,31]) {
+ const s={...base,sams:[{id:10,x:700+offset,y:500,level,queue:Array(level).fill(1000)}]};
+ const p={...makePlan(1),goal:'atomic'},prediction=simulate(s,p),actual=engineRun(s,p,null,true);
+ assert.ok(actual.atomHits>0);
+ assert.deepEqual(actual.destroyedSAMs,offset<30?[10]:[]);
+ assert.deepEqual(prediction.atomDestroyedSAMs,actual.destroyedSAMs);blastCases++;
+}
+console.log(`Upstream atomic structural destruction: ${blastCases} radius/level cases match native detonation.`);
+for(const readyTick of [1000,1020,1060,1400]) {
+ const s={...base,sams:[{id:10,x:695,y:500,level:3,queue:[],building:true,readyTick}]};
+ const p=makePlan(4,4),prediction=assess(s,p),actual=engineRun(s,p);
+ if(prediction.ok)assert.ok(actual.hydroHits>=1);
+}
+console.log('Upstream construction activation: 4 before/during/after flight cases verified.');

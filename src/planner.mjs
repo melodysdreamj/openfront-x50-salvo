@@ -68,6 +68,13 @@ export function rangeAt(sam,tick,rules) {
   return elapsed>=u.duration ? range(u.targetLevel) : u.startRange+(range(u.targetLevel)-u.startRange)*elapsed/u.duration;
 }
 
+// Structures strictly inside outer radius are deleted by NukeExecution,
+// independently of terrain's irregular blast edge and structure level.
+export function atomicSAMTargets(s) {
+  const radius=s.rules.atomBlastRadius;
+  return Number.isFinite(radius)&&radius>0?s.sams.filter(u=>dist2(u,s.target)<radius**2).map(u=>u.id):[];
+}
+
 export function validateSnapshot(s) {
   if (!s || !Number.isInteger(s.tick) || !s.target || !s.rules) throw Error('게임 상태가 불완전합니다');
   for (const k of ['tickMs','samCooldown','siloCooldown','atomSpeed','hydroSpeed','samSpeed','targetRange','maxSamRange'])
@@ -76,6 +83,7 @@ export function validateSnapshot(s) {
   for (const u of [...s.silos,...s.sams]) {
     if (!Number.isInteger(u.level)||u.level<1||!Number.isFinite(u.x)||!Number.isFinite(u.y)||!Array.isArray(u.queue)||u.queue.some(t=>!Number.isInteger(t)))
       throw Error('구조물 레벨 또는 재장전 정보를 읽을 수 없습니다');
+    if(u.readyTick!==undefined&&!Number.isInteger(u.readyTick))throw Error('SAM 완공 시점 정보가 불완전합니다');
     if(u.upgrade&&(!Number.isInteger(u.upgrade.startTick)||!Number.isFinite(u.upgrade.startRange)||
       !Number.isInteger(u.upgrade.targetLevel)||u.upgrade.targetLevel<1||!(u.upgrade.duration>0)))
       throw Error('SAM 업그레이드 진행 정보가 불완전합니다');
@@ -109,8 +117,8 @@ function bombUnit(b) {
 }
 
 // An assigned interceptor counts as a kill immediately. We deliberately keep
-// defending SAMs alive after atom impacts: reported hits do not rely on blast
-// randomness, third-party damage, or favorable destruction of the launcher.
+// defending SAMs alive after atom impacts when computing interception. Track
+// guaranteed structure kills separately; never rely on them to rescue a hydro.
 export function simulate(s,plan,opt={}) {
   validateSnapshot(s);
   const r=s.rules, start=s.tick, deadline=opt.deadline??Infinity;
@@ -119,6 +127,9 @@ export function simulate(s,plan,opt={}) {
   const sams=s.sams.map(u=>({...u,queue:[...u.queue],interceptions:0}));
   if (opt.reverse) sams.reverse();
   const me=actor(s.me), defenders=actor(-1), bombs=[], cache=opt.pathCache??new Map();
+  const atomDestroyedSAMs=new Set(s.confirmedDestroyedSAMs??[]);
+  const blastTargets=new Set(atomicSAMTargets(s));
+  let atomicImpact=false;
   const traces=[], launches=[], used=new Set(), participating=new Set(), byUnit=new Map();
   let now=start, gold=s.gold, atomHits=s.confirmedAtomHits??0, hydroHits=s.confirmedHydroHits??0,
     committedHydroHits=0,dropped=0,tubeShortage=0,goldShortage=0,lastArrival=0,nextId=1;
@@ -177,7 +188,11 @@ export function simulate(s,plan,opt={}) {
         if(b.index>=b.path.length-1) {
           b.index=b.path.length-1; b.done=true;
           if(b.ours&&!b.targeted) {
-            if(b.type===HYDRO) {hydroHits++;if(b.committed)committedHydroHits++;} else atomHits++;
+            if(b.type===HYDRO) {hydroHits++;if(b.committed)committedHydroHits++;} else {
+              atomHits++;
+              if(!atomicImpact)for(const id of blastTargets)atomDestroyedSAMs.add(id);
+              atomicImpact=true;
+            }
             lastArrival=now-start;
           }
         }
@@ -187,9 +202,11 @@ export function simulate(s,plan,opt={}) {
     if(opt.moveFirst) move();
     game.nearbyUnits=missileIndex(bombs,now,opt.spawnFirst,r.maxSamRange*4);
     for(const sam of sams) {
+      // Unknown/rejoined construction dates remain immediately active. Known
+      // starts use native completion + execution activation; timing variants
+      // also test activation two ticks earlier.
+      if(sam.building&&sam.readyTick!==undefined&&now<sam.readyTick+(opt.constructionShift??0))continue;
       while(sam.queue.length&&now-sam.queue[0]>=r.samCooldown) sam.queue.shift();
-      // Treat construction as completed for conservative planning. This avoids
-      // promising a hit through a SAM that finishes during the flight.
       if(sam.queue.length>=sam.level) continue;
       for(const target of sam.selector.getValidTargets(now)) {
         if(sam.queue.length>=sam.level) break;
@@ -203,19 +220,19 @@ export function simulate(s,plan,opt={}) {
     if(ai===actions.length&&bombs.every(b=>b.done||b.targeted)) break;
   }
   const unfinished=bombs.some(b=>b.ours&&!b.done&&!b.targeted);
-  return {atomHits,hydroHits,committedHydroHits,dropped,tubeShortage,goldShortage,unfinished,cost:s.gold-gold,lastArrival,launches,traces,
+  return {...(s.rules.atomBlastRadius!==undefined?{atomDestroyedSAMs:[...atomDestroyedSAMs]}:{}),atomHits,hydroHits,committedHydroHits,dropped,tubeShortage,goldShortage,unfinished,cost:s.gold-gold,lastArrival,launches,traces,
     usedSilos:[...used],participating:[...participating],
     interceptions:sams.map(u=>({id:u.id,count:u.interceptions})),ticks:now-start};
 }
 
 function affordable(s,plan) { return BigInt(plan.atoms)*s.atomCost+BigInt(plan.hydros)*s.hydroCost<=s.gold; }
 function succeeds(result,plan,minHits) { return !result.dropped&&!result.unfinished&&
-  ((plan.goal??(plan.hydros?'hydro':'atomic'))==='hydro'?result.hydroHits>=1:result.atomHits>=minHits); }
+  ((plan.goal??(plan.hydros?'hydro':'atomic'))==='hydro'?result.hydroHits>=1:result.atomHits>=minHits&&(!plan.targetSAMIds||plan.targetSAMIds.length>0&&plan.targetSAMIds.every(id=>result.atomDestroyedSAMs?.includes(id)))); }
 
 export function assess(s,plan,options={}) {
   const cache=options.pathCache??new Map();
   const base={deadline:options.deadline,maxTicks:options.maxTicks,pathCache:cache,conservative:true};
-  const cases=[{}, {reverse:true,moveFirst:true,spawnFirst:true,flightShift:1}, {hydroDelay:-2,delay:2,flightShift:-1}, {reverse:true,hydroDelay:2,delay:2}];
+  const cases=[{}, {reverse:true,moveFirst:true,spawnFirst:true,flightShift:1,constructionShift:-2}, {hydroDelay:-2,delay:2,flightShift:-1}, {reverse:true,hydroDelay:2,delay:2}];
   let worst=null;
   for(const variant of cases) {
     const result=simulate(s,plan,{...base,...variant});
@@ -237,6 +254,7 @@ export function* searchSteps(s, options={}) {
   validateSnapshot(s);
   const began=performance.now(),deadline=began+(options.budgetMs??1800),pathCache=new Map();
   const minHits=Math.max(1,options.minAtomHits??1);
+  const targetSAMIds=options.requireSamDestruction?atomicSAMTargets(s):null;
   const cap=Math.min(5000,Math.max(0,options.maxAtoms??2000));
   const initial=options.initialTicks??3,interval=options.intentIntervalTicks??1;
   const committedHydro=s.includeCommitted&&(s.inflight??[]).some(b=>b.committed&&b.owner===s.me&&!b.targeted&&b.type===HYDRO);
@@ -277,8 +295,8 @@ export function* searchSteps(s, options={}) {
     outer: for(const [fraction,gap] of [[1,0],[.75,0],[.5,0],[1,8],[.75,8],[1,30],[1,60],[.5,30]]) {
      for(const atoms of counts) {
       for(const up of [s.preferredUp!==false,s.preferredUp===false]) {
-        if(fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {
-          const p=run({...makePlan(atoms,null,0,up,initial,interval),goal:'atomic'}); if(p) result.atomic=p;
+        if((!targetSAMIds||targetSAMIds.length>0)&&fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {
+          const p=run({...makePlan(atoms,null,0,up,initial,interval),goal:'atomic',...(targetSAMIds?{targetSAMIds}: {})}); if(p) result.atomic=p;
           yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
         }
         if(!result.mixed&&options.allowHydroGoal!==false&&(committedHydro||s.allowed?.mixed!==false)&&(atoms===0||s.allowed?.atomic!==false)) {
@@ -324,6 +342,7 @@ export function* searchSteps(s, options={}) {
       result.reason=`시험한 수소 공격은 SAM (${sam.x}, ${sam.y}) Lv${sam.level}이 ${b.tick}틱에 요격 — 발사 배치·간격 개선 필요`;
     } else result.reason='탐색 범위에서 돌파 계획 없음 — 사일로 발사 간격·배치와 SAM 재장전이 병목일 수 있습니다';
   }
+  if(!result.chosen&&targetSAMIds?.length===0&&!result.limited)result.reason='수소 적중 계획을 찾지 못했고, 원자 폭발 반경 안에 목표 SAM이 없어 원자로 전환하지 않고 중단합니다';
   result.elapsedMs=Math.round(performance.now()-began);
   return result;
 }

@@ -4,7 +4,7 @@ import {trajectory,simulate,assess,makePlan,ATOM,HYDRO} from '../src/planner.mjs
 import {adapt,flightProgress,remainingPlan,defenseSignature,upgradeAdvice} from '../src/adaptive.mjs';
 function fixture(overrides={}) {
   const s={tick:1000,me:1,target:{x:700,y:500},height:1000,width:1000,
-    rules:{tickMs:100,samCooldown:90,siloCooldown:90,atomSpeed:10,hydroSpeed:10,samSpeed:12,targetRange:150,maxSamRange:150},
+    rules:{atomBlastRadius:30,tickMs:100,samCooldown:90,siloCooldown:90,atomSpeed:10,hydroSpeed:10,samSpeed:12,targetRange:150,maxSamRange:150},
     silos:[{id:1,x:550,y:500,level:50,queue:[]}],sams:[{id:10,x:695,y:500,level:3,queue:[]}],
     gold:100000000n,atomCost:750000n,hydroCost:5000000n,allowed:{atomic:true,mixed:true},includeCommitted:true};
   s.inflight=[{id:99,type:HYDRO,owner:1,committed:true,index:5,waitTicks:0,

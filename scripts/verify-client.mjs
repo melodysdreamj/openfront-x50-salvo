@@ -6,7 +6,7 @@ import ts from 'typescript';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import {createPriceReader} from '../src/prices.mjs';
-import {validateSnapshot,trajectory,search,simulate,ATOM,HYDRO} from '../src/planner.mjs';
+import {validateSnapshot,trajectory,search,simulate,atomicSAMTargets,ATOM,HYDRO} from '../src/planner.mjs';
 import {flightProgress} from '../src/adaptive.mjs';
 const root=path.resolve(process.argv[2]??'../OpenFrontIO');
 const deps={};
@@ -26,7 +26,9 @@ function methods(file,name,selected,{includeConstructor=false,helpers=[]}={}){
  const extra=a.statements.filter(n=>ts.isFunctionDeclaration(n)&&helpers.includes(n.name?.text)).map(n=>n.getText(a)).join('\n');
  return evaluate(extra+'\nclass '+name+' {\n'+members.map(n=>n.getText(a)).join('\n')+'\n}',[name])[name];
 }
-const Config=methods('core/configuration/Config.ts','Config',['unitInfoCache','unitInfo','costWrapper','infiniteGold','hasInfiniteGoldFor','isReplay','msPerTick','SAMCooldown','SiloCooldown','isUnitDisabled','nukeMagnitudes','nukeSpeed','defaultNukeTargetableRange','samRange','maxSamRange','samUpgradeDuration','defaultSamMissileSpeed'],{includeConstructor:true});
+const configAst=ast('core/configuration/Config.ts');
+evaluate(configAst.statements.find(n=>ts.isVariableStatement(n)&&n.declarationList.declarations.some(d=>d.name.getText(configAst)==='SAM_CONSTRUCTION_TICKS')).getText(configAst).replace(/^export /,''),['SAM_CONSTRUCTION_TICKS']);
+const Config=methods('core/configuration/Config.ts','Config',['unitInfoCache','unitInfo','costWrapper','infiniteGold','hasInfiniteGoldFor','isReplay','msPerTick','SAMCooldown','SiloCooldown','isUnitDisabled','nukeMagnitudes','nukeSpeed','defaultNukeTargetableRange','samRange','maxSamRange','samUpgradeDuration','defaultSamMissileSpeed','instantBuild'],{includeConstructor:true});
 const Player=methods('core/game/PlayerImpl.ts','PlayerImpl',['buildableUnits','unitsOwned','unitsConstructed','type','isLobbyCreator']);
 const PlayerView=methods('client/view/PlayerView.ts','PlayerView',['buildables','actions','id','smallID','type','isPlayer','isAlive','isOnSameTeam','isFriendly','isAlliedWith','isLobbyCreator','gold']);
 const UnitView=methods('client/view/UnitView.ts','UnitView',null,{helpers:['trainTypeToNum','numToTrainType','unitStateFromUpdate','applyUpdateInPlace']});
@@ -51,18 +53,30 @@ const legacy=fs.readFileSync(new URL('../src/legacy.js',import.meta.url),'utf8')
 const ownerFn=legacy.slice(legacy.indexOf('  function isOwnedByMe'),legacy.indexOf('  function getTransform'));
 const browserSource=fs.readFileSync(new URL('../src/browser.js',import.meta.url),'utf8');
 const snapshotFn=browserSource.slice(browserSource.indexOf('  function plannerSnapshot'),browserSource.indexOf('  function plannerStop'));
-const reader=createPriceReader(),context=vm.createContext({getGameView:()=>g,ATOM,HYDRO,validateSnapshot,flightProgress,plannerPrices:reader,plannerPaths:new WeakMap(),getRocketDirectionUp:()=>true,RL:{perMinute:150,minWindow:[]},dist2:(a,b)=>(a.x-b.x)**2+(a.y-b.y)**2});
+const reader=createPriceReader(),context=vm.createContext({getGameView:()=>g,ATOM,HYDRO,validateSnapshot,atomicSAMTargets,flightProgress,plannerPrices:reader,plannerPaths:new WeakMap(),plannerConstructionEpoch:new WeakMap(),getRocketDirectionUp:()=>true,RL:{perMinute:150,minWindow:[]},dist2:(a,b)=>(a.x-b.x)**2+(a.y-b.y)**2});
 vm.runInContext(ownerFn+'\n'+snapshotFn+'\nthis.snapshot=plannerSnapshot;',context);
+const observeFn=browserSource.slice(browserSource.indexOf('  function plannerObserve'),browserSource.indexOf('  function plannerFinish'));
+vm.runInContext(observeFn+'\nthis.observe=plannerObserve;',context);
 let checks=0;const check=(label,fn)=>{fn();checks++;console.log('Client boundary: '+label);};
 check('previous price call reproduces unitsOwned failure with original Config and PlayerView',()=>{
  assert.equal(typeof me.unitsOwned,'undefined');assert.throws(()=>cfg.unitInfo(ATOM).cost(g,me),/unitsOwned/);
 });
+assert.throws(()=>context.snapshot(cursor));
+assert.equal(context.plannerConstructionEpoch.has(g),false,'failed price read cannot establish construction epoch');
 await reader.refresh(g,me);
 check('fixed snapshot reads actual engine prices via original PlayerView.buildables',()=>{
  const s=context.snapshot(cursor);assert.equal(s.atomCost,750000n);assert.equal(s.hydroCost,5000000n);assert.equal(s.silos.length,1);assert.equal(s.sams.length,2);
 });
 check('original UnitView preserves SAM upgrade state and current reload queue',()=>{
  const s=context.snapshot(cursor),u=s.sams.find(u=>u.id===2);assert.equal(u.upgrade.startTick,995);assert.equal(u.upgrade.duration,45);assert.equal(u.queue[0],980);
+});
+check('construction timing trusts new native UnitViews but not pre-existing builders',()=>{
+ const old=unit(update(90,'SAM Launcher',2,500685,{underConstruction:true}));
+ assert.equal(context.snapshot(cursor).sams.find(u=>u.id===90).readyTick,undefined);
+ g.time+=1;
+ const fresh=unit(update(91,'SAM Launcher',2,500680,{underConstruction:true}));
+ assert.equal(context.snapshot(cursor).sams.find(u=>u.id===91).readyTick,g.time+cfg.unitInfo('SAM Launcher').constructionDuration+2);
+ g._units.delete(90);g._units.delete(91);g.time=1000;
 });
 check('sea target keeps nearby SAMs, including launch-path defenders',()=>{
  g.owner=()=>neutral;
@@ -98,5 +112,17 @@ check('original UnitView exposes warship patrol target used for creation acknowl
  const ship=unit(update(8,'Warship',1,500100,{warshipState:{patrolTile:500700,state:'patrolling'}}));
  assert.equal(ship.warshipState().patrolTile,500700);
  assert.ok(g.units('Warship').some(u=>u.id()===8&&u.owner()===me));
+});
+
+check('atomic arrival requires explicit SAM destruction, not disappearance through ownership change',()=>{
+ const atom=unit(update(99,ATOM,1,cursor,{targetTile:cursor}));
+ const before=context.snapshot(cursor),run={me:1,tile:cursor,ids:new Set([4]),tracked:new Map([[99,{id:99,type:ATOM,active:true,hit:false}]]),outbox:[],hitAtoms:0,hitHydros:0,destroyedSAMs:new Set(),current:before};
+ atom.update(update(99,ATOM,1,cursor,{targetTile:cursor,isActive:false,reachedTarget:true}));
+ const current=context.snapshot(cursor);current.sams=current.sams.filter(u=>u.id!==2); // same-team exclusion, SAM remains active
+ context.observe(run,current);assert.equal(run.hitAtoms,1);assert.equal(run.destroyedSAMs.size,0);
+ // Another confirmed arrival accompanied by the native inactive UnitView.
+ run.current=before;run.tracked.get(99).hit=false;
+ sam.update(update(2,'SAM Launcher',2,500695,{isActive:false}));
+ context.observe(run,context.snapshot(cursor));assert.ok(run.destroyedSAMs.has(2));
 });
 console.log(`Original client/config boundary checks: ${checks} passed. Source: ${root}`);

@@ -1,4 +1,4 @@
-import {ATOM,HYDRO,assess,search} from './planner.mjs';
+import {ATOM,HYDRO,assess,search,atomicSAMTargets} from './planner.mjs';
 
 // The conservative planner never credits unrelated flights. Keep them in the
 // live observer, but do not repeatedly clone their full paths into each Worker.
@@ -71,7 +71,7 @@ export function defenseSignature(s) {
   return JSON.stringify([
     s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner]),s.allowed,
     s.sams.filter(u=>boxes.some(([x0,x1,y0,y1])=>u.x>=x0&&u.x<=x1&&u.y>=y0&&u.y<=y1))
-      .map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.upgrade])]);
+      .map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.upgrade,...(u.readyTick===undefined?[]:[u.readyTick])])]);
 }
 
 export function adapt(s,request,options={}) {
@@ -80,7 +80,9 @@ export function adapt(s,request,options={}) {
   const hydroLeft=Math.max(0,request.hydroLimit-request.sentHydros);
   const minHits=options.minAtomHits??1,lead=options.initialTicks??6;
   s={...s,includeCommitted:true};
+  const requireSamDestruction=request.goal==='hydro'||!!request.remaining?.targetSAMIds;
   const old=request.remaining?{...request.remaining,goal:request.goal}:null;
+  if(old?.targetSAMIds)old.targetSAMIds=[...new Set([...old.targetSAMIds,...atomicSAMTargets(s)])];
   const envelope=p=>p&&p.atoms<=cap&&p.hydros<=hydroLeft&&p.actions.length<=(s.intentBudget??140)&&
     p.actions.every(a=>a.type===HYDRO?s.allowed?.mixed!==false:s.allowed?.atomic!==false)&&
     BigInt(p.atoms)*s.atomCost+BigInt(p.hydros)*s.hydroCost<=s.gold;
@@ -94,12 +96,14 @@ export function adapt(s,request,options={}) {
   const timeLeft=deadline-performance.now();
   if(timeLeft<=0)return {chosen:null,decision:'stop',limited:true,reason:'재계산 시간 내 유효한 계획을 확인하지 못했습니다',snapshotTick:s.tick};
   const result=search(s,{...options,budgetMs:timeLeft,maxAtoms:cap,initialTicks:lead,
-    allowHydroGoal:request.goal!=='atomic',allowNewHydro:hydroLeft>0});
+    requireSamDestruction,allowHydroGoal:request.goal!=='atomic',allowNewHydro:hydroLeft>0});
+  if(result.limited&&requireSamDestruction&&request.goal==='hydro'&&!result.mixed)
+    return {...result,chosen:null,decision:'stop',reason:'수소 구출 후보 계산을 계속합니다 — 원자 전환은 검토 완료 후 결정'};
   if(!result.chosen)return {...result,decision:'stop',reason:cap===0?'이번 공격의 누적 원자 발사 한도에 도달했습니다':result.reason};
   const goal=result.chosen.goal??(result.chosen.hydros?'hydro':'atomic');
   const decision=!result.chosen.actions.length?'observe':goal==='atomic'?'atomic':request.sentHydros>0?'rescue':'mixed';
   const reason={observe:'현재 관측 상태로 목표 달성 예상 — 추가 발사 보류',
-    atomic:request.goal==='atomic'?'변경된 방어에 맞춰 원자 집중 수량·일정 수정':'수소 구출 계획을 찾지 못해 원자 집중으로 전환',rescue:`비행 중 수소 구출을 위해 원자 ${result.chosen.atoms}발 보강`,
+    atomic:request.goal==='atomic'?'변경된 방어에 맞춰 원자 집중 수량·일정 수정':`수소 구출 계획을 찾지 못해 목표 SAM ${result.chosen.targetSAMIds?.length??0}기 제거를 위한 원자 집중으로 전환`,rescue:`비행 중 수소 구출을 위해 원자 ${result.chosen.atoms}발 보강`,
     mixed:`원자 ${result.chosen.atoms}발 + 수소 ${result.chosen.hydros}발로 남은 계획 수정`}[decision];
   return {...result,decision,reason};
 }

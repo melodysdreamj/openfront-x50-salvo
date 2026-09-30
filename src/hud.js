@@ -47,6 +47,9 @@
       '재장전 완료 1발분 = 지금 비어 있는 미사일 발사관 1개.',
       'SAM 수는 지도 전체의 아군 외 검토 대상입니다. 목표 주변에 모두 있다는 뜻은 아닙니다.',
       `비행 중 ${r.existingFlights}발 관측. 다른 공격의 방어 소모·SAM 파괴 효과는 성공 근거에서 제외합니다.`);
+    const building=s.sams?.filter(u=>u.building)??[];
+    if(building.length)lines.push(`건설 중 SAM ${building.length}기: 착공 확인 시 완공·가동 시간 반영, 시점 불명은 즉시 가동으로 계산`);
+    lines.push('발사 중 수소 구출 실패 시: 원자 폭발 반경 안 SAM 제거가 검증될 때만 원자 집중으로 전환. 목표 SAM이 없으면 중단.');
     if(r.reason)lines.push('계산 결과: '+r.reason);
     if(r.diagnostics?.length)lines.push(...r.diagnostics);
     for(const [name,plan] of [['수소 + 원자',r.mixed],['원자만',r.atomic]])if(plan) {
@@ -57,7 +60,7 @@
     lines.push('','사일로 배치');
     for(const u of r.silos)lines.push(`(${u.x}, ${u.y}) Lv${u.level} · 재장전 완료 ${u.ready}발분${used.has(u.id)?' · 추천 계획에 사용':''}`);
     lines.push('','SAM 배치');
-    for(const u of r.sams)lines.push(`(${u.x}, ${u.y}) Lv${u.level} · 요격 준비 ${u.ready}발분${sams.has(u.id)?' · 추천 계획에서 요격':''}`);
+    for(const u of r.sams) {const live=s.sams?.find(v=>v.id===u.id);lines.push(`(${u.x}, ${u.y}) Lv${u.level} · 요격 준비 ${u.ready}발분${sams.has(u.id)?' · 추천 계획에서 요격':''}${live?.building?(live.readyTick===undefined?' · 건설 시점 불명: 즉시 가동 가정':` · 약 ${Math.max(0,(live.readyTick-s.tick)/10).toFixed(1)}초 후 가동 (최대 0.2초 조기 가동도 검증)`):''}`);}
     lines.push('','현재 상태의 예측입니다. 명중이나 최소 필요 레벨을 보장하지 않습니다.');
     return lines.join('\n');
   }
