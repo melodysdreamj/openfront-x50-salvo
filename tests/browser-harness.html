@@ -1,0 +1,37 @@
+<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>공격 계산기 로컬 검증</title>
+<style>body{margin:0;background:#1b2b35;color:#e6edf3;font:16px/1.5 system-ui}main{margin:28px;max-width:600px}h1{font-size:24px}p{color:#bdcbd5}#map{position:fixed;inset:160px 20px 20px;border:1px solid #52716c;background:#2c4e43}#map:after{content:"모의 지도 · 커서 목표";position:absolute;right:10%;top:30%;color:#f3d7a5}build-menu{display:none}</style>
+<main><h1>공격 계산기 검증 화면</h1><p>실제 게임이 아닌 브라우저 통합 테스트용 모의 상태입니다. I: 분석·발사 / Esc: 취소 / F8: 상세</p></main><div id="map"></div><build-menu></build-menu>
+<script>
+let tick=1000,nextId=50,gold=10000000000n;const motions=new Map();let updates=[];
+const me={smallID:()=>1,id:()=>"me",isPlayer:()=>true,isAlive:()=>true,isOnSameTeam:()=>false,gold:()=>gold};
+const enemy={smallID:()=>2,id:()=>"enemy",isPlayer:()=>true,isOnSameTeam:()=>false};
+function unit(id,type,x,y,lv,owner){let q=[];return {id:()=>id,type:()=>type,tile:()=>y*1000+x,owner:()=>owner,level:()=>lv,missileTimerQueue:()=>q,isActive:()=>true,isUnderConstruction:()=>false,state:{samUpgradeStartTick:null},targetTile:()=>null};}
+let units=[unit(1,'Missile Silo',100,500,50,me),unit(2,'SAM Launcher',695,500,1,enemy)];
+const cfg={msPerTick:()=>100,SAMCooldown:()=>90,SiloCooldown:()=>90,nukeSpeed:()=>10,defaultSamMissileSpeed:()=>12,defaultNukeTargetableRange:()=>150,maxSamRange:()=>150,samRange:l=>150-480/(l+5),samUpgradeDuration:()=>45,
+unitInfo:type=>({constructionDuration:type==='SAM Launcher'?300:100,cost:(g,p)=>{p.unitsOwned(type);return type==='Hydrogen Bomb'?5000000n:750000n;}}),isUnitDisabled:()=>false,nukeMagnitudes:type=>({outer:type==='Hydrogen Bomb'?100:30}),infiniteGold:()=>false};
+me.buildables=async(tile,types)=>types.map(type=>({type,cost:type==='Hydrogen Bomb'?5000000n:750000n,canBuild:false,canUpgrade:false}));
+class BuildUnitIntentEvent{constructor(unit,tile,rocketDirectionUp,amount){Object.assign(this,{unit,tile,rocketDirectionUp,amount});}}
+class SendUpgradeStructureIntentEvent{constructor(unitId,unitType,amount){Object.assign(this,{unitId,unitType,amount});}}
+const sent=[];const bus={listeners:new Map([[BuildUnitIntentEvent,[]],[SendUpgradeStructureIntentEvent,[]]]),emit(e){sent.push({tick,...e});
+if(e instanceof SendUpgradeStructureIntentEvent){setTimeout(()=>{const u=units.find(u=>u.id()===e.unitId);if(u){const lv=u.level()+e.amount;u.level=()=>lv;}},200);return;}
+setTimeout(()=>{
+  for(let i=0;i<(e.amount??1);i++){const silo=units.find(u=>u.type()==='Missile Silo'&&u.missileTimerQueue().length<u.level());if(!silo)break;silo.missileTimerQueue().push(tick);gold-=e.unit==='Hydrogen Bomb'?5000000n:750000n;
+    const u=unit(nextId++,e.unit,game.x(silo.tile()),game.y(silo.tile()),1,me);
+    const path=__x50.planner.trajectory({x:game.x(silo.tile()),y:game.y(silo.tile())},{x:game.x(e.tile),y:game.y(e.tile)},1000,e.rocketDirectionUp,10,150);
+    const wait=silo.missileTimerQueue().length-1;u.active=true;u.hit=false;u.index=0;u.targeted=false;
+    u.targetTile=()=>e.tile;u.isActive=()=>u.active;u.reachedTarget=()=>u.hit;
+    u.tile=()=>path[u.index].tile.y*1000+path[u.index].tile.x;
+    u.nukeState=()=>({trajectory:path.map(v=>({tile:v.tile.y*1000+v.tile.x,targetable:v.targetable})),targetedBySam:u.targeted,waitTicks:Math.max(0,tick+wait-tick),trajectoryIndex:0});
+    motions.set(u.id(),{startTick:tick+wait,ticksPerStep:1,path});units.push(u);}
+},200);}};
+const game={myPlayer:()=>me,config:()=>cfg,ticks:()=>tick,gameID:()=>"fixture-game",inSpawnPhase:()=>false,isSpawnImmunityActive:()=>false,isImpassable:()=>false,
+manhattanDist:(a,b)=>Math.abs(a%1000-b%1000)+Math.abs(Math.floor(a/1000)-Math.floor(b/1000)),
+x:t=>t%1000,y:t=>Math.floor(t/1000),ref:(x,y)=>y*1000+x,width:()=>1000,height:()=>1000,isValidCoord:(x,y)=>x>=0&&y>=0&&x<1000&&y<1000,isValidRef:t=>Number.isInteger(t)&&t>=0&&t<1000000,owner:()=>enemy,
+unit:id=>units.find(u=>u.id()===id),motionPlans:()=>motions,updatesSinceLastTick:()=>({1:updates}),
+units:(...types)=>units.filter(u=>u.isActive()&&(!types.length||types.includes(u.type())))};
+const bm=document.querySelector('build-menu');Object.assign(bm,{game,eventBus:bus,transformHandler:{screenToWorldCoordinates:()=>({x:700,y:500})},uiState:{rocketDirectionUp:true}});
+const ticking=setInterval(()=>{tick++;updates=[];for(const u of units){const q=u.missileTimerQueue();if(q[0]<=tick-90)q.shift();
+const m=motions.get(u.id());if(m&&u.active){u.index=Math.min(m.path.length-1,Math.max(0,tick-m.startTick));if(u.index===m.path.length-1){u.active=false;u.hit=!u.targeted;if(u.hit&&fixture.blast&&u.type()==='Atom Bomb')for(const sam of units.filter(v=>v.type()==='SAM Launcher'))if((game.x(sam.tile())-game.x(u.targetTile()))**2+(game.y(sam.tile())-game.y(u.targetTile()))**2<cfg.nukeMagnitudes('Atom Bomb').outer**2)sam.isActive=()=>false;updates.push({id:u.id(),unitType:u.type(),ownerID:1,isActive:false,reachedTarget:u.hit,targetTile:u.targetTile()});}}}},100);
+window.fixture={sent,game,me,enemy,unit,bm,units:()=>units,setUnits:a=>units=a,setGold:n=>gold=BigInt(n),stopTicks:()=>clearInterval(ticking)};
+</script><script src="/openfront-x50-salvo.user.js"></script></html>

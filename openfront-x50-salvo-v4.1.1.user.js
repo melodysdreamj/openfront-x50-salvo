@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      4.2.7
+// @version      4.1.1
 // @description  사설·연습 로비 — 커서 공격 예측 / I: 추천 계획 실행 / Esc: 중단
 // @author       local build
 // @match        https://openfront.io/*
@@ -403,63 +403,12 @@ function trajectory(from, to, height, up, speed, targetRange) {
     targetable:dist2(p,from)<targetRange**2 || dist2(p,to)<targetRange**2}));
 }
 
-// Geometry is independent of silo ID and weapon name; speed, map height and
-// targetability are part of the key. Reuse the exact same integer path in search.
-function cachedPath(cache,s,silo,up,speed) {
-  const key=[silo.x,silo.y,s.target.x,s.target.y,s.height,up,speed,s.rules.targetRange].join(':');
-  let path=cache.get(key);
-  if(!path) {path=trajectory(silo,s.target,s.height,up,speed,s.rules.targetRange);cache.set(key,path);}
-  return path;
-}
-
-// Exact broad phase. Rebuild once at the SAM phase, then reuse the sorted
-// neighbouring cells for SAMs in the same cell. Insertion order is significant
-// for score ties and the original selector's interception cache.
-function missileIndex(bombs,now,spawnFirst,cellSize) {
-  const cells=new Map(), neighbourhoods=new Map();
-  for(const b of bombs) {
-    if(b.done||b.targeted||!(b.spawn<now||spawnFirst))continue;
-    const tile=b.unit.tile(),x=Math.floor(tile.x/cellSize),y=Math.floor(tile.y/cellSize),key=x+':'+y;
-    let cell=cells.get(key);if(!cell)cells.set(key,cell=[]);
-    cell.push({b,tile});
-  }
-  return (tile,range,_types,predicate)=>{
-    const x=Math.floor(tile.x/cellSize),y=Math.floor(tile.y/cellSize),span=Math.ceil(range/cellSize),key=x+':'+y+':'+span;
-    let nearby=neighbourhoods.get(key);
-    if(!nearby) {
-      nearby=[];
-      for(let dx=-span;dx<=span;dx++)for(let dy=-span;dy<=span;dy++) {
-        const cell=cells.get((x+dx)+':'+(y+dy));if(cell)for(const item of cell)nearby.push(item);
-      }
-      nearby.sort((a,b)=>a.b.id-b.b.id);neighbourhoods.set(key,nearby);
-    }
-    const found=[],rangeSq=range*range;
-    for(const item of nearby) {
-      // Earlier SAMs in this very phase may already have assigned the missile.
-      if(item.b.targeted)continue;
-      const distance=dist2(item.tile,tile);
-      if(distance<=rangeSq) {
-        const candidate={unit:item.b.unit,distSquared:distance};
-        if(predicate(candidate))found.push(candidate);
-      }
-    }
-    return found;
-  };
-}
-
 function rangeAt(sam,tick,rules) {
   const range = level => rules.maxSamRange-480/(level+5);
   const u=sam.upgrade;
   if (!u) return range(sam.level);
   const elapsed=tick-u.startTick;
   return elapsed>=u.duration ? range(u.targetLevel) : u.startRange+(range(u.targetLevel)-u.startRange)*elapsed/u.duration;
-}
-
-// Structures strictly inside outer radius are deleted by NukeExecution,
-// independently of terrain's irregular blast edge and structure level.
-function atomicSAMTargets(s) {
-  const radius=s.rules.atomBlastRadius;
-  return Number.isFinite(radius)&&radius>0?s.sams.filter(u=>dist2(u,s.target)<radius**2).map(u=>u.id):[];
 }
 
 function validateSnapshot(s) {
@@ -470,7 +419,6 @@ function validateSnapshot(s) {
   for (const u of [...s.silos,...s.sams]) {
     if (!Number.isInteger(u.level)||u.level<1||!Number.isFinite(u.x)||!Number.isFinite(u.y)||!Array.isArray(u.queue)||u.queue.some(t=>!Number.isInteger(t)))
       throw Error('구조물 레벨 또는 재장전 정보를 읽을 수 없습니다');
-    if(u.readyTick!==undefined&&!Number.isInteger(u.readyTick))throw Error('SAM 완공 시점 정보가 불완전합니다');
     if(u.upgrade&&(!Number.isInteger(u.upgrade.startTick)||!Number.isFinite(u.upgrade.startRange)||
       !Number.isInteger(u.upgrade.targetLevel)||u.upgrade.targetLevel<1||!(u.upgrade.duration>0)))
       throw Error('SAM 업그레이드 진행 정보가 불완전합니다');
@@ -478,18 +426,18 @@ function validateSnapshot(s) {
   if (typeof s.gold!=='bigint'||typeof s.atomCost!=='bigint'||typeof s.hydroCost!=='bigint') throw Error('골드 또는 가격 정보를 읽을 수 없습니다');
 }
 
-// One intent per tick by default, <=50 atoms per intent. Sending more intents per
+// One intent every two ticks, <=50 atoms per intent. Sending more intents per
 // second does not remove the per-silo launch queue. Keep explicit timeline data.
-function makePlan(atoms, hydroAfter=null, gap=0, up=true, initial=3,intervalTicks=1) {
+function makePlan(atoms, hydroAfter=null, gap=0, up=true, initial=3) {
   const actions=[]; let left=atoms, sent=0, tick=initial, hydro=false;
   while (left>0 || (hydroAfter!==null&&!hydro)) {
     if (!hydro && hydroAfter!==null && sent>=hydroAfter) {
       tick+=gap;
-      actions.push({tick,type:HYDRO,amount:1}); hydro=true; tick+=intervalTicks;
+      actions.push({tick,type:HYDRO,amount:1}); hydro=true; tick+=2;
     } else {
       const count=Math.min(50,left,hydroAfter!==null&&!hydro?hydroAfter-sent:left);
       if (count<=0) break;
-      actions.push({tick,type:ATOM,amount:count}); sent+=count; left-=count; tick+=intervalTicks;
+      actions.push({tick,type:ATOM,amount:count}); sent+=count; left-=count; tick+=2;
     }
   }
   return {actions,atoms,hydros:hydroAfter===null?0:1,up,hydroAfter,gap};
@@ -504,8 +452,8 @@ function bombUnit(b) {
 }
 
 // An assigned interceptor counts as a kill immediately. We deliberately keep
-// defending SAMs alive after atom impacts when computing interception. Track
-// guaranteed structure kills separately; never rely on them to rescue a hydro.
+// defending SAMs alive after atom impacts: reported hits do not rely on blast
+// randomness, third-party damage, or favorable destruction of the launcher.
 function simulate(s,plan,opt={}) {
   validateSnapshot(s);
   const r=s.rules, start=s.tick, deadline=opt.deadline??Infinity;
@@ -514,16 +462,14 @@ function simulate(s,plan,opt={}) {
   const sams=s.sams.map(u=>({...u,queue:[...u.queue],interceptions:0}));
   if (opt.reverse) sams.reverse();
   const me=actor(s.me), defenders=actor(-1), bombs=[], cache=opt.pathCache??new Map();
-  const atomDestroyedSAMs=new Set(s.confirmedDestroyedSAMs??[]);
-  const blastTargets=new Set(atomicSAMTargets(s));
-  let atomicImpact=false;
   const traces=[], launches=[], used=new Set(), participating=new Set(), byUnit=new Map();
   let now=start, gold=s.gold, atomHits=s.confirmedAtomHits??0, hydroHits=s.confirmedHydroHits??0,
     committedHydroHits=0,dropped=0,tubeShortage=0,goldShortage=0,lastArrival=0,nextId=1;
   const config={defaultSamMissileSpeed:()=>r.samSpeed,maxSamRange:()=>r.maxSamRange,
     dynamicSamRange:(sam,t)=>rangeAt(sam.data,t,r),gameConfig:()=>({gameType:'Singleplayer'})};
   const game={config:()=>config,getWinner:()=>null,manhattanDist:manhattan,euclideanDistSquared:dist2,
-    nearbyUnits:null};
+    nearbyUnits:(tile,range,_types,predicate)=>bombs.filter(b=>!b.done&&(b.spawn<now||opt.spawnFirst)&&dist2(b.unit.tile(),tile)<=range**2)
+      .map(b=>({unit:b.unit,distSquared:dist2(b.unit.tile(),tile)})).filter(predicate)};
   for (const sam of sams) {
     sam.unit={data:sam,id:()=>sam.id,tile:()=>sam,level:()=>sam.level,owner:()=>defenders};
     sam.selector=new SAMTargetingSystem(game,sam.unit);
@@ -547,7 +493,7 @@ function simulate(s,plan,opt={}) {
   for (now=start;now<=end;now++) {
     if ((now-start)%8===0 && performance.now()>deadline) throw Error('SEARCH_TIMEOUT');
     // Silo reloads one slot per tick. SAM reloads every expired slot in a tick.
-    for (const silo of silos) if(silo.queue.length&&now-silo.queue[0]>=r.siloCooldown) {silo.queue.shift();silo.lastDep=undefined;}
+    for (const silo of silos) if(silo.queue.length&&now-silo.queue[0]>=r.siloCooldown) silo.queue.shift();
     while (ai<actions.length&&actions[ai].at<=now) {
       const a=actions[ai++];
       for(let n=0;n<a.amount;n++) {
@@ -555,14 +501,13 @@ function simulate(s,plan,opt={}) {
         const cost=a.type===HYDRO?s.hydroCost:s.atomCost;
         if (!silo||gold<cost) { dropped++;if(!silo)tubeShortage++;if(gold<cost)goldShortage++;continue; }
         gold-=cost; used.add(silo.id);
-        if(silo.lastDep===undefined) {
-          silo.lastDep=0;
-          for(const launchTick of silo.queue)silo.lastDep=Math.max(launchTick+1,silo.lastDep+1);
-        }
-        const lastDep=silo.lastDep;
+        let lastDep=0;
+        for(const launchTick of silo.queue) lastDep=Math.max(launchTick+1,lastDep+1);
         const moveAt=now+Math.max(0,lastDep-now)+1;
-        silo.queue.push(now);silo.lastDep=Math.max(now+1,lastDep+1);
-        const path=cachedPath(cache,s,silo,plan.up,a.type===HYDRO?r.hydroSpeed:r.atomSpeed);
+        silo.queue.push(now);
+        const key=[silo.id,silo.x,silo.y,s.target.x,s.target.y,plan.up,a.type].join(':');
+        let path=cache.get(key);
+        if(!path) { path=trajectory(silo,s.target,s.height,plan.up,a.type===HYDRO?r.hydroSpeed:r.atomSpeed,r.targetRange); cache.set(key,path); }
         const b={id:nextId++,type:a.type,owner:me,path,index:0,spawn:now,now,moveAt,target:s.target,targeted:false,done:false,ours:true,silo:silo.id};
         b.unit=bombUnit(b); bombs.push(b);byUnit.set(b.unit,b);
         launches.push({action:a.order,silo:silo.id,type:a.type,spawn:now-start,depart:moveAt-start});
@@ -575,11 +520,7 @@ function simulate(s,plan,opt={}) {
         if(b.index>=b.path.length-1) {
           b.index=b.path.length-1; b.done=true;
           if(b.ours&&!b.targeted) {
-            if(b.type===HYDRO) {hydroHits++;if(b.committed)committedHydroHits++;} else {
-              atomHits++;
-              if(!atomicImpact)for(const id of blastTargets)atomDestroyedSAMs.add(id);
-              atomicImpact=true;
-            }
+            if(b.type===HYDRO) {hydroHits++;if(b.committed)committedHydroHits++;} else atomHits++;
             lastArrival=now-start;
           }
         }
@@ -587,13 +528,10 @@ function simulate(s,plan,opt={}) {
       for(const b of bombs)b.afterMove=true;
     };
     if(opt.moveFirst) move();
-    game.nearbyUnits=missileIndex(bombs,now,opt.spawnFirst,r.maxSamRange*4);
     for(const sam of sams) {
-      // Unknown/rejoined construction dates remain immediately active. Known
-      // starts use native completion + execution activation; timing variants
-      // also test activation two ticks earlier.
-      if(sam.building&&sam.readyTick!==undefined&&now<sam.readyTick+(opt.constructionShift??0))continue;
       while(sam.queue.length&&now-sam.queue[0]>=r.samCooldown) sam.queue.shift();
+      // Treat construction as completed for conservative planning. This avoids
+      // promising a hit through a SAM that finishes during the flight.
       if(sam.queue.length>=sam.level) continue;
       for(const target of sam.selector.getValidTargets(now)) {
         if(sam.queue.length>=sam.level) break;
@@ -607,19 +545,19 @@ function simulate(s,plan,opt={}) {
     if(ai===actions.length&&bombs.every(b=>b.done||b.targeted)) break;
   }
   const unfinished=bombs.some(b=>b.ours&&!b.done&&!b.targeted);
-  return {...(s.rules.atomBlastRadius!==undefined?{atomDestroyedSAMs:[...atomDestroyedSAMs]}:{}),atomHits,hydroHits,committedHydroHits,dropped,tubeShortage,goldShortage,unfinished,cost:s.gold-gold,lastArrival,launches,traces,
+  return {atomHits,hydroHits,committedHydroHits,dropped,tubeShortage,goldShortage,unfinished,cost:s.gold-gold,lastArrival,launches,traces,
     usedSilos:[...used],participating:[...participating],
     interceptions:sams.map(u=>({id:u.id,count:u.interceptions})),ticks:now-start};
 }
 
 function affordable(s,plan) { return BigInt(plan.atoms)*s.atomCost+BigInt(plan.hydros)*s.hydroCost<=s.gold; }
 function succeeds(result,plan,minHits) { return !result.dropped&&!result.unfinished&&
-  ((plan.goal??(plan.hydros?'hydro':'atomic'))==='hydro'?result.hydroHits>=1:result.atomHits>=minHits&&(!plan.targetSAMIds||plan.targetSAMIds.length>0&&plan.targetSAMIds.every(id=>result.atomDestroyedSAMs?.includes(id)))); }
+  ((plan.goal??(plan.hydros?'hydro':'atomic'))==='hydro'?result.hydroHits>=1:result.atomHits>=minHits); }
 
 function assess(s,plan,options={}) {
   const cache=options.pathCache??new Map();
   const base={deadline:options.deadline,maxTicks:options.maxTicks,pathCache:cache,conservative:true};
-  const cases=[{}, {reverse:true,moveFirst:true,spawnFirst:true,flightShift:1,constructionShift:-2}, {hydroDelay:-2,delay:2,flightShift:-1}, {reverse:true,hydroDelay:2,delay:2}];
+  const cases=[{}, {reverse:true,moveFirst:true,spawnFirst:true,flightShift:1}, {hydroDelay:-2,delay:2,flightShift:-1}, {reverse:true,hydroDelay:2,delay:2}];
   let worst=null;
   for(const variant of cases) {
     const result=simulate(s,plan,{...base,...variant});
@@ -629,33 +567,24 @@ function assess(s,plan,options={}) {
   return {ok:true,result:worst};
 }
 
-// A resumable candidate traversal. The worker retains this generator and its
-// geometry cache between slices; the synchronous API keeps identical ordering.
 function search(s, options={}) {
-  const steps=searchSteps(s,options);
-  let step; do {step=steps.next();} while(!step.done);
-  return step.value;
-}
-
-function* searchSteps(s, options={}) {
   validateSnapshot(s);
   const began=performance.now(),deadline=began+(options.budgetMs??1800),pathCache=new Map();
   const minHits=Math.max(1,options.minAtomHits??1);
-  const targetSAMIds=options.requireSamDestruction?atomicSAMTargets(s):null;
   const cap=Math.min(5000,Math.max(0,options.maxAtoms??2000));
-  const initial=options.initialTicks??3,interval=options.intentIntervalTicks??1;
+  const initial=options.initialTicks??3;
   const committedHydro=s.includeCommitted&&(s.inflight??[]).some(b=>b.committed&&b.owner===s.me&&!b.targeted&&b.type===HYDRO);
   const ready=s.silos.reduce((n,u)=>n+(u.building?0:Math.max(0,u.level-u.queue.length)),0);
   // Estimate capacity only along possible trajectories. Keep all SAMs in the
   // actual simulation; this filter is solely a search-order optimization.
-  const paths=s.silos.filter(u=>!u.building).flatMap(u=>[true,false].map(up=>cachedPath(pathCache,s,u,up,s.rules.atomSpeed)));
+  const paths=s.silos.filter(u=>!u.building).flatMap(u=>[true,false].map(up=>trajectory(u,s.target,s.height,up,s.rules.atomSpeed,s.rules.targetRange)));
   const relevant=s.sams.filter(u=>paths.some(path=>path.some(p=>p.targetable&&dist2(p.tile,u)<=s.rules.maxSamRange**2)));
   const slots=relevant.reduce((n,u)=>n+u.level,0);
   const result={mixed:null,atomic:null,chosen:null,tested:0,limited:false,reason:'',
     snapshotTick:s.tick,minAtomHits:minHits,maxAtoms:cap,ready,slots,
     silos:s.silos.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),
     sams:s.sams.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),
-    existingFlights:s.observedFlights??(s.inflight??[]).length};
+    existingFlights:(s.inflight??[]).length};
   if(!s.includeCommitted&&!s.silos.some(u=>!u.building)) {result.reason='완성된 사일로가 없습니다'; return result;}
   if(!s.includeCommitted&&s.intentBudget===0) {result.reason='남은 명령 한도가 없습니다. 회복 후 다시 분석하세요';return result;}
   if(!s.includeCommitted&&s.gold<s.atomCost&&s.gold<s.hydroCost) {result.reason='원자·수소 1발을 구매할 골드가 부족합니다';return result;}
@@ -682,21 +611,18 @@ function* searchSteps(s, options={}) {
     outer: for(const [fraction,gap] of [[1,0],[.75,0],[.5,0],[1,8],[.75,8],[1,30],[1,60],[.5,30]]) {
      for(const atoms of counts) {
       for(const up of [s.preferredUp!==false,s.preferredUp===false]) {
-        if((!targetSAMIds||targetSAMIds.length>0)&&fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {
-          const p=run({...makePlan(atoms,null,0,up,initial,interval),goal:'atomic',...(targetSAMIds?{targetSAMIds}: {})}); if(p) result.atomic=p;
-          yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
+        if(fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {
+          const p=run({...makePlan(atoms,null,0,up,initial),goal:'atomic'}); if(p) result.atomic=p;
         }
         if(!result.mixed&&options.allowHydroGoal!==false&&(committedHydro||s.allowed?.mixed!==false)&&(atoms===0||s.allowed?.atomic!==false)) {
           if(atoms===0&&(fraction!==1||gap!==0))continue;
           if(committedHydro&&fraction===1&&gap===0) {
-            const rescue=run({...makePlan(atoms,null,0,up,initial,interval),goal:'hydro'});
+            const rescue=run({...makePlan(atoms,null,0,up,initial),goal:'hydro'});
             if(rescue)result.mixed=rescue;
-            yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
           }
           if(!result.mixed&&options.allowNewHydro!==false&&s.allowed?.mixed!==false) {
-            const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial,interval),goal:'hydro'});
+            const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial),goal:'hydro'});
             if(p) result.mixed=p;
-            yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};
           }
         }
         if(result.mixed&&result.atomic) break outer;
@@ -729,31 +655,11 @@ function* searchSteps(s, options={}) {
       result.reason=`시험한 수소 공격은 SAM (${sam.x}, ${sam.y}) Lv${sam.level}이 ${b.tick}틱에 요격 — 발사 배치·간격 개선 필요`;
     } else result.reason='탐색 범위에서 돌파 계획 없음 — 사일로 발사 간격·배치와 SAM 재장전이 병목일 수 있습니다';
   }
-  if(!result.chosen&&targetSAMIds?.length===0&&!result.limited)result.reason='수소 적중 계획을 찾지 못했고, 원자 폭발 반경 안에 목표 SAM이 없어 원자로 전환하지 않고 중단합니다';
   result.elapsedMs=Math.round(performance.now()-began);
   return result;
 }
 
-// Before any launch, the model is invariant under a common translation of time.
-// Compare relative timers, not wall-clock age. This is deliberately exact: a
-// shorter SAM cooldown or progressing range upgrade is NOT assumed harmless.
-// This key is only for prelaunch snapshots, never for committed flying missiles.
-function preflightKey(s) {
-  const unit=u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.queue.map(t=>t-s.tick),
-    u.upgrade?[u.upgrade.startRange,u.upgrade.targetLevel,u.upgrade.duration,
-      Math.min(u.upgrade.duration,s.tick-u.upgrade.startTick)]:null];
-  return JSON.stringify([s.game,s.me,s.tile,s.target,s.height,s.width,s.rules,s.allowed,
-    s.atomCost.toString(),s.hydroCost.toString(),s.silos.map(unit),s.sams.map(unit)]);
-}
 
-
-
-// The conservative planner never credits unrelated flights. Keep them in the
-// live observer, but do not repeatedly clone their full paths into each Worker.
-function workerSnapshot(s) {
-  return {...s,observedFlights:s.observedFlights??(s.inflight??[]).length,
-    inflight:(s.inflight??[]).filter(b=>s.includeCommitted&&b.committed&&b.owner===s.me&&!b.targeted)};
-}
 
 // Decode authoritative motion-plan time instead of the nukeState index, which
 // may be stale when the client derives motion without per-tick unit updates.
@@ -782,24 +688,6 @@ function remainingPlan(plan,index,baseTick,snapshotTick,leadTicks=6) {
     hydros:actions.filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)};
 }
 
-// Paths are immutable within a snapshot/observer. Retain only weak references;
-// one suffix table replaces path slicing and four scans on every game tick.
-const suffixBoundsCache=new WeakMap();
-function suffixBounds(path,index) {
-  let bounds=suffixBoundsCache.get(path);
-  if(!bounds) {
-    bounds=new Float64Array(path.length*4);
-    let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
-    for(let i=path.length-1;i>=0;i--) {
-      const p=path[i].tile;
-      minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);
-      bounds.set([minX,maxX,minY,maxY],i*4);
-    }
-    suffixBoundsCache.set(path,bounds);
-  }
-  return bounds.subarray(index*4,index*4+4);
-}
-
 // Cheap geometric broad phase for the observer. Every potentially relevant SAM
 // stays in the simulator. Changes well outside every possible path need not
 // interrupt a precisely timed volley.
@@ -811,15 +699,14 @@ function defenseSignature(s) {
       Math.min(silo.y,s.target.y)-h-r,Math.max(silo.y,s.target.y)+h+r]);
   }
   for(const b of s.inflight??[])if(b.committed&&b.path?.length) {
-    if(b.index<b.path.length) {
-      const [x0,x1,y0,y1]=suffixBounds(b.path,b.index);
-      boxes.push([x0-r,x1+r,y0-r,y1+r]);
-    }
+    const p=b.path.slice(b.index).map(v=>v.tile);
+    if(p.length)boxes.push([Math.min(...p.map(v=>v.x))-r,Math.max(...p.map(v=>v.x))+r,
+      Math.min(...p.map(v=>v.y))-r,Math.max(...p.map(v=>v.y))+r]);
   }
   return JSON.stringify([
     s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner]),s.allowed,
     s.sams.filter(u=>boxes.some(([x0,x1,y0,y1])=>u.x>=x0&&u.x<=x1&&u.y>=y0&&u.y<=y1))
-      .map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.upgrade,...(u.readyTick===undefined?[]:[u.readyTick])])]);
+      .map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.upgrade])]);
 }
 
 function adapt(s,request,options={}) {
@@ -828,9 +715,7 @@ function adapt(s,request,options={}) {
   const hydroLeft=Math.max(0,request.hydroLimit-request.sentHydros);
   const minHits=options.minAtomHits??1,lead=options.initialTicks??6;
   s={...s,includeCommitted:true};
-  const requireSamDestruction=request.goal==='hydro'||!!request.remaining?.targetSAMIds;
   const old=request.remaining?{...request.remaining,goal:request.goal}:null;
-  if(old?.targetSAMIds)old.targetSAMIds=[...new Set([...old.targetSAMIds,...atomicSAMTargets(s)])];
   const envelope=p=>p&&p.atoms<=cap&&p.hydros<=hydroLeft&&p.actions.length<=(s.intentBudget??140)&&
     p.actions.every(a=>a.type===HYDRO?s.allowed?.mixed!==false:s.allowed?.atomic!==false)&&
     BigInt(p.atoms)*s.atomCost+BigInt(p.hydros)*s.hydroCost<=s.gold;
@@ -844,14 +729,12 @@ function adapt(s,request,options={}) {
   const timeLeft=deadline-performance.now();
   if(timeLeft<=0)return {chosen:null,decision:'stop',limited:true,reason:'재계산 시간 내 유효한 계획을 확인하지 못했습니다',snapshotTick:s.tick};
   const result=search(s,{...options,budgetMs:timeLeft,maxAtoms:cap,initialTicks:lead,
-    requireSamDestruction,allowHydroGoal:request.goal!=='atomic',allowNewHydro:hydroLeft>0});
-  if(result.limited&&requireSamDestruction&&request.goal==='hydro'&&!result.mixed)
-    return {...result,chosen:null,decision:'stop',reason:'수소 구출 후보 계산을 계속합니다 — 원자 전환은 검토 완료 후 결정'};
+    allowHydroGoal:request.goal!=='atomic',allowNewHydro:hydroLeft>0});
   if(!result.chosen)return {...result,decision:'stop',reason:cap===0?'이번 공격의 누적 원자 발사 한도에 도달했습니다':result.reason};
   const goal=result.chosen.goal??(result.chosen.hydros?'hydro':'atomic');
   const decision=!result.chosen.actions.length?'observe':goal==='atomic'?'atomic':request.sentHydros>0?'rescue':'mixed';
   const reason={observe:'현재 관측 상태로 목표 달성 예상 — 추가 발사 보류',
-    atomic:request.goal==='atomic'?'변경된 방어에 맞춰 원자 집중 수량·일정 수정':`수소 구출 계획을 찾지 못해 목표 SAM ${result.chosen.targetSAMIds?.length??0}기 제거를 위한 원자 집중으로 전환`,rescue:`비행 중 수소 구출을 위해 원자 ${result.chosen.atoms}발 보강`,
+    atomic:request.goal==='atomic'?'변경된 방어에 맞춰 원자 집중 수량·일정 수정':'수소 구출 계획을 찾지 못해 원자 집중으로 전환',rescue:`비행 중 수소 구출을 위해 원자 ${result.chosen.atoms}발 보강`,
     mixed:`원자 ${result.chosen.atoms}발 + 수소 ${result.chosen.hydros}발로 남은 계획 수정`}[decision];
   return {...result,decision,reason};
 }
@@ -882,50 +765,7 @@ function upgradeAdvice(s,options={}) {
   return {text:'시험한 레벨업만으로는 돌파를 확인하지 못했습니다. 사일로 수·배치 또는 다음 공격의 발사 한도를 검토하세요',verified:false,attempts};
 }
 
-
-
-// Compare structures at the SAME absolute tick. An upgrade completing naturally
-// is predicted by the simulator, not a new upgrade. Flight positions and SAM
-// cooldown activity from other battles deliberately do not restart planning.
-function planningStructureKey(s,at=s.tick) {
-  const state={...s,inflight:[],sams:s.sams.map(u=>u.upgrade&&at>=u.upgrade.startTick+u.upgrade.duration?
-    {...u,level:u.upgrade.targetLevel,upgrade:null}:u)};
-  return JSON.stringify([s.game,s.me,s.tile,s.target,s.width,s.height,s.rules,
-    s.atomCost.toString(),s.hydroCost.toString(),defenseSignature(state)]);
-}
-
-// Exact idle expiry of our own launch queues (one slot per tick). A new shot
-// or any other queue mutation must still be validated; ordinary aging must not.
-function ownQueuesFollowClock(before,after) {
-  if(after.tick<before.tick)return false;
-  const units=new Map(after.silos.map(u=>[u.id,u]));
-  return before.silos.every(u=>{
-    const current=units.get(u.id);if(!current)return false;
-    let next=before.tick+1,index=0;
-    for(const t of u.queue) {
-      next=Math.max(next,t+before.rules.siloCooldown);
-      if(next>after.tick)break;
-      index++;next++;
-    }
-    return JSON.stringify(u.queue.slice(index))===JSON.stringify(current.queue);
-  });
-}
-
-// Preserve relative gaps and choose an absolute launch appointment in the
-// future. The caller uses the original snapshot tick as base, never completion.
-function scheduledCandidate(plan,lead) {
-  const shift=Math.max(0,lead-(plan.actions[0]?.tick??lead));
-  return {...plan,actions:plan.actions.map(a=>({...a,tick:a.tick+shift}))};
-}
-
-// Ordinary movement, successful arrivals and expected atom interceptions are
-// not reasons to throw out a computed candidate. A newly targeted hydrogen is.
-function newHydrogenThreat(before,after) {
-  const safe=new Set((before.inflight??[]).filter(b=>b.committed&&b.type==='Hydrogen Bomb'&&!b.targeted).map(b=>b.id));
-  return (after.inflight??[]).some(b=>b.committed&&b.type==='Hydrogen Bomb'&&b.targeted&&safe.has(b.id));
-}
-
-const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points along a cubic Bezier curve.\n */\nclass DistanceBasedBezierCurve {\n    p0;\n    p1;\n    p2;\n    p3;\n    static SUB_SCALE = 256;\n    cachedPoints = [];\n    currentIndex = 0;\n    pixelSpacingScaled = 1;\n    accumulatedDistanceScaled = 0;\n    constructor(p0, p1, p2, p3, distanceIncrement) {\n        this.p0 = p0;\n        this.p1 = p1;\n        this.p2 = p2;\n        this.p3 = p3;\n        this.computeAllPoints(distanceIncrement);\n    }\n    /**\n     * Statically compute the full length of a bezier curve without allocating any points.\n     */\n    static getLength(p0, p1, p2, p3) {\n        const scale = 256;\n        const p0x = Math.round(p0.x) * scale;\n        const p0y = Math.round(p0.y) * scale;\n        const p3x = Math.round(p3.x) * scale;\n        const p3y = Math.round(p3.y) * scale;\n        const st = { lastX: p0x, lastY: p0y, accumDist: 0 };\n        DistanceBasedBezierCurve.sharedSubdivide(p0x, p0y, Math.round(p1.x) * scale, Math.round(p1.y) * scale, Math.round(p2.x) * scale, Math.round(p2.y) * scale, p3x, p3y, 0, st);\n        const edx = p3x - st.lastX;\n        const edy = p3y - st.lastY;\n        st.accumDist += Math.floor(Math.sqrt(edx * edx + edy * edy));\n        return st.accumDist / scale;\n    }\n    getAllPoints() {\n        return this.cachedPoints;\n    }\n    /**\n     * Move forward along the curve by the given distance/speed step.\n     * Returns the next cached point, or null if at the end.\n     */\n    increment(distance = 1) {\n        this.accumulatedDistanceScaled += Math.max(1, Math.round(distance * DistanceBasedBezierCurve.SUB_SCALE));\n        while (this.currentIndex < this.cachedPoints.length - 1 &&\n            this.accumulatedDistanceScaled >= this.pixelSpacingScaled) {\n            this.currentIndex++;\n            this.accumulatedDistanceScaled -= this.pixelSpacingScaled;\n        }\n        if (this.currentIndex >= this.cachedPoints.length - 1) {\n            return null;\n        }\n        return this.cachedPoints[this.currentIndex];\n    }\n    getCurrentIndex() {\n        return this.currentIndex;\n    }\n    /** Control points and progress, for game snapshots. */\n    getState() {\n        return {\n            points: [{ ...this.p0 }, { ...this.p1 }, { ...this.p2 }, { ...this.p3 }],\n            currentIndex: this.currentIndex,\n            accumulatedDistanceScaled: this.accumulatedDistanceScaled,\n        };\n    }\n    /** Restores progress onto a curve rebuilt from the same control points. */\n    setProgress(currentIndex, accumulatedDistanceScaled) {\n        this.currentIndex = currentIndex;\n        this.accumulatedDistanceScaled = accumulatedDistanceScaled;\n    }\n    /**\n     * Precompute curve points using Single-Pass In-Order Recursive De Casteljau Subdivision.\n     * Uses IEEE 754 exact-rounded Math.floor(Math.sqrt(...)) for deterministic integer distance accumulation.\n     */\n    computeAllPoints(pixelSpacing) {\n        this.cachedPoints = [];\n        this.currentIndex = 0;\n        this.accumulatedDistanceScaled = 0;\n        this.pixelSpacingScaled = Math.max(DistanceBasedBezierCurve.SUB_SCALE, Math.round(pixelSpacing * DistanceBasedBezierCurve.SUB_SCALE));\n        const scale = DistanceBasedBezierCurve.SUB_SCALE; // 8-bit fixed-point precision\n        const stepThreshold = this.pixelSpacingScaled;\n        const p0x = Math.round(this.p0.x) * scale;\n        const p0y = Math.round(this.p0.y) * scale;\n        const p3x = Math.round(this.p3.x) * scale;\n        const p3y = Math.round(this.p3.y) * scale;\n        const st = {\n            lastX: p0x,\n            lastY: p0y,\n            accumDist: 0,\n            stepThreshold,\n            cachedPoints: this.cachedPoints,\n        };\n        this.cachedPoints.push({\n            x: (p0x + 128) >> 8,\n            y: (p0y + 128) >> 8,\n        });\n        // Single-pass recursive midpoint subdivision and inline spatial filtering\n        DistanceBasedBezierCurve.sharedSubdivide(p0x, p0y, Math.round(this.p1.x) * scale, Math.round(this.p1.y) * scale, Math.round(this.p2.x) * scale, Math.round(this.p2.y) * scale, p3x, p3y, 0, st);\n        // Ensure endpoint is included if not already P3\n        const lastPt = {\n            x: (p3x + 128) >> 8,\n            y: (p3y + 128) >> 8,\n        };\n        const lastIndex = this.cachedPoints.length - 1;\n        if (lastIndex >= 0) {\n            const endCached = this.cachedPoints[lastIndex];\n            if (endCached.x !== lastPt.x || endCached.y !== lastPt.y) {\n                this.cachedPoints.push(lastPt);\n            }\n        }\n        else {\n            this.cachedPoints.push(lastPt);\n        }\n    }\n    static sharedSubdivide(ax, ay, bx, by, cx, cy, dx, dy, depth, st) {\n        const dist = Math.abs(bx - ax) +\n            Math.abs(by - ay) +\n            Math.abs(cx - bx) +\n            Math.abs(cy - by) +\n            Math.abs(dx - cx) +\n            Math.abs(dy - cy);\n        if (dist <= 256 || depth >= 10) {\n            const edx = ax - st.lastX;\n            const edy = ay - st.lastY;\n            st.accumDist += Math.floor(Math.sqrt(edx * edx + edy * edy));\n            st.lastX = ax;\n            st.lastY = ay;\n            if (st.stepThreshold !== undefined && st.cachedPoints !== undefined) {\n                while (st.accumDist >= st.stepThreshold) {\n                    st.cachedPoints.push({\n                        x: (ax + 128) >> 8,\n                        y: (ay + 128) >> 8,\n                    });\n                    st.accumDist -= st.stepThreshold;\n                }\n            }\n            return;\n        }\n        // De Casteljau midpoints via bitwise right-shift >> 1\n        const m01_x = (ax + bx) >> 1;\n        const m01_y = (ay + by) >> 1;\n        const m12_x = (bx + cx) >> 1;\n        const m12_y = (by + cy) >> 1;\n        const m23_x = (cx + dx) >> 1;\n        const m23_y = (cy + dy) >> 1;\n        const m012_x = (m01_x + m12_x) >> 1;\n        const m012_y = (m01_y + m12_y) >> 1;\n        const m123_x = (m12_x + m23_x) >> 1;\n        const m123_y = (m12_y + m23_y) >> 1;\n        const mx = (m012_x + m123_x) >> 1;\n        const my = (m012_y + m123_y) >> 1;\n        // IN-ORDER RECURSION: Left segment first, then Right segment\n        DistanceBasedBezierCurve.sharedSubdivide(ax, ay, m01_x, m01_y, m012_x, m012_y, mx, my, depth + 1, st);\n        DistanceBasedBezierCurve.sharedSubdivide(mx, my, m123_x, m123_y, m23_x, m23_y, dx, dy, depth + 1, st);\n    }\n}\n\n// Extracted from OpenFrontIO 5dc09dbd2dde5105d8b403d7b5ddf8d503e04ec2.\n// Copyright OpenFront and Contributors. AGPL-3.0-only. See THIRD_PARTY.md.\n// Only imports were replaced with the simulation adapter below; targeting is unchanged.\nconst UnitType = { AtomBomb: \"Atom Bomb\", HydrogenBomb: \"Hydrogen Bomb\", MIRVWarhead: \"MIRV Warhead\" };\nconst GameType = { Singleplayer: \"Singleplayer\" };\nconst isUnit = (u) => !!u && typeof u.targetedBySAM === \"function\";\n/**\n * Smart SAM targeting system preshoting nukes so its range is strictly enforced\n */\nclass SAMTargetingSystem {\n    mg;\n    sam;\n    // Cached interception states indexed by nuke ID to avoid per-tick recomputation.\n    precomputedNukes = new Map();\n    missileSpeed;\n    constructor(mg, sam) {\n        this.mg = mg;\n        this.sam = sam;\n        this.missileSpeed = this.mg.config().defaultSamMissileSpeed();\n        this.isTargetableNearbyUnit = this.isTargetableNearbyUnit.bind(this);\n    }\n    /** Cached interceptions in insertion order, for game snapshots. */\n    getState() {\n        return [...this.precomputedNukes].map(([id, c]) => ({\n            id,\n            tick: c.tick,\n            tile: c.tile,\n            minDistSq: c.minDistSq,\n            lastSeenTick: c.lastSeenTick,\n        }));\n    }\n    setState(s) {\n        for (const { id, tick, tile, minDistSq, lastSeenTick } of s) {\n            this.precomputedNukes.set(id, { tick, tile, minDistSq, lastSeenTick });\n        }\n    }\n    onLevelUp() {\n        for (const [id, cached] of this.precomputedNukes) {\n            if (cached.tick === -1) {\n                this.precomputedNukes.delete(id);\n            }\n        }\n    }\n    updateUnreachableNukes(currentTick) {\n        for (const [id, cached] of this.precomputedNukes) {\n            if (cached.lastSeenTick !== currentTick) {\n                this.precomputedNukes.delete(id);\n            }\n        }\n    }\n    tickToReach(currentTile, tile) {\n        return Math.ceil(this.mg.manhattanDist(currentTile, tile) / this.missileSpeed);\n    }\n    checkDetonationInterception(unit, samTile, ticks) {\n        const trajectory = unit.trajectory();\n        const maxIdx = trajectory.length - 2;\n        const finalTile = trajectory[trajectory.length - 1];\n        if (!finalTile?.targetable)\n            return undefined;\n        const curIdx = unit.trajectoryIndex();\n        const waitTicks = unit.nukeState().waitTicks ?? 0;\n        const expTicks = trajectory.length - 1 - curIdx + waitTicks;\n        const range = this.mg.config().dynamicSamRange(this.sam, ticks + expTicks);\n        if (this.mg.euclideanDistSquared(samTile, finalTile.tile) > range * range) {\n            return undefined;\n        }\n        const flightTile = trajectory[maxIdx];\n        if (!flightTile?.targetable)\n            return undefined;\n        const nukeTicks = maxIdx - curIdx + waitTicks;\n        const samTicks = this.tickToReach(samTile, flightTile.tile);\n        const tickBeforeShooting = nukeTicks - samTicks;\n        return tickBeforeShooting >= 0\n            ? { tick: tickBeforeShooting, tile: flightTile.tile }\n            : undefined;\n    }\n    computeInterceptionTile(unit, samTile, ticks) {\n        const trajectory = unit.trajectory();\n        const curIdx = unit.trajectoryIndex();\n        const waitTicks = unit.nukeState().waitTicks ?? 0;\n        const maxIdx = trajectory.length - 2;\n        const maxSamRangeSq = this.mg.config().maxSamRange() ** 2;\n        let minDistSq = Infinity;\n        let closestTile = samTile;\n        let incSteps = 0;\n        let lastDistSq = -1;\n        for (let i = curIdx; i <= maxIdx; i++) {\n            const tile = trajectory[i];\n            const distSq = this.mg.euclideanDistSquared(samTile, tile.tile);\n            if (distSq < minDistSq) {\n                minDistSq = distSq;\n                closestTile = tile.tile;\n            }\n            incSteps = lastDistSq !== -1 && distSq > lastDistSq ? incSteps + 1 : 0;\n            lastDistSq = distSq;\n            const nukeTicks = i - curIdx + waitTicks;\n            const samTicks = this.tickToReach(samTile, tile.tile);\n            const allowed = this.mg\n                .config()\n                .dynamicSamRange(this.sam, ticks + nukeTicks);\n            if (tile.targetable &&\n                distSq <= allowed * allowed &&\n                nukeTicks >= samTicks) {\n                return {\n                    tick: nukeTicks - samTicks,\n                    tile: tile.tile,\n                    minDistSq,\n                    lastSeenTick: ticks,\n                };\n            }\n            if (incSteps > 3 && distSq > maxSamRangeSq)\n                break;\n        }\n        const det = this.checkDetonationInterception(unit, samTile, ticks);\n        if (det) {\n            return { tick: det.tick, tile: det.tile, minDistSq, lastSeenTick: ticks };\n        }\n        return {\n            tick: minDistSq > maxSamRangeSq ? -2 : -1,\n            tile: closestTile,\n            minDistSq,\n            lastSeenTick: ticks,\n        };\n    }\n    isTargetableNearbyUnit = ({ unit, }) => {\n        return this.isValidNukeTarget(unit);\n    };\n    isValidNukeTarget(unit) {\n        if (!isUnit(unit) ||\n            unit.targetedBySAM() ||\n            unit.owner() === this.sam.owner()) {\n            return false;\n        }\n        const samOwner = this.sam.owner();\n        const nukeOwner = unit.owner();\n        if (samOwner.isFriendly(nukeOwner)) {\n            // Aftergame fun (nuking teammates once the game is over) is disabled in singleplayer.\n            const gameOver = this.mg.getWinner() !== null &&\n                this.mg.config().gameConfig().gameType !== GameType.Singleplayer;\n            return gameOver && samOwner.isOnSameTeam(nukeOwner);\n        }\n        return true;\n    }\n    computeTargetScore(target) {\n        const samTile = this.sam.tile();\n        const unit = target.unit;\n        const trajectory = unit.trajectory();\n        const currentIndex = unit.trajectoryIndex();\n        const timeToExplode = Math.max(1, trajectory.length - currentIndex);\n        const targetTile = unit.targetTile() ??\n            (trajectory.length > 0\n                ? trajectory[trajectory.length - 1].tile\n                : samTile);\n        const distToSilo = this.mg.manhattanDist(samTile, targetTile);\n        // Hydro unit type bonus\n        // 70,000 offset balances the distance bonus between Hydro at 100 and Atom at 30\n        const typeBonus = unit.type() === UnitType.HydrogenBomb ? 70_001 : 0;\n        // Distance bonus: Closer to silo higher score (-1,000 pts per unit distance)\n        // due to manhattanDist, distToSilo can exceed 150 diagonally, 200000 starting point.\n        const distanceBonus = Math.max(0, 200_000 - distToSilo * 1000);\n        // Time based score: +100 pts per tick earlier\n        // Since all nukes are already guaranteed to need a SAM response at this tick,\n        // this is only a very minor tiebreaker.\n        const urgencyBonus = Math.max(0, 10_000 - timeToExplode * 100);\n        return typeBonus + distanceBonus + urgencyBonus;\n    }\n    sortTargets(targets) {\n        if (targets.length <= 1)\n            return targets;\n        for (const target of targets) {\n            target.score = this.computeTargetScore(target);\n        }\n        // Sort by score, js' Timsort guarantees O(n log n)\n        return targets.sort((a, b) => b.score - a.score);\n    }\n    getValidTargets(ticks) {\n        const samTile = this.sam.tile();\n        const detectionRange = this.mg.config().maxSamRange() * 4;\n        const nukes = this.mg.nearbyUnits(samTile, detectionRange, [UnitType.AtomBomb, UnitType.HydrogenBomb, UnitType.MIRVWarhead], this.isTargetableNearbyUnit);\n        const targets = [];\n        for (const nuke of nukes) {\n            const id = nuke.unit.id();\n            const cached = this.precomputedNukes.get(id);\n            if (cached !== undefined) {\n                cached.lastSeenTick = ticks;\n                if (cached.tick === -2 || cached.tick === -1)\n                    continue;\n                if (cached.tick === ticks || cached.tick === ticks + 1) {\n                    targets.push({ tile: cached.tile, unit: nuke.unit });\n                    this.precomputedNukes.delete(id);\n                    continue;\n                }\n                if (cached.tick > ticks)\n                    continue;\n                this.precomputedNukes.delete(id);\n            }\n            const res = this.computeInterceptionTile(nuke.unit, samTile, ticks);\n            if (res.tick >= 0 && res.tick <= 1) {\n                targets.push({ unit: nuke.unit, tile: res.tile });\n            }\n            else {\n                this.precomputedNukes.set(id, {\n                    tick: res.tick >= 0 ? res.tick + ticks : res.tick,\n                    tile: res.tile,\n                    minDistSq: res.minDistSq,\n                    lastSeenTick: ticks,\n                });\n            }\n        }\n        this.updateUnreachableNukes(ticks);\n        return this.sortTargets(targets);\n    }\n}\n\n// The physics and target selector are pinned in src/vendor. No browser objects here.\n\n\nconst ATOM = 'Atom Bomb', HYDRO = 'Hydrogen Bomb';\nconst manhattan = (a,b) => Math.abs(a.x-b.x)+Math.abs(a.y-b.y);\nconst dist2 = (a,b) => (a.x-b.x)**2+(a.y-b.y)**2;\nconst clamp = (n,a,b) => Math.max(a,Math.min(b,n));\n\nfunction trajectory(from, to, height, up, speed, targetRange) {\n  const dx=to.x-from.x, dy=to.y-from.y;\n  const h=Math.max(Math.hypot(dx,dy)/3,50)*(up?-1:1);\n  const curve=new DistanceBasedBezierCurve(from,\n    {x:from.x+dx/4,y:clamp(from.y+dy/4+h,0,height-1)},\n    {x:from.x+dx*3/4,y:clamp(from.y+dy*3/4+h,0,height-1)},to,speed);\n  return curve.getAllPoints().map(p => ({tile:p,\n    targetable:dist2(p,from)<targetRange**2 || dist2(p,to)<targetRange**2}));\n}\n\n// Geometry is independent of silo ID and weapon name; speed, map height and\n// targetability are part of the key. Reuse the exact same integer path in search.\nfunction cachedPath(cache,s,silo,up,speed) {\n  const key=[silo.x,silo.y,s.target.x,s.target.y,s.height,up,speed,s.rules.targetRange].join(':');\n  let path=cache.get(key);\n  if(!path) {path=trajectory(silo,s.target,s.height,up,speed,s.rules.targetRange);cache.set(key,path);}\n  return path;\n}\n\n// Exact broad phase. Rebuild once at the SAM phase, then reuse the sorted\n// neighbouring cells for SAMs in the same cell. Insertion order is significant\n// for score ties and the original selector's interception cache.\nfunction missileIndex(bombs,now,spawnFirst,cellSize) {\n  const cells=new Map(), neighbourhoods=new Map();\n  for(const b of bombs) {\n    if(b.done||b.targeted||!(b.spawn<now||spawnFirst))continue;\n    const tile=b.unit.tile(),x=Math.floor(tile.x/cellSize),y=Math.floor(tile.y/cellSize),key=x+':'+y;\n    let cell=cells.get(key);if(!cell)cells.set(key,cell=[]);\n    cell.push({b,tile});\n  }\n  return (tile,range,_types,predicate)=>{\n    const x=Math.floor(tile.x/cellSize),y=Math.floor(tile.y/cellSize),span=Math.ceil(range/cellSize),key=x+':'+y+':'+span;\n    let nearby=neighbourhoods.get(key);\n    if(!nearby) {\n      nearby=[];\n      for(let dx=-span;dx<=span;dx++)for(let dy=-span;dy<=span;dy++) {\n        const cell=cells.get((x+dx)+':'+(y+dy));if(cell)for(const item of cell)nearby.push(item);\n      }\n      nearby.sort((a,b)=>a.b.id-b.b.id);neighbourhoods.set(key,nearby);\n    }\n    const found=[],rangeSq=range*range;\n    for(const item of nearby) {\n      // Earlier SAMs in this very phase may already have assigned the missile.\n      if(item.b.targeted)continue;\n      const distance=dist2(item.tile,tile);\n      if(distance<=rangeSq) {\n        const candidate={unit:item.b.unit,distSquared:distance};\n        if(predicate(candidate))found.push(candidate);\n      }\n    }\n    return found;\n  };\n}\n\nfunction rangeAt(sam,tick,rules) {\n  const range = level => rules.maxSamRange-480/(level+5);\n  const u=sam.upgrade;\n  if (!u) return range(sam.level);\n  const elapsed=tick-u.startTick;\n  return elapsed>=u.duration ? range(u.targetLevel) : u.startRange+(range(u.targetLevel)-u.startRange)*elapsed/u.duration;\n}\n\n// Structures strictly inside outer radius are deleted by NukeExecution,\n// independently of terrain's irregular blast edge and structure level.\nfunction atomicSAMTargets(s) {\n  const radius=s.rules.atomBlastRadius;\n  return Number.isFinite(radius)&&radius>0?s.sams.filter(u=>dist2(u,s.target)<radius**2).map(u=>u.id):[];\n}\n\nfunction validateSnapshot(s) {\n  if (!s || !Number.isInteger(s.tick) || !s.target || !s.rules) throw Error('게임 상태가 불완전합니다');\n  for (const k of ['tickMs','samCooldown','siloCooldown','atomSpeed','hydroSpeed','samSpeed','targetRange','maxSamRange'])\n    if (!(s.rules[k]>0 && Number.isFinite(s.rules[k]))) throw Error('게임 규칙을 읽을 수 없습니다: '+k);\n  if (!Array.isArray(s.silos)||!Array.isArray(s.sams)) throw Error('구조물 목록을 읽을 수 없습니다');\n  for (const u of [...s.silos,...s.sams]) {\n    if (!Number.isInteger(u.level)||u.level<1||!Number.isFinite(u.x)||!Number.isFinite(u.y)||!Array.isArray(u.queue)||u.queue.some(t=>!Number.isInteger(t)))\n      throw Error('구조물 레벨 또는 재장전 정보를 읽을 수 없습니다');\n    if(u.readyTick!==undefined&&!Number.isInteger(u.readyTick))throw Error('SAM 완공 시점 정보가 불완전합니다');\n    if(u.upgrade&&(!Number.isInteger(u.upgrade.startTick)||!Number.isFinite(u.upgrade.startRange)||\n      !Number.isInteger(u.upgrade.targetLevel)||u.upgrade.targetLevel<1||!(u.upgrade.duration>0)))\n      throw Error('SAM 업그레이드 진행 정보가 불완전합니다');\n  }\n  if (typeof s.gold!=='bigint'||typeof s.atomCost!=='bigint'||typeof s.hydroCost!=='bigint') throw Error('골드 또는 가격 정보를 읽을 수 없습니다');\n}\n\n// One intent per tick by default, <=50 atoms per intent. Sending more intents per\n// second does not remove the per-silo launch queue. Keep explicit timeline data.\nfunction makePlan(atoms, hydroAfter=null, gap=0, up=true, initial=3,intervalTicks=1) {\n  const actions=[]; let left=atoms, sent=0, tick=initial, hydro=false;\n  while (left>0 || (hydroAfter!==null&&!hydro)) {\n    if (!hydro && hydroAfter!==null && sent>=hydroAfter) {\n      tick+=gap;\n      actions.push({tick,type:HYDRO,amount:1}); hydro=true; tick+=intervalTicks;\n    } else {\n      const count=Math.min(50,left,hydroAfter!==null&&!hydro?hydroAfter-sent:left);\n      if (count<=0) break;\n      actions.push({tick,type:ATOM,amount:count}); sent+=count; left-=count; tick+=intervalTicks;\n    }\n  }\n  return {actions,atoms,hydros:hydroAfter===null?0:1,up,hydroAfter,gap};\n}\n\nfunction actor(id) { return {smallID:()=>id,isFriendly:()=>false,isOnSameTeam:()=>false}; }\nfunction bombUnit(b) {\n  return {id:()=>b.id,tile:()=>b.path[Math.min(b.index,b.path.length-1)].tile,\n    type:()=>b.type,owner:()=>b.owner,targetedBySAM:()=>b.targeted,\n    targetTile:()=>b.target,trajectory:()=>b.path,trajectoryIndex:()=>b.index,\n    nukeState:()=>({waitTicks:Math.max(0,b.moveAt-b.now-(b.afterMove?1:0))})};\n}\n\n// An assigned interceptor counts as a kill immediately. We deliberately keep\n// defending SAMs alive after atom impacts when computing interception. Track\n// guaranteed structure kills separately; never rely on them to rescue a hydro.\nfunction simulate(s,plan,opt={}) {\n  validateSnapshot(s);\n  const r=s.rules, start=s.tick, deadline=opt.deadline??Infinity;\n  const silos=s.silos.filter(u=>!u.building).map(u=>({...u,queue:[...u.queue]}));\n  silos.sort((a,b)=>manhattan(a,s.target)-manhattan(b,s.target)); // stable game order\n  const sams=s.sams.map(u=>({...u,queue:[...u.queue],interceptions:0}));\n  if (opt.reverse) sams.reverse();\n  const me=actor(s.me), defenders=actor(-1), bombs=[], cache=opt.pathCache??new Map();\n  const atomDestroyedSAMs=new Set(s.confirmedDestroyedSAMs??[]);\n  const blastTargets=new Set(atomicSAMTargets(s));\n  let atomicImpact=false;\n  const traces=[], launches=[], used=new Set(), participating=new Set(), byUnit=new Map();\n  let now=start, gold=s.gold, atomHits=s.confirmedAtomHits??0, hydroHits=s.confirmedHydroHits??0,\n    committedHydroHits=0,dropped=0,tubeShortage=0,goldShortage=0,lastArrival=0,nextId=1;\n  const config={defaultSamMissileSpeed:()=>r.samSpeed,maxSamRange:()=>r.maxSamRange,\n    dynamicSamRange:(sam,t)=>rangeAt(sam.data,t,r),gameConfig:()=>({gameType:'Singleplayer'})};\n  const game={config:()=>config,getWinner:()=>null,manhattanDist:manhattan,euclideanDistSquared:dist2,\n    nearbyUnits:null};\n  for (const sam of sams) {\n    sam.unit={data:sam,id:()=>sam.id,tile:()=>sam,level:()=>sam.level,owner:()=>defenders};\n    sam.selector=new SAMTargetingSystem(game,sam.unit);\n  }\n  // Only confirmed missiles belonging to this operation may be credited in\n  // adaptive mode. They are already paid for and must NOT consume a silo again.\n  for (const b of s.inflight??[]) {\n    if(opt.conservative&&!(s.includeCommitted&&b.committed&&b.owner===s.me))continue;\n    if (b.targeted || !b.path?.length) continue;\n    const shift=opt.flightShift??0;\n    const waiting=Math.max(0,(b.waitTicks||0)-shift);\n    const index=clamp(b.index+Math.max(0,shift-(b.waitTicks||0)),0,b.path.length-1);\n    const item={...b,id:nextId++,owner:me,index,ours:!!b.committed,committed:!!b.committed,\n      spawn:start-1,now:start,moveAt:start+waiting,done:false};\n    item.unit=bombUnit(item); bombs.push(item);byUnit.set(item.unit,item);\n  }\n  const phase=opt.delay??0;\n  const actions=plan.actions.map((a,i)=>({...a,at:start+a.tick+2+phase+(a.type===HYDRO?(opt.hydroDelay??0):0),order:i})).sort((a,b)=>a.at-b.at||a.order-b.order);\n  let ai=0;\n  const end=start+(opt.maxTicks??1200);\n  for (now=start;now<=end;now++) {\n    if ((now-start)%8===0 && performance.now()>deadline) throw Error('SEARCH_TIMEOUT');\n    // Silo reloads one slot per tick. SAM reloads every expired slot in a tick.\n    for (const silo of silos) if(silo.queue.length&&now-silo.queue[0]>=r.siloCooldown) {silo.queue.shift();silo.lastDep=undefined;}\n    while (ai<actions.length&&actions[ai].at<=now) {\n      const a=actions[ai++];\n      for(let n=0;n<a.amount;n++) {\n        const silo=silos.find(u=>u.queue.length<u.level);\n        const cost=a.type===HYDRO?s.hydroCost:s.atomCost;\n        if (!silo||gold<cost) { dropped++;if(!silo)tubeShortage++;if(gold<cost)goldShortage++;continue; }\n        gold-=cost; used.add(silo.id);\n        if(silo.lastDep===undefined) {\n          silo.lastDep=0;\n          for(const launchTick of silo.queue)silo.lastDep=Math.max(launchTick+1,silo.lastDep+1);\n        }\n        const lastDep=silo.lastDep;\n        const moveAt=now+Math.max(0,lastDep-now)+1;\n        silo.queue.push(now);silo.lastDep=Math.max(now+1,lastDep+1);\n        const path=cachedPath(cache,s,silo,plan.up,a.type===HYDRO?r.hydroSpeed:r.atomSpeed);\n        const b={id:nextId++,type:a.type,owner:me,path,index:0,spawn:now,now,moveAt,target:s.target,targeted:false,done:false,ours:true,silo:silo.id};\n        b.unit=bombUnit(b); bombs.push(b);byUnit.set(b.unit,b);\n        launches.push({action:a.order,silo:silo.id,type:a.type,spawn:now-start,depart:moveAt-start});\n      }\n    }\n    for(const b of bombs) {b.now=now;b.afterMove=false;}\n    const move=()=>{\n      for(const b of bombs) if(!b.done&&now>=b.moveAt) {\n        b.index++;\n        if(b.index>=b.path.length-1) {\n          b.index=b.path.length-1; b.done=true;\n          if(b.ours&&!b.targeted) {\n            if(b.type===HYDRO) {hydroHits++;if(b.committed)committedHydroHits++;} else {\n              atomHits++;\n              if(!atomicImpact)for(const id of blastTargets)atomDestroyedSAMs.add(id);\n              atomicImpact=true;\n            }\n            lastArrival=now-start;\n          }\n        }\n      }\n      for(const b of bombs)b.afterMove=true;\n    };\n    if(opt.moveFirst) move();\n    game.nearbyUnits=missileIndex(bombs,now,opt.spawnFirst,r.maxSamRange*4);\n    for(const sam of sams) {\n      // Unknown/rejoined construction dates remain immediately active. Known\n      // starts use native completion + execution activation; timing variants\n      // also test activation two ticks earlier.\n      if(sam.building&&sam.readyTick!==undefined&&now<sam.readyTick+(opt.constructionShift??0))continue;\n      while(sam.queue.length&&now-sam.queue[0]>=r.samCooldown) sam.queue.shift();\n      if(sam.queue.length>=sam.level) continue;\n      for(const target of sam.selector.getValidTargets(now)) {\n        if(sam.queue.length>=sam.level) break;\n        const b=byUnit.get(target.unit);\n        if(!b||b.done||b.targeted) continue;\n        b.targeted=true; sam.queue.push(now); sam.interceptions++; participating.add(sam.id);\n        if(b.ours&&traces.length<100) traces.push({sam:sam.id,type:b.type,tick:now-start,silo:b.silo});\n      }\n    }\n    if(!opt.moveFirst) move();\n    if(ai===actions.length&&bombs.every(b=>b.done||b.targeted)) break;\n  }\n  const unfinished=bombs.some(b=>b.ours&&!b.done&&!b.targeted);\n  return {...(s.rules.atomBlastRadius!==undefined?{atomDestroyedSAMs:[...atomDestroyedSAMs]}:{}),atomHits,hydroHits,committedHydroHits,dropped,tubeShortage,goldShortage,unfinished,cost:s.gold-gold,lastArrival,launches,traces,\n    usedSilos:[...used],participating:[...participating],\n    interceptions:sams.map(u=>({id:u.id,count:u.interceptions})),ticks:now-start};\n}\n\nfunction affordable(s,plan) { return BigInt(plan.atoms)*s.atomCost+BigInt(plan.hydros)*s.hydroCost<=s.gold; }\nfunction succeeds(result,plan,minHits) { return !result.dropped&&!result.unfinished&&\n  ((plan.goal??(plan.hydros?'hydro':'atomic'))==='hydro'?result.hydroHits>=1:result.atomHits>=minHits&&(!plan.targetSAMIds||plan.targetSAMIds.length>0&&plan.targetSAMIds.every(id=>result.atomDestroyedSAMs?.includes(id)))); }\n\nfunction assess(s,plan,options={}) {\n  const cache=options.pathCache??new Map();\n  const base={deadline:options.deadline,maxTicks:options.maxTicks,pathCache:cache,conservative:true};\n  const cases=[{}, {reverse:true,moveFirst:true,spawnFirst:true,flightShift:1,constructionShift:-2}, {hydroDelay:-2,delay:2,flightShift:-1}, {reverse:true,hydroDelay:2,delay:2}];\n  let worst=null;\n  for(const variant of cases) {\n    const result=simulate(s,plan,{...base,...variant});\n    if(!worst||result.hydroHits<worst.hydroHits||result.atomHits<worst.atomHits) worst=result;\n    if(!succeeds(result,plan,options.minAtomHits??1)) return {ok:false,result};\n  }\n  return {ok:true,result:worst};\n}\n\n// A resumable candidate traversal. The worker retains this generator and its\n// geometry cache between slices; the synchronous API keeps identical ordering.\nfunction search(s, options={}) {\n  const steps=searchSteps(s,options);\n  let step; do {step=steps.next();} while(!step.done);\n  return step.value;\n}\n\nfunction* searchSteps(s, options={}) {\n  validateSnapshot(s);\n  const began=performance.now(),deadline=began+(options.budgetMs??1800),pathCache=new Map();\n  const minHits=Math.max(1,options.minAtomHits??1);\n  const targetSAMIds=options.requireSamDestruction?atomicSAMTargets(s):null;\n  const cap=Math.min(5000,Math.max(0,options.maxAtoms??2000));\n  const initial=options.initialTicks??3,interval=options.intentIntervalTicks??1;\n  const committedHydro=s.includeCommitted&&(s.inflight??[]).some(b=>b.committed&&b.owner===s.me&&!b.targeted&&b.type===HYDRO);\n  const ready=s.silos.reduce((n,u)=>n+(u.building?0:Math.max(0,u.level-u.queue.length)),0);\n  // Estimate capacity only along possible trajectories. Keep all SAMs in the\n  // actual simulation; this filter is solely a search-order optimization.\n  const paths=s.silos.filter(u=>!u.building).flatMap(u=>[true,false].map(up=>cachedPath(pathCache,s,u,up,s.rules.atomSpeed)));\n  const relevant=s.sams.filter(u=>paths.some(path=>path.some(p=>p.targetable&&dist2(p.tile,u)<=s.rules.maxSamRange**2)));\n  const slots=relevant.reduce((n,u)=>n+u.level,0);\n  const result={mixed:null,atomic:null,chosen:null,tested:0,limited:false,reason:'',\n    snapshotTick:s.tick,minAtomHits:minHits,maxAtoms:cap,ready,slots,\n    silos:s.silos.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),\n    sams:s.sams.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),\n    existingFlights:s.observedFlights??(s.inflight??[]).length};\n  if(!s.includeCommitted&&!s.silos.some(u=>!u.building)) {result.reason='완성된 사일로가 없습니다'; return result;}\n  if(!s.includeCommitted&&s.intentBudget===0) {result.reason='남은 명령 한도가 없습니다. 회복 후 다시 분석하세요';return result;}\n  if(!s.includeCommitted&&s.gold<s.atomCost&&s.gold<s.hydroCost) {result.reason='원자·수소 1발을 구매할 골드가 부족합니다';return result;}\n  const counts=[0,minHits,...[1,1.25,1.5,2,.8,.5,3].map(x=>Math.ceil(slots*x)+minHits),\n    ready-1,ready,4,8,16,32,50,100,200,400,800,cap]\n    .filter(n=>Number.isInteger(n)&&n>=0&&n<=cap).filter((n,i,a)=>a.indexOf(n)===i);\n  const run=plan=>{\n    if(!affordable(s,plan)||plan.actions.length>(s.intentBudget??140)) return null;\n    result.tested++;\n    const a=assess(s,plan,{deadline,pathCache,minAtomHits:minHits,maxTicks:options.maxTicks??1200});\n    if(!a.ok) {\n      const failure={atoms:plan.atoms,hydros:plan.hydros,up:plan.up,dropped:a.result.dropped,\n        tubeShortage:a.result.tubeShortage,goldShortage:a.result.goldShortage,\n        blockedBy:a.result.traces.filter(t=>t.type===HYDRO),usedSilos:a.result.usedSilos,\n        launchSpan:a.result.launches.length?Math.max(...a.result.launches.map(l=>l.depart))-Math.min(...a.result.launches.map(l=>l.depart)):0,\n        interceptions:a.result.interceptions};\n      if(!result.failure||failure.dropped<result.failure.dropped||\n        (failure.dropped===result.failure.dropped&&failure.atoms>result.failure.atoms)) result.failure=failure;\n    }\n    return a.ok?{...plan,...a.result}:null;\n  };\n  try {\n    // Interleave modes so an expensive mixed search cannot starve atomic analysis.\n    outer: for(const [fraction,gap] of [[1,0],[.75,0],[.5,0],[1,8],[.75,8],[1,30],[1,60],[.5,30]]) {\n     for(const atoms of counts) {\n      for(const up of [s.preferredUp!==false,s.preferredUp===false]) {\n        if((!targetSAMIds||targetSAMIds.length>0)&&fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {\n          const p=run({...makePlan(atoms,null,0,up,initial,interval),goal:'atomic',...(targetSAMIds?{targetSAMIds}: {})}); if(p) result.atomic=p;\n          yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};\n        }\n        if(!result.mixed&&options.allowHydroGoal!==false&&(committedHydro||s.allowed?.mixed!==false)&&(atoms===0||s.allowed?.atomic!==false)) {\n          if(atoms===0&&(fraction!==1||gap!==0))continue;\n          if(committedHydro&&fraction===1&&gap===0) {\n            const rescue=run({...makePlan(atoms,null,0,up,initial,interval),goal:'hydro'});\n            if(rescue)result.mixed=rescue;\n            yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};\n          }\n          if(!result.mixed&&options.allowNewHydro!==false&&s.allowed?.mixed!==false) {\n            const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial,interval),goal:'hydro'});\n            if(p) result.mixed=p;\n            yield {tested:result.tested,mixed:!!result.mixed,atomic:!!result.atomic};\n          }\n        }\n        if(result.mixed&&result.atomic) break outer;\n      }\n      if(performance.now()>deadline) throw Error('SEARCH_TIMEOUT');\n     }\n    }\n  } catch(e) { if(e.message==='SEARCH_TIMEOUT') result.limited=true; else throw e; }\n  result.chosen=result.mixed??result.atomic;\n  result.mode=result.mixed?'mixed':result.atomic?'atomic':result.limited?'unknown':'blocked';\n  result.diagnostics=[];\n  if(!result.chosen&&result.failure) {\n    const f=result.failure;\n    if(f.tubeShortage)result.diagnostics.push(`시험 공격 ${f.atoms+f.hydros}발 중 ${f.tubeShortage}발이 발사관 부족으로 발사되지 못함`);\n    const reloaded=f.interceptions.filter(v=>v.count>(s.sams.find(u=>u.id===v.id)?.level??Infinity));\n    if(reloaded.length)result.diagnostics.push(`SAM ${reloaded.length}기가 재장전 후 반복 요격 · 발사 분산 ${(f.launchSpan*s.rules.tickMs/1000).toFixed(1)}초, 사일로 수·배치 검토`);\n    for(const b of f.blockedBy.slice(0,1)) {\n      const sam=s.sams.find(u=>u.id===b.sam),silo=s.silos.find(u=>u.id===b.silo);\n      if(sam&&silo&&dist2(sam,s.target)>s.rules.maxSamRange**2)\n        result.diagnostics.push(`목표 주변 밖 SAM (${sam.x}, ${sam.y}) Lv${sam.level}이 사일로 (${silo.x}, ${silo.y})의 수소를 경로에서 요격`);\n    }\n  }\n  if(!result.chosen) {\n    if(result.limited) result.reason='계산 시간 내 검증된 계획을 찾지 못했습니다. I로 더 길게 재분석합니다';\n    else if(!ready) result.reason='현재 발사관이 재장전 중입니다. 준비 후 다시 분석합니다';\n    else if(s.allowed?.mixed===false&&s.allowed?.atomic===false) result.reason='게임 규칙상 이 위치에는 발사할 수 없습니다';\n    else if(result.failure?.tubeShortage) result.reason=`시험한 공격에서 발사관 ${result.failure.tubeShortage}발분 부족 — 사일로 레벨·재장전 확인`;\n    else if(result.failure?.blockedBy?.length) {\n      const b=result.failure.blockedBy[0],sam=s.sams.find(u=>u.id===b.sam);\n      result.reason=`시험한 수소 공격은 SAM (${sam.x}, ${sam.y}) Lv${sam.level}이 ${b.tick}틱에 요격 — 발사 배치·간격 개선 필요`;\n    } else result.reason='탐색 범위에서 돌파 계획 없음 — 사일로 발사 간격·배치와 SAM 재장전이 병목일 수 있습니다';\n  }\n  if(!result.chosen&&targetSAMIds?.length===0&&!result.limited)result.reason='수소 적중 계획을 찾지 못했고, 원자 폭발 반경 안에 목표 SAM이 없어 원자로 전환하지 않고 중단합니다';\n  result.elapsedMs=Math.round(performance.now()-began);\n  return result;\n}\n\n// Before any launch, the model is invariant under a common translation of time.\n// Compare relative timers, not wall-clock age. This is deliberately exact: a\n// shorter SAM cooldown or progressing range upgrade is NOT assumed harmless.\n// This key is only for prelaunch snapshots, never for committed flying missiles.\nfunction preflightKey(s) {\n  const unit=u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.queue.map(t=>t-s.tick),\n    u.upgrade?[u.upgrade.startRange,u.upgrade.targetLevel,u.upgrade.duration,\n      Math.min(u.upgrade.duration,s.tick-u.upgrade.startTick)]:null];\n  return JSON.stringify([s.game,s.me,s.tile,s.target,s.height,s.width,s.rules,s.allowed,\n    s.atomCost.toString(),s.hydroCost.toString(),s.silos.map(unit),s.sams.map(unit)]);\n}\n\n\n\n// The conservative planner never credits unrelated flights. Keep them in the\n// live observer, but do not repeatedly clone their full paths into each Worker.\nfunction workerSnapshot(s) {\n  return {...s,observedFlights:s.observedFlights??(s.inflight??[]).length,\n    inflight:(s.inflight??[]).filter(b=>s.includeCommitted&&b.committed&&b.owner===s.me&&!b.targeted)};\n}\n\n// Decode authoritative motion-plan time instead of the nukeState index, which\n// may be stale when the client derives motion without per-tick unit updates.\nfunction flightProgress(path,position,nukeState,motion,tick) {\n  if(!path?.length)throw Error('비행 궤적이 없어 재계산할 수 없습니다');\n  const matches=i=>path[i]?.tile.x===position.x&&path[i]?.tile.y===position.y;\n  if(motion) {\n    if(motion.ticksPerStep!==1||!Number.isInteger(motion.startTick))throw Error('지원하지 않는 비행 시간 정보');\n    const index=Math.max(0,Math.min(path.length-1,tick-motion.startTick));\n    if(!matches(index))throw Error('비행 위치와 시간 정보가 일치하지 않습니다');\n    return {index,waitTicks:Math.max(0,motion.startTick-tick)};\n  }\n  // Older clients are usable only when the observed tile unambiguously resolves\n  // the path index; never substitute the stale server index or silently guess.\n  const matchesAt=[];path.forEach((_,i)=>{if(matches(i))matchesAt.push(i);});\n  if(matchesAt.length!==1||!Number.isInteger(nukeState.waitTicks)||nukeState.waitTicks<0)\n    throw Error('미사일의 현재 비행 시점을 확인할 수 없습니다');\n  return {index:matchesAt[0],waitTicks:matchesAt[0]===0?nukeState.waitTicks:0};\n}\n\nfunction remainingPlan(plan,index,baseTick,snapshotTick,leadTicks=6) {\n  const actions=plan.actions.slice(index).map(a=>({...a,tick:baseTick+a.tick-snapshotTick}));\n  const shift=actions.length?Math.max(0,leadTicks-actions[0].tick):0;\n  for(const a of actions)a.tick+=shift;\n  return {...plan,actions,atoms:actions.filter(a=>a.type===ATOM).reduce((n,a)=>n+a.amount,0),\n    hydros:actions.filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)};\n}\n\n// Paths are immutable within a snapshot/observer. Retain only weak references;\n// one suffix table replaces path slicing and four scans on every game tick.\nconst suffixBoundsCache=new WeakMap();\nfunction suffixBounds(path,index) {\n  let bounds=suffixBoundsCache.get(path);\n  if(!bounds) {\n    bounds=new Float64Array(path.length*4);\n    let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;\n    for(let i=path.length-1;i>=0;i--) {\n      const p=path[i].tile;\n      minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);\n      bounds.set([minX,maxX,minY,maxY],i*4);\n    }\n    suffixBoundsCache.set(path,bounds);\n  }\n  return bounds.subarray(index*4,index*4+4);\n}\n\n// Cheap geometric broad phase for the observer. Every potentially relevant SAM\n// stays in the simulator. Changes well outside every possible path need not\n// interrupt a precisely timed volley.\nfunction defenseSignature(s) {\n  const r=s.rules.maxSamRange, boxes=[];\n  for(const silo of s.silos) {\n    const h=Math.max(Math.hypot(s.target.x-silo.x,s.target.y-silo.y)/3,50);\n    boxes.push([Math.min(silo.x,s.target.x)-r,Math.max(silo.x,s.target.x)+r,\n      Math.min(silo.y,s.target.y)-h-r,Math.max(silo.y,s.target.y)+h+r]);\n  }\n  for(const b of s.inflight??[])if(b.committed&&b.path?.length) {\n    if(b.index<b.path.length) {\n      const [x0,x1,y0,y1]=suffixBounds(b.path,b.index);\n      boxes.push([x0-r,x1+r,y0-r,y1+r]);\n    }\n  }\n  return JSON.stringify([\n    s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner]),s.allowed,\n    s.sams.filter(u=>boxes.some(([x0,x1,y0,y1])=>u.x>=x0&&u.x<=x1&&u.y>=y0&&u.y<=y1))\n      .map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.upgrade,...(u.readyTick===undefined?[]:[u.readyTick])])]);\n}\n\nfunction adapt(s,request,options={}) {\n  const began=performance.now(),budget=options.budgetMs??350,deadline=began+budget;\n  const cap=Math.max(0,request.atomLimit-request.sentAtoms);\n  const hydroLeft=Math.max(0,request.hydroLimit-request.sentHydros);\n  const minHits=options.minAtomHits??1,lead=options.initialTicks??6;\n  s={...s,includeCommitted:true};\n  const requireSamDestruction=request.goal==='hydro'||!!request.remaining?.targetSAMIds;\n  const old=request.remaining?{...request.remaining,goal:request.goal}:null;\n  if(old?.targetSAMIds)old.targetSAMIds=[...new Set([...old.targetSAMIds,...atomicSAMTargets(s)])];\n  const envelope=p=>p&&p.atoms<=cap&&p.hydros<=hydroLeft&&p.actions.length<=(s.intentBudget??140)&&\n    p.actions.every(a=>a.type===HYDRO?s.allowed?.mixed!==false:s.allowed?.atomic!==false)&&\n    BigInt(p.atoms)*s.atomCost+BigInt(p.hydros)*s.hydroCost<=s.gold;\n  // Test the committed goal first. No repeated hydro launch when its per-run\n  // allowance has already been spent; a flying hydro can only receive atom help.\n  if(envelope(old))try{\n    const check=assess(s,old,{deadline,minAtomHits:minHits,maxTicks:options.maxTicks});\n    if(check.ok)return {chosen:{...old,...check.result},decision:old.actions.length?'keep':'observe',\n      reason:old.actions.length?'변경된 SAM에서도 남은 계획 유효':'추가 발사 없이 현재 비행으로 목표 달성 예상',snapshotTick:s.tick};\n  }catch(e){if(e.message!=='SEARCH_TIMEOUT')throw e;}\n  const timeLeft=deadline-performance.now();\n  if(timeLeft<=0)return {chosen:null,decision:'stop',limited:true,reason:'재계산 시간 내 유효한 계획을 확인하지 못했습니다',snapshotTick:s.tick};\n  const result=search(s,{...options,budgetMs:timeLeft,maxAtoms:cap,initialTicks:lead,\n    requireSamDestruction,allowHydroGoal:request.goal!=='atomic',allowNewHydro:hydroLeft>0});\n  if(result.limited&&requireSamDestruction&&request.goal==='hydro'&&!result.mixed)\n    return {...result,chosen:null,decision:'stop',reason:'수소 구출 후보 계산을 계속합니다 — 원자 전환은 검토 완료 후 결정'};\n  if(!result.chosen)return {...result,decision:'stop',reason:cap===0?'이번 공격의 누적 원자 발사 한도에 도달했습니다':result.reason};\n  const goal=result.chosen.goal??(result.chosen.hydros?'hydro':'atomic');\n  const decision=!result.chosen.actions.length?'observe':goal==='atomic'?'atomic':request.sentHydros>0?'rescue':'mixed';\n  const reason={observe:'현재 관측 상태로 목표 달성 예상 — 추가 발사 보류',\n    atomic:request.goal==='atomic'?'변경된 방어에 맞춰 원자 집중 수량·일정 수정':`수소 구출 계획을 찾지 못해 목표 SAM ${result.chosen.targetSAMIds?.length??0}기 제거를 위한 원자 집중으로 전환`,rescue:`비행 중 수소 구출을 위해 원자 ${result.chosen.atoms}발 보강`,\n    mixed:`원자 ${result.chosen.atoms}발 + 수소 ${result.chosen.hydros}발로 남은 계획 수정`}[decision];\n  return {...result,decision,reason};\n}\n\n// Advice is a separate, non-executing next-attack experiment. It never mutates\n// the live game or pretends an upgrade can finish before a flying hydro arrives.\nfunction upgradeAdvice(s,options={}) {\n  const deadline=performance.now()+(options.budgetMs??800),attempts=[];\n  const ready={...s,includeCommitted:false,inflight:[],confirmedAtomHits:0,confirmedHydroHits:0,\n    tick:s.tick+s.rules.samCooldown+90,\n    silos:s.silos.filter(u=>!u.building).map(u=>({...u,queue:[]})),\n    sams:s.sams.map(u=>({...u,queue:[],level:Math.max(u.level,u.upgrade?.targetLevel??u.level),upgrade:null}))};\n  if(!ready.silos.length)return {text:'먼저 사일로를 건설하고 완공 후 다시 분석하세요',verified:false};\n  const check=state=>search(state,{...options,budgetMs:Math.max(1,Math.min(120,deadline-performance.now())),initialTicks:3});\n  if(performance.now()<deadline) {\n    const base=check(ready);\n    if(base.chosen)return {text:'현재 배치도 재장전 완료 후 다음 공격에서 돌파 계획이 있습니다. 발사관을 충전한 뒤 다시 분석하세요',verified:true,kind:'reload'};\n  }\n  for(const silo of ready.silos.slice().sort((a,b)=>Math.abs(a.x-s.target.x)+Math.abs(a.y-s.target.y)-Math.abs(b.x-s.target.x)-Math.abs(b.y-s.target.y)).slice(0,3)) {\n    for(const add of [10,25,50,100]) {\n      if(performance.now()>=deadline)return {text:'현재 탐색 시간 안에 레벨업만으로 해결되는 조건을 확인하지 못했습니다. 사일로 추가·배치 변경도 검토하세요',verified:false,attempts};\n      const next={...ready,silos:ready.silos.map(u=>u.id===silo.id?{...u,level:u.level+add}:u)};\n      const r=check(next);attempts.push({id:silo.id,add,success:!!r.chosen});\n      if(r.chosen)return {text:`다음 공격 후보: 사일로 (${silo.x}, ${silo.y}) Lv${silo.level} → Lv${silo.level+add}. 업그레이드·재장전 완료를 가정하면 돌파 예상 (최소 레벨·업그레이드 비용 검증 아님)`,\n        verified:true,kind:'upgrade',silo:silo.id,from:silo.level,to:silo.level+add,plan:r.chosen,attempts};\n    }\n  }\n  return {text:'시험한 레벨업만으로는 돌파를 확인하지 못했습니다. 사일로 수·배치 또는 다음 공격의 발사 한도를 검토하세요',verified:false,attempts};\n}\n\n\n\n// Compare structures at the SAME absolute tick. An upgrade completing naturally\n// is predicted by the simulator, not a new upgrade. Flight positions and SAM\n// cooldown activity from other battles deliberately do not restart planning.\nfunction planningStructureKey(s,at=s.tick) {\n  const state={...s,inflight:[],sams:s.sams.map(u=>u.upgrade&&at>=u.upgrade.startTick+u.upgrade.duration?\n    {...u,level:u.upgrade.targetLevel,upgrade:null}:u)};\n  return JSON.stringify([s.game,s.me,s.tile,s.target,s.width,s.height,s.rules,\n    s.atomCost.toString(),s.hydroCost.toString(),defenseSignature(state)]);\n}\n\n// Exact idle expiry of our own launch queues (one slot per tick). A new shot\n// or any other queue mutation must still be validated; ordinary aging must not.\nfunction ownQueuesFollowClock(before,after) {\n  if(after.tick<before.tick)return false;\n  const units=new Map(after.silos.map(u=>[u.id,u]));\n  return before.silos.every(u=>{\n    const current=units.get(u.id);if(!current)return false;\n    let next=before.tick+1,index=0;\n    for(const t of u.queue) {\n      next=Math.max(next,t+before.rules.siloCooldown);\n      if(next>after.tick)break;\n      index++;next++;\n    }\n    return JSON.stringify(u.queue.slice(index))===JSON.stringify(current.queue);\n  });\n}\n\n// Preserve relative gaps and choose an absolute launch appointment in the\n// future. The caller uses the original snapshot tick as base, never completion.\nfunction scheduledCandidate(plan,lead) {\n  const shift=Math.max(0,lead-(plan.actions[0]?.tick??lead));\n  return {...plan,actions:plan.actions.map(a=>({...a,tick:a.tick+shift}))};\n}\n\n// Ordinary movement, successful arrivals and expected atom interceptions are\n// not reasons to throw out a computed candidate. A newly targeted hydrogen is.\nfunction newHydrogenThreat(before,after) {\n  const safe=new Set((before.inflight??[]).filter(b=>b.committed&&b.type==='Hydrogen Bomb'&&!b.targeted).map(b=>b.id));\n  return (after.inflight??[]).some(b=>b.committed&&b.type==='Hydrogen Bomb'&&b.targeted&&safe.has(b.id));\n}\n\nself.onmessage = e => {\n  const d=e.data;\n  const failed=error=>self.postMessage({id:d.id,error:error.message});\n  try {\n    if(d.options?.continuous) {\n      const steps=searchSteps(d.snapshot,{...d.options,budgetMs:Infinity});\n      const advance=()=>{\n        try {\n          const until=performance.now()+50;let step;\n          do {step=steps.next();if(step.done){self.postMessage({id:d.id,result:step.value});return;}}\n          while(performance.now()<until);\n          self.postMessage({id:d.id,progress:step.value});\n          setTimeout(advance,0);\n        }catch(error){failed(error);}\n      };\n      self.postMessage({id:d.id,progress:{tested:0}});advance();return;\n    }\n    const result=d.kind===\"adapt\"?adapt(d.snapshot,d.request,d.options):d.kind===\"advice\"?upgradeAdvice(d.snapshot,d.options):d.kind===\"assess\"?assess(d.snapshot,d.plan,{...d.options,deadline:performance.now()+(d.options.budgetMs??2500)}):search(d.snapshot,d.options);\n    self.postMessage({id:d.id,result});\n  }catch(error){failed(error);}\n};";
+const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points along a cubic Bezier curve.\n */\nclass DistanceBasedBezierCurve {\n    p0;\n    p1;\n    p2;\n    p3;\n    static SUB_SCALE = 256;\n    cachedPoints = [];\n    currentIndex = 0;\n    pixelSpacingScaled = 1;\n    accumulatedDistanceScaled = 0;\n    constructor(p0, p1, p2, p3, distanceIncrement) {\n        this.p0 = p0;\n        this.p1 = p1;\n        this.p2 = p2;\n        this.p3 = p3;\n        this.computeAllPoints(distanceIncrement);\n    }\n    /**\n     * Statically compute the full length of a bezier curve without allocating any points.\n     */\n    static getLength(p0, p1, p2, p3) {\n        const scale = 256;\n        const p0x = Math.round(p0.x) * scale;\n        const p0y = Math.round(p0.y) * scale;\n        const p3x = Math.round(p3.x) * scale;\n        const p3y = Math.round(p3.y) * scale;\n        const st = { lastX: p0x, lastY: p0y, accumDist: 0 };\n        DistanceBasedBezierCurve.sharedSubdivide(p0x, p0y, Math.round(p1.x) * scale, Math.round(p1.y) * scale, Math.round(p2.x) * scale, Math.round(p2.y) * scale, p3x, p3y, 0, st);\n        const edx = p3x - st.lastX;\n        const edy = p3y - st.lastY;\n        st.accumDist += Math.floor(Math.sqrt(edx * edx + edy * edy));\n        return st.accumDist / scale;\n    }\n    getAllPoints() {\n        return this.cachedPoints;\n    }\n    /**\n     * Move forward along the curve by the given distance/speed step.\n     * Returns the next cached point, or null if at the end.\n     */\n    increment(distance = 1) {\n        this.accumulatedDistanceScaled += Math.max(1, Math.round(distance * DistanceBasedBezierCurve.SUB_SCALE));\n        while (this.currentIndex < this.cachedPoints.length - 1 &&\n            this.accumulatedDistanceScaled >= this.pixelSpacingScaled) {\n            this.currentIndex++;\n            this.accumulatedDistanceScaled -= this.pixelSpacingScaled;\n        }\n        if (this.currentIndex >= this.cachedPoints.length - 1) {\n            return null;\n        }\n        return this.cachedPoints[this.currentIndex];\n    }\n    getCurrentIndex() {\n        return this.currentIndex;\n    }\n    /** Control points and progress, for game snapshots. */\n    getState() {\n        return {\n            points: [{ ...this.p0 }, { ...this.p1 }, { ...this.p2 }, { ...this.p3 }],\n            currentIndex: this.currentIndex,\n            accumulatedDistanceScaled: this.accumulatedDistanceScaled,\n        };\n    }\n    /** Restores progress onto a curve rebuilt from the same control points. */\n    setProgress(currentIndex, accumulatedDistanceScaled) {\n        this.currentIndex = currentIndex;\n        this.accumulatedDistanceScaled = accumulatedDistanceScaled;\n    }\n    /**\n     * Precompute curve points using Single-Pass In-Order Recursive De Casteljau Subdivision.\n     * Uses IEEE 754 exact-rounded Math.floor(Math.sqrt(...)) for deterministic integer distance accumulation.\n     */\n    computeAllPoints(pixelSpacing) {\n        this.cachedPoints = [];\n        this.currentIndex = 0;\n        this.accumulatedDistanceScaled = 0;\n        this.pixelSpacingScaled = Math.max(DistanceBasedBezierCurve.SUB_SCALE, Math.round(pixelSpacing * DistanceBasedBezierCurve.SUB_SCALE));\n        const scale = DistanceBasedBezierCurve.SUB_SCALE; // 8-bit fixed-point precision\n        const stepThreshold = this.pixelSpacingScaled;\n        const p0x = Math.round(this.p0.x) * scale;\n        const p0y = Math.round(this.p0.y) * scale;\n        const p3x = Math.round(this.p3.x) * scale;\n        const p3y = Math.round(this.p3.y) * scale;\n        const st = {\n            lastX: p0x,\n            lastY: p0y,\n            accumDist: 0,\n            stepThreshold,\n            cachedPoints: this.cachedPoints,\n        };\n        this.cachedPoints.push({\n            x: (p0x + 128) >> 8,\n            y: (p0y + 128) >> 8,\n        });\n        // Single-pass recursive midpoint subdivision and inline spatial filtering\n        DistanceBasedBezierCurve.sharedSubdivide(p0x, p0y, Math.round(this.p1.x) * scale, Math.round(this.p1.y) * scale, Math.round(this.p2.x) * scale, Math.round(this.p2.y) * scale, p3x, p3y, 0, st);\n        // Ensure endpoint is included if not already P3\n        const lastPt = {\n            x: (p3x + 128) >> 8,\n            y: (p3y + 128) >> 8,\n        };\n        const lastIndex = this.cachedPoints.length - 1;\n        if (lastIndex >= 0) {\n            const endCached = this.cachedPoints[lastIndex];\n            if (endCached.x !== lastPt.x || endCached.y !== lastPt.y) {\n                this.cachedPoints.push(lastPt);\n            }\n        }\n        else {\n            this.cachedPoints.push(lastPt);\n        }\n    }\n    static sharedSubdivide(ax, ay, bx, by, cx, cy, dx, dy, depth, st) {\n        const dist = Math.abs(bx - ax) +\n            Math.abs(by - ay) +\n            Math.abs(cx - bx) +\n            Math.abs(cy - by) +\n            Math.abs(dx - cx) +\n            Math.abs(dy - cy);\n        if (dist <= 256 || depth >= 10) {\n            const edx = ax - st.lastX;\n            const edy = ay - st.lastY;\n            st.accumDist += Math.floor(Math.sqrt(edx * edx + edy * edy));\n            st.lastX = ax;\n            st.lastY = ay;\n            if (st.stepThreshold !== undefined && st.cachedPoints !== undefined) {\n                while (st.accumDist >= st.stepThreshold) {\n                    st.cachedPoints.push({\n                        x: (ax + 128) >> 8,\n                        y: (ay + 128) >> 8,\n                    });\n                    st.accumDist -= st.stepThreshold;\n                }\n            }\n            return;\n        }\n        // De Casteljau midpoints via bitwise right-shift >> 1\n        const m01_x = (ax + bx) >> 1;\n        const m01_y = (ay + by) >> 1;\n        const m12_x = (bx + cx) >> 1;\n        const m12_y = (by + cy) >> 1;\n        const m23_x = (cx + dx) >> 1;\n        const m23_y = (cy + dy) >> 1;\n        const m012_x = (m01_x + m12_x) >> 1;\n        const m012_y = (m01_y + m12_y) >> 1;\n        const m123_x = (m12_x + m23_x) >> 1;\n        const m123_y = (m12_y + m23_y) >> 1;\n        const mx = (m012_x + m123_x) >> 1;\n        const my = (m012_y + m123_y) >> 1;\n        // IN-ORDER RECURSION: Left segment first, then Right segment\n        DistanceBasedBezierCurve.sharedSubdivide(ax, ay, m01_x, m01_y, m012_x, m012_y, mx, my, depth + 1, st);\n        DistanceBasedBezierCurve.sharedSubdivide(mx, my, m123_x, m123_y, m23_x, m23_y, dx, dy, depth + 1, st);\n    }\n}\n\n// Extracted from OpenFrontIO 5dc09dbd2dde5105d8b403d7b5ddf8d503e04ec2.\n// Copyright OpenFront and Contributors. AGPL-3.0-only. See THIRD_PARTY.md.\n// Only imports were replaced with the simulation adapter below; targeting is unchanged.\nconst UnitType = { AtomBomb: \"Atom Bomb\", HydrogenBomb: \"Hydrogen Bomb\", MIRVWarhead: \"MIRV Warhead\" };\nconst GameType = { Singleplayer: \"Singleplayer\" };\nconst isUnit = (u) => !!u && typeof u.targetedBySAM === \"function\";\n/**\n * Smart SAM targeting system preshoting nukes so its range is strictly enforced\n */\nclass SAMTargetingSystem {\n    mg;\n    sam;\n    // Cached interception states indexed by nuke ID to avoid per-tick recomputation.\n    precomputedNukes = new Map();\n    missileSpeed;\n    constructor(mg, sam) {\n        this.mg = mg;\n        this.sam = sam;\n        this.missileSpeed = this.mg.config().defaultSamMissileSpeed();\n        this.isTargetableNearbyUnit = this.isTargetableNearbyUnit.bind(this);\n    }\n    /** Cached interceptions in insertion order, for game snapshots. */\n    getState() {\n        return [...this.precomputedNukes].map(([id, c]) => ({\n            id,\n            tick: c.tick,\n            tile: c.tile,\n            minDistSq: c.minDistSq,\n            lastSeenTick: c.lastSeenTick,\n        }));\n    }\n    setState(s) {\n        for (const { id, tick, tile, minDistSq, lastSeenTick } of s) {\n            this.precomputedNukes.set(id, { tick, tile, minDistSq, lastSeenTick });\n        }\n    }\n    onLevelUp() {\n        for (const [id, cached] of this.precomputedNukes) {\n            if (cached.tick === -1) {\n                this.precomputedNukes.delete(id);\n            }\n        }\n    }\n    updateUnreachableNukes(currentTick) {\n        for (const [id, cached] of this.precomputedNukes) {\n            if (cached.lastSeenTick !== currentTick) {\n                this.precomputedNukes.delete(id);\n            }\n        }\n    }\n    tickToReach(currentTile, tile) {\n        return Math.ceil(this.mg.manhattanDist(currentTile, tile) / this.missileSpeed);\n    }\n    checkDetonationInterception(unit, samTile, ticks) {\n        const trajectory = unit.trajectory();\n        const maxIdx = trajectory.length - 2;\n        const finalTile = trajectory[trajectory.length - 1];\n        if (!finalTile?.targetable)\n            return undefined;\n        const curIdx = unit.trajectoryIndex();\n        const waitTicks = unit.nukeState().waitTicks ?? 0;\n        const expTicks = trajectory.length - 1 - curIdx + waitTicks;\n        const range = this.mg.config().dynamicSamRange(this.sam, ticks + expTicks);\n        if (this.mg.euclideanDistSquared(samTile, finalTile.tile) > range * range) {\n            return undefined;\n        }\n        const flightTile = trajectory[maxIdx];\n        if (!flightTile?.targetable)\n            return undefined;\n        const nukeTicks = maxIdx - curIdx + waitTicks;\n        const samTicks = this.tickToReach(samTile, flightTile.tile);\n        const tickBeforeShooting = nukeTicks - samTicks;\n        return tickBeforeShooting >= 0\n            ? { tick: tickBeforeShooting, tile: flightTile.tile }\n            : undefined;\n    }\n    computeInterceptionTile(unit, samTile, ticks) {\n        const trajectory = unit.trajectory();\n        const curIdx = unit.trajectoryIndex();\n        const waitTicks = unit.nukeState().waitTicks ?? 0;\n        const maxIdx = trajectory.length - 2;\n        const maxSamRangeSq = this.mg.config().maxSamRange() ** 2;\n        let minDistSq = Infinity;\n        let closestTile = samTile;\n        let incSteps = 0;\n        let lastDistSq = -1;\n        for (let i = curIdx; i <= maxIdx; i++) {\n            const tile = trajectory[i];\n            const distSq = this.mg.euclideanDistSquared(samTile, tile.tile);\n            if (distSq < minDistSq) {\n                minDistSq = distSq;\n                closestTile = tile.tile;\n            }\n            incSteps = lastDistSq !== -1 && distSq > lastDistSq ? incSteps + 1 : 0;\n            lastDistSq = distSq;\n            const nukeTicks = i - curIdx + waitTicks;\n            const samTicks = this.tickToReach(samTile, tile.tile);\n            const allowed = this.mg\n                .config()\n                .dynamicSamRange(this.sam, ticks + nukeTicks);\n            if (tile.targetable &&\n                distSq <= allowed * allowed &&\n                nukeTicks >= samTicks) {\n                return {\n                    tick: nukeTicks - samTicks,\n                    tile: tile.tile,\n                    minDistSq,\n                    lastSeenTick: ticks,\n                };\n            }\n            if (incSteps > 3 && distSq > maxSamRangeSq)\n                break;\n        }\n        const det = this.checkDetonationInterception(unit, samTile, ticks);\n        if (det) {\n            return { tick: det.tick, tile: det.tile, minDistSq, lastSeenTick: ticks };\n        }\n        return {\n            tick: minDistSq > maxSamRangeSq ? -2 : -1,\n            tile: closestTile,\n            minDistSq,\n            lastSeenTick: ticks,\n        };\n    }\n    isTargetableNearbyUnit = ({ unit, }) => {\n        return this.isValidNukeTarget(unit);\n    };\n    isValidNukeTarget(unit) {\n        if (!isUnit(unit) ||\n            unit.targetedBySAM() ||\n            unit.owner() === this.sam.owner()) {\n            return false;\n        }\n        const samOwner = this.sam.owner();\n        const nukeOwner = unit.owner();\n        if (samOwner.isFriendly(nukeOwner)) {\n            // Aftergame fun (nuking teammates once the game is over) is disabled in singleplayer.\n            const gameOver = this.mg.getWinner() !== null &&\n                this.mg.config().gameConfig().gameType !== GameType.Singleplayer;\n            return gameOver && samOwner.isOnSameTeam(nukeOwner);\n        }\n        return true;\n    }\n    computeTargetScore(target) {\n        const samTile = this.sam.tile();\n        const unit = target.unit;\n        const trajectory = unit.trajectory();\n        const currentIndex = unit.trajectoryIndex();\n        const timeToExplode = Math.max(1, trajectory.length - currentIndex);\n        const targetTile = unit.targetTile() ??\n            (trajectory.length > 0\n                ? trajectory[trajectory.length - 1].tile\n                : samTile);\n        const distToSilo = this.mg.manhattanDist(samTile, targetTile);\n        // Hydro unit type bonus\n        // 70,000 offset balances the distance bonus between Hydro at 100 and Atom at 30\n        const typeBonus = unit.type() === UnitType.HydrogenBomb ? 70_001 : 0;\n        // Distance bonus: Closer to silo higher score (-1,000 pts per unit distance)\n        // due to manhattanDist, distToSilo can exceed 150 diagonally, 200000 starting point.\n        const distanceBonus = Math.max(0, 200_000 - distToSilo * 1000);\n        // Time based score: +100 pts per tick earlier\n        // Since all nukes are already guaranteed to need a SAM response at this tick,\n        // this is only a very minor tiebreaker.\n        const urgencyBonus = Math.max(0, 10_000 - timeToExplode * 100);\n        return typeBonus + distanceBonus + urgencyBonus;\n    }\n    sortTargets(targets) {\n        if (targets.length <= 1)\n            return targets;\n        for (const target of targets) {\n            target.score = this.computeTargetScore(target);\n        }\n        // Sort by score, js' Timsort guarantees O(n log n)\n        return targets.sort((a, b) => b.score - a.score);\n    }\n    getValidTargets(ticks) {\n        const samTile = this.sam.tile();\n        const detectionRange = this.mg.config().maxSamRange() * 4;\n        const nukes = this.mg.nearbyUnits(samTile, detectionRange, [UnitType.AtomBomb, UnitType.HydrogenBomb, UnitType.MIRVWarhead], this.isTargetableNearbyUnit);\n        const targets = [];\n        for (const nuke of nukes) {\n            const id = nuke.unit.id();\n            const cached = this.precomputedNukes.get(id);\n            if (cached !== undefined) {\n                cached.lastSeenTick = ticks;\n                if (cached.tick === -2 || cached.tick === -1)\n                    continue;\n                if (cached.tick === ticks || cached.tick === ticks + 1) {\n                    targets.push({ tile: cached.tile, unit: nuke.unit });\n                    this.precomputedNukes.delete(id);\n                    continue;\n                }\n                if (cached.tick > ticks)\n                    continue;\n                this.precomputedNukes.delete(id);\n            }\n            const res = this.computeInterceptionTile(nuke.unit, samTile, ticks);\n            if (res.tick >= 0 && res.tick <= 1) {\n                targets.push({ unit: nuke.unit, tile: res.tile });\n            }\n            else {\n                this.precomputedNukes.set(id, {\n                    tick: res.tick >= 0 ? res.tick + ticks : res.tick,\n                    tile: res.tile,\n                    minDistSq: res.minDistSq,\n                    lastSeenTick: ticks,\n                });\n            }\n        }\n        this.updateUnreachableNukes(ticks);\n        return this.sortTargets(targets);\n    }\n}\n\n// The physics and target selector are pinned in src/vendor. No browser objects here.\n\n\nconst ATOM = 'Atom Bomb', HYDRO = 'Hydrogen Bomb';\nconst manhattan = (a,b) => Math.abs(a.x-b.x)+Math.abs(a.y-b.y);\nconst dist2 = (a,b) => (a.x-b.x)**2+(a.y-b.y)**2;\nconst clamp = (n,a,b) => Math.max(a,Math.min(b,n));\n\nfunction trajectory(from, to, height, up, speed, targetRange) {\n  const dx=to.x-from.x, dy=to.y-from.y;\n  const h=Math.max(Math.hypot(dx,dy)/3,50)*(up?-1:1);\n  const curve=new DistanceBasedBezierCurve(from,\n    {x:from.x+dx/4,y:clamp(from.y+dy/4+h,0,height-1)},\n    {x:from.x+dx*3/4,y:clamp(from.y+dy*3/4+h,0,height-1)},to,speed);\n  return curve.getAllPoints().map(p => ({tile:p,\n    targetable:dist2(p,from)<targetRange**2 || dist2(p,to)<targetRange**2}));\n}\n\nfunction rangeAt(sam,tick,rules) {\n  const range = level => rules.maxSamRange-480/(level+5);\n  const u=sam.upgrade;\n  if (!u) return range(sam.level);\n  const elapsed=tick-u.startTick;\n  return elapsed>=u.duration ? range(u.targetLevel) : u.startRange+(range(u.targetLevel)-u.startRange)*elapsed/u.duration;\n}\n\nfunction validateSnapshot(s) {\n  if (!s || !Number.isInteger(s.tick) || !s.target || !s.rules) throw Error('게임 상태가 불완전합니다');\n  for (const k of ['tickMs','samCooldown','siloCooldown','atomSpeed','hydroSpeed','samSpeed','targetRange','maxSamRange'])\n    if (!(s.rules[k]>0 && Number.isFinite(s.rules[k]))) throw Error('게임 규칙을 읽을 수 없습니다: '+k);\n  if (!Array.isArray(s.silos)||!Array.isArray(s.sams)) throw Error('구조물 목록을 읽을 수 없습니다');\n  for (const u of [...s.silos,...s.sams]) {\n    if (!Number.isInteger(u.level)||u.level<1||!Number.isFinite(u.x)||!Number.isFinite(u.y)||!Array.isArray(u.queue)||u.queue.some(t=>!Number.isInteger(t)))\n      throw Error('구조물 레벨 또는 재장전 정보를 읽을 수 없습니다');\n    if(u.upgrade&&(!Number.isInteger(u.upgrade.startTick)||!Number.isFinite(u.upgrade.startRange)||\n      !Number.isInteger(u.upgrade.targetLevel)||u.upgrade.targetLevel<1||!(u.upgrade.duration>0)))\n      throw Error('SAM 업그레이드 진행 정보가 불완전합니다');\n  }\n  if (typeof s.gold!=='bigint'||typeof s.atomCost!=='bigint'||typeof s.hydroCost!=='bigint') throw Error('골드 또는 가격 정보를 읽을 수 없습니다');\n}\n\n// One intent every two ticks, <=50 atoms per intent. Sending more intents per\n// second does not remove the per-silo launch queue. Keep explicit timeline data.\nfunction makePlan(atoms, hydroAfter=null, gap=0, up=true, initial=3) {\n  const actions=[]; let left=atoms, sent=0, tick=initial, hydro=false;\n  while (left>0 || (hydroAfter!==null&&!hydro)) {\n    if (!hydro && hydroAfter!==null && sent>=hydroAfter) {\n      tick+=gap;\n      actions.push({tick,type:HYDRO,amount:1}); hydro=true; tick+=2;\n    } else {\n      const count=Math.min(50,left,hydroAfter!==null&&!hydro?hydroAfter-sent:left);\n      if (count<=0) break;\n      actions.push({tick,type:ATOM,amount:count}); sent+=count; left-=count; tick+=2;\n    }\n  }\n  return {actions,atoms,hydros:hydroAfter===null?0:1,up,hydroAfter,gap};\n}\n\nfunction actor(id) { return {smallID:()=>id,isFriendly:()=>false,isOnSameTeam:()=>false}; }\nfunction bombUnit(b) {\n  return {id:()=>b.id,tile:()=>b.path[Math.min(b.index,b.path.length-1)].tile,\n    type:()=>b.type,owner:()=>b.owner,targetedBySAM:()=>b.targeted,\n    targetTile:()=>b.target,trajectory:()=>b.path,trajectoryIndex:()=>b.index,\n    nukeState:()=>({waitTicks:Math.max(0,b.moveAt-b.now-(b.afterMove?1:0))})};\n}\n\n// An assigned interceptor counts as a kill immediately. We deliberately keep\n// defending SAMs alive after atom impacts: reported hits do not rely on blast\n// randomness, third-party damage, or favorable destruction of the launcher.\nfunction simulate(s,plan,opt={}) {\n  validateSnapshot(s);\n  const r=s.rules, start=s.tick, deadline=opt.deadline??Infinity;\n  const silos=s.silos.filter(u=>!u.building).map(u=>({...u,queue:[...u.queue]}));\n  silos.sort((a,b)=>manhattan(a,s.target)-manhattan(b,s.target)); // stable game order\n  const sams=s.sams.map(u=>({...u,queue:[...u.queue],interceptions:0}));\n  if (opt.reverse) sams.reverse();\n  const me=actor(s.me), defenders=actor(-1), bombs=[], cache=opt.pathCache??new Map();\n  const traces=[], launches=[], used=new Set(), participating=new Set(), byUnit=new Map();\n  let now=start, gold=s.gold, atomHits=s.confirmedAtomHits??0, hydroHits=s.confirmedHydroHits??0,\n    committedHydroHits=0,dropped=0,tubeShortage=0,goldShortage=0,lastArrival=0,nextId=1;\n  const config={defaultSamMissileSpeed:()=>r.samSpeed,maxSamRange:()=>r.maxSamRange,\n    dynamicSamRange:(sam,t)=>rangeAt(sam.data,t,r),gameConfig:()=>({gameType:'Singleplayer'})};\n  const game={config:()=>config,getWinner:()=>null,manhattanDist:manhattan,euclideanDistSquared:dist2,\n    nearbyUnits:(tile,range,_types,predicate)=>bombs.filter(b=>!b.done&&(b.spawn<now||opt.spawnFirst)&&dist2(b.unit.tile(),tile)<=range**2)\n      .map(b=>({unit:b.unit,distSquared:dist2(b.unit.tile(),tile)})).filter(predicate)};\n  for (const sam of sams) {\n    sam.unit={data:sam,id:()=>sam.id,tile:()=>sam,level:()=>sam.level,owner:()=>defenders};\n    sam.selector=new SAMTargetingSystem(game,sam.unit);\n  }\n  // Only confirmed missiles belonging to this operation may be credited in\n  // adaptive mode. They are already paid for and must NOT consume a silo again.\n  for (const b of s.inflight??[]) {\n    if(opt.conservative&&!(s.includeCommitted&&b.committed&&b.owner===s.me))continue;\n    if (b.targeted || !b.path?.length) continue;\n    const shift=opt.flightShift??0;\n    const waiting=Math.max(0,(b.waitTicks||0)-shift);\n    const index=clamp(b.index+Math.max(0,shift-(b.waitTicks||0)),0,b.path.length-1);\n    const item={...b,id:nextId++,owner:me,index,ours:!!b.committed,committed:!!b.committed,\n      spawn:start-1,now:start,moveAt:start+waiting,done:false};\n    item.unit=bombUnit(item); bombs.push(item);byUnit.set(item.unit,item);\n  }\n  const phase=opt.delay??0;\n  const actions=plan.actions.map((a,i)=>({...a,at:start+a.tick+2+phase+(a.type===HYDRO?(opt.hydroDelay??0):0),order:i})).sort((a,b)=>a.at-b.at||a.order-b.order);\n  let ai=0;\n  const end=start+(opt.maxTicks??1200);\n  for (now=start;now<=end;now++) {\n    if ((now-start)%8===0 && performance.now()>deadline) throw Error('SEARCH_TIMEOUT');\n    // Silo reloads one slot per tick. SAM reloads every expired slot in a tick.\n    for (const silo of silos) if(silo.queue.length&&now-silo.queue[0]>=r.siloCooldown) silo.queue.shift();\n    while (ai<actions.length&&actions[ai].at<=now) {\n      const a=actions[ai++];\n      for(let n=0;n<a.amount;n++) {\n        const silo=silos.find(u=>u.queue.length<u.level);\n        const cost=a.type===HYDRO?s.hydroCost:s.atomCost;\n        if (!silo||gold<cost) { dropped++;if(!silo)tubeShortage++;if(gold<cost)goldShortage++;continue; }\n        gold-=cost; used.add(silo.id);\n        let lastDep=0;\n        for(const launchTick of silo.queue) lastDep=Math.max(launchTick+1,lastDep+1);\n        const moveAt=now+Math.max(0,lastDep-now)+1;\n        silo.queue.push(now);\n        const key=[silo.id,silo.x,silo.y,s.target.x,s.target.y,plan.up,a.type].join(':');\n        let path=cache.get(key);\n        if(!path) { path=trajectory(silo,s.target,s.height,plan.up,a.type===HYDRO?r.hydroSpeed:r.atomSpeed,r.targetRange); cache.set(key,path); }\n        const b={id:nextId++,type:a.type,owner:me,path,index:0,spawn:now,now,moveAt,target:s.target,targeted:false,done:false,ours:true,silo:silo.id};\n        b.unit=bombUnit(b); bombs.push(b);byUnit.set(b.unit,b);\n        launches.push({action:a.order,silo:silo.id,type:a.type,spawn:now-start,depart:moveAt-start});\n      }\n    }\n    for(const b of bombs) {b.now=now;b.afterMove=false;}\n    const move=()=>{\n      for(const b of bombs) if(!b.done&&now>=b.moveAt) {\n        b.index++;\n        if(b.index>=b.path.length-1) {\n          b.index=b.path.length-1; b.done=true;\n          if(b.ours&&!b.targeted) {\n            if(b.type===HYDRO) {hydroHits++;if(b.committed)committedHydroHits++;} else atomHits++;\n            lastArrival=now-start;\n          }\n        }\n      }\n      for(const b of bombs)b.afterMove=true;\n    };\n    if(opt.moveFirst) move();\n    for(const sam of sams) {\n      while(sam.queue.length&&now-sam.queue[0]>=r.samCooldown) sam.queue.shift();\n      // Treat construction as completed for conservative planning. This avoids\n      // promising a hit through a SAM that finishes during the flight.\n      if(sam.queue.length>=sam.level) continue;\n      for(const target of sam.selector.getValidTargets(now)) {\n        if(sam.queue.length>=sam.level) break;\n        const b=byUnit.get(target.unit);\n        if(!b||b.done||b.targeted) continue;\n        b.targeted=true; sam.queue.push(now); sam.interceptions++; participating.add(sam.id);\n        if(b.ours&&traces.length<100) traces.push({sam:sam.id,type:b.type,tick:now-start,silo:b.silo});\n      }\n    }\n    if(!opt.moveFirst) move();\n    if(ai===actions.length&&bombs.every(b=>b.done||b.targeted)) break;\n  }\n  const unfinished=bombs.some(b=>b.ours&&!b.done&&!b.targeted);\n  return {atomHits,hydroHits,committedHydroHits,dropped,tubeShortage,goldShortage,unfinished,cost:s.gold-gold,lastArrival,launches,traces,\n    usedSilos:[...used],participating:[...participating],\n    interceptions:sams.map(u=>({id:u.id,count:u.interceptions})),ticks:now-start};\n}\n\nfunction affordable(s,plan) { return BigInt(plan.atoms)*s.atomCost+BigInt(plan.hydros)*s.hydroCost<=s.gold; }\nfunction succeeds(result,plan,minHits) { return !result.dropped&&!result.unfinished&&\n  ((plan.goal??(plan.hydros?'hydro':'atomic'))==='hydro'?result.hydroHits>=1:result.atomHits>=minHits); }\n\nfunction assess(s,plan,options={}) {\n  const cache=options.pathCache??new Map();\n  const base={deadline:options.deadline,maxTicks:options.maxTicks,pathCache:cache,conservative:true};\n  const cases=[{}, {reverse:true,moveFirst:true,spawnFirst:true,flightShift:1}, {hydroDelay:-2,delay:2,flightShift:-1}, {reverse:true,hydroDelay:2,delay:2}];\n  let worst=null;\n  for(const variant of cases) {\n    const result=simulate(s,plan,{...base,...variant});\n    if(!worst||result.hydroHits<worst.hydroHits||result.atomHits<worst.atomHits) worst=result;\n    if(!succeeds(result,plan,options.minAtomHits??1)) return {ok:false,result};\n  }\n  return {ok:true,result:worst};\n}\n\nfunction search(s, options={}) {\n  validateSnapshot(s);\n  const began=performance.now(),deadline=began+(options.budgetMs??1800),pathCache=new Map();\n  const minHits=Math.max(1,options.minAtomHits??1);\n  const cap=Math.min(5000,Math.max(0,options.maxAtoms??2000));\n  const initial=options.initialTicks??3;\n  const committedHydro=s.includeCommitted&&(s.inflight??[]).some(b=>b.committed&&b.owner===s.me&&!b.targeted&&b.type===HYDRO);\n  const ready=s.silos.reduce((n,u)=>n+(u.building?0:Math.max(0,u.level-u.queue.length)),0);\n  // Estimate capacity only along possible trajectories. Keep all SAMs in the\n  // actual simulation; this filter is solely a search-order optimization.\n  const paths=s.silos.filter(u=>!u.building).flatMap(u=>[true,false].map(up=>trajectory(u,s.target,s.height,up,s.rules.atomSpeed,s.rules.targetRange)));\n  const relevant=s.sams.filter(u=>paths.some(path=>path.some(p=>p.targetable&&dist2(p.tile,u)<=s.rules.maxSamRange**2)));\n  const slots=relevant.reduce((n,u)=>n+u.level,0);\n  const result={mixed:null,atomic:null,chosen:null,tested:0,limited:false,reason:'',\n    snapshotTick:s.tick,minAtomHits:minHits,maxAtoms:cap,ready,slots,\n    silos:s.silos.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),\n    sams:s.sams.map(u=>({id:u.id,x:u.x,y:u.y,level:u.level,ready:u.level-u.queue.length})),\n    existingFlights:(s.inflight??[]).length};\n  if(!s.includeCommitted&&!s.silos.some(u=>!u.building)) {result.reason='완성된 사일로가 없습니다'; return result;}\n  if(!s.includeCommitted&&s.intentBudget===0) {result.reason='남은 명령 한도가 없습니다. 회복 후 다시 분석하세요';return result;}\n  if(!s.includeCommitted&&s.gold<s.atomCost&&s.gold<s.hydroCost) {result.reason='원자·수소 1발을 구매할 골드가 부족합니다';return result;}\n  const counts=[0,minHits,...[1,1.25,1.5,2,.8,.5,3].map(x=>Math.ceil(slots*x)+minHits),\n    ready-1,ready,4,8,16,32,50,100,200,400,800,cap]\n    .filter(n=>Number.isInteger(n)&&n>=0&&n<=cap).filter((n,i,a)=>a.indexOf(n)===i);\n  const run=plan=>{\n    if(!affordable(s,plan)||plan.actions.length>(s.intentBudget??140)) return null;\n    result.tested++;\n    const a=assess(s,plan,{deadline,pathCache,minAtomHits:minHits,maxTicks:options.maxTicks??1200});\n    if(!a.ok) {\n      const failure={atoms:plan.atoms,hydros:plan.hydros,up:plan.up,dropped:a.result.dropped,\n        tubeShortage:a.result.tubeShortage,goldShortage:a.result.goldShortage,\n        blockedBy:a.result.traces.filter(t=>t.type===HYDRO),usedSilos:a.result.usedSilos,\n        launchSpan:a.result.launches.length?Math.max(...a.result.launches.map(l=>l.depart))-Math.min(...a.result.launches.map(l=>l.depart)):0,\n        interceptions:a.result.interceptions};\n      if(!result.failure||failure.dropped<result.failure.dropped||\n        (failure.dropped===result.failure.dropped&&failure.atoms>result.failure.atoms)) result.failure=failure;\n    }\n    return a.ok?{...plan,...a.result}:null;\n  };\n  try {\n    // Interleave modes so an expensive mixed search cannot starve atomic analysis.\n    outer: for(const [fraction,gap] of [[1,0],[.75,0],[.5,0],[1,8],[.75,8],[1,30],[1,60],[.5,30]]) {\n     for(const atoms of counts) {\n      for(const up of [s.preferredUp!==false,s.preferredUp===false]) {\n        if(fraction===1&&gap===0&&!result.atomic&&(atoms>=minHits||s.includeCommitted)&&((atoms===0&&s.includeCommitted)||s.allowed?.atomic!==false)) {\n          const p=run({...makePlan(atoms,null,0,up,initial),goal:'atomic'}); if(p) result.atomic=p;\n        }\n        if(!result.mixed&&options.allowHydroGoal!==false&&(committedHydro||s.allowed?.mixed!==false)&&(atoms===0||s.allowed?.atomic!==false)) {\n          if(atoms===0&&(fraction!==1||gap!==0))continue;\n          if(committedHydro&&fraction===1&&gap===0) {\n            const rescue=run({...makePlan(atoms,null,0,up,initial),goal:'hydro'});\n            if(rescue)result.mixed=rescue;\n          }\n          if(!result.mixed&&options.allowNewHydro!==false&&s.allowed?.mixed!==false) {\n            const p=run({...makePlan(atoms,Math.floor(atoms*fraction),gap,up,initial),goal:'hydro'});\n            if(p) result.mixed=p;\n          }\n        }\n        if(result.mixed&&result.atomic) break outer;\n      }\n      if(performance.now()>deadline) throw Error('SEARCH_TIMEOUT');\n     }\n    }\n  } catch(e) { if(e.message==='SEARCH_TIMEOUT') result.limited=true; else throw e; }\n  result.chosen=result.mixed??result.atomic;\n  result.mode=result.mixed?'mixed':result.atomic?'atomic':result.limited?'unknown':'blocked';\n  result.diagnostics=[];\n  if(!result.chosen&&result.failure) {\n    const f=result.failure;\n    if(f.tubeShortage)result.diagnostics.push(`시험 공격 ${f.atoms+f.hydros}발 중 ${f.tubeShortage}발이 발사관 부족으로 발사되지 못함`);\n    const reloaded=f.interceptions.filter(v=>v.count>(s.sams.find(u=>u.id===v.id)?.level??Infinity));\n    if(reloaded.length)result.diagnostics.push(`SAM ${reloaded.length}기가 재장전 후 반복 요격 · 발사 분산 ${(f.launchSpan*s.rules.tickMs/1000).toFixed(1)}초, 사일로 수·배치 검토`);\n    for(const b of f.blockedBy.slice(0,1)) {\n      const sam=s.sams.find(u=>u.id===b.sam),silo=s.silos.find(u=>u.id===b.silo);\n      if(sam&&silo&&dist2(sam,s.target)>s.rules.maxSamRange**2)\n        result.diagnostics.push(`목표 주변 밖 SAM (${sam.x}, ${sam.y}) Lv${sam.level}이 사일로 (${silo.x}, ${silo.y})의 수소를 경로에서 요격`);\n    }\n  }\n  if(!result.chosen) {\n    if(result.limited) result.reason='계산 시간 내 검증된 계획을 찾지 못했습니다. I로 더 길게 재분석합니다';\n    else if(!ready) result.reason='현재 발사관이 재장전 중입니다. 준비 후 다시 분석합니다';\n    else if(s.allowed?.mixed===false&&s.allowed?.atomic===false) result.reason='게임 규칙상 이 위치에는 발사할 수 없습니다';\n    else if(result.failure?.tubeShortage) result.reason=`시험한 공격에서 발사관 ${result.failure.tubeShortage}발분 부족 — 사일로 레벨·재장전 확인`;\n    else if(result.failure?.blockedBy?.length) {\n      const b=result.failure.blockedBy[0],sam=s.sams.find(u=>u.id===b.sam);\n      result.reason=`시험한 수소 공격은 SAM (${sam.x}, ${sam.y}) Lv${sam.level}이 ${b.tick}틱에 요격 — 발사 배치·간격 개선 필요`;\n    } else result.reason='탐색 범위에서 돌파 계획 없음 — 사일로 발사 간격·배치와 SAM 재장전이 병목일 수 있습니다';\n  }\n  result.elapsedMs=Math.round(performance.now()-began);\n  return result;\n}\n\n\n\n// Decode authoritative motion-plan time instead of the nukeState index, which\n// may be stale when the client derives motion without per-tick unit updates.\nfunction flightProgress(path,position,nukeState,motion,tick) {\n  if(!path?.length)throw Error('비행 궤적이 없어 재계산할 수 없습니다');\n  const matches=i=>path[i]?.tile.x===position.x&&path[i]?.tile.y===position.y;\n  if(motion) {\n    if(motion.ticksPerStep!==1||!Number.isInteger(motion.startTick))throw Error('지원하지 않는 비행 시간 정보');\n    const index=Math.max(0,Math.min(path.length-1,tick-motion.startTick));\n    if(!matches(index))throw Error('비행 위치와 시간 정보가 일치하지 않습니다');\n    return {index,waitTicks:Math.max(0,motion.startTick-tick)};\n  }\n  // Older clients are usable only when the observed tile unambiguously resolves\n  // the path index; never substitute the stale server index or silently guess.\n  const matchesAt=[];path.forEach((_,i)=>{if(matches(i))matchesAt.push(i);});\n  if(matchesAt.length!==1||!Number.isInteger(nukeState.waitTicks)||nukeState.waitTicks<0)\n    throw Error('미사일의 현재 비행 시점을 확인할 수 없습니다');\n  return {index:matchesAt[0],waitTicks:matchesAt[0]===0?nukeState.waitTicks:0};\n}\n\nfunction remainingPlan(plan,index,baseTick,snapshotTick,leadTicks=6) {\n  const actions=plan.actions.slice(index).map(a=>({...a,tick:baseTick+a.tick-snapshotTick}));\n  const shift=actions.length?Math.max(0,leadTicks-actions[0].tick):0;\n  for(const a of actions)a.tick+=shift;\n  return {...plan,actions,atoms:actions.filter(a=>a.type===ATOM).reduce((n,a)=>n+a.amount,0),\n    hydros:actions.filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)};\n}\n\n// Cheap geometric broad phase for the observer. Every potentially relevant SAM\n// stays in the simulator. Changes well outside every possible path need not\n// interrupt a precisely timed volley.\nfunction defenseSignature(s) {\n  const r=s.rules.maxSamRange, boxes=[];\n  for(const silo of s.silos) {\n    const h=Math.max(Math.hypot(s.target.x-silo.x,s.target.y-silo.y)/3,50);\n    boxes.push([Math.min(silo.x,s.target.x)-r,Math.max(silo.x,s.target.x)+r,\n      Math.min(silo.y,s.target.y)-h-r,Math.max(silo.y,s.target.y)+h+r]);\n  }\n  for(const b of s.inflight??[])if(b.committed&&b.path?.length) {\n    const p=b.path.slice(b.index).map(v=>v.tile);\n    if(p.length)boxes.push([Math.min(...p.map(v=>v.x))-r,Math.max(...p.map(v=>v.x))+r,\n      Math.min(...p.map(v=>v.y))-r,Math.max(...p.map(v=>v.y))+r]);\n  }\n  return JSON.stringify([\n    s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner]),s.allowed,\n    s.sams.filter(u=>boxes.some(([x0,x1,y0,y1])=>u.x>=x0&&u.x<=x1&&u.y>=y0&&u.y<=y1))\n      .map(u=>[u.id,u.x,u.y,u.level,u.building,u.owner,u.upgrade])]);\n}\n\nfunction adapt(s,request,options={}) {\n  const began=performance.now(),budget=options.budgetMs??350,deadline=began+budget;\n  const cap=Math.max(0,request.atomLimit-request.sentAtoms);\n  const hydroLeft=Math.max(0,request.hydroLimit-request.sentHydros);\n  const minHits=options.minAtomHits??1,lead=options.initialTicks??6;\n  s={...s,includeCommitted:true};\n  const old=request.remaining?{...request.remaining,goal:request.goal}:null;\n  const envelope=p=>p&&p.atoms<=cap&&p.hydros<=hydroLeft&&p.actions.length<=(s.intentBudget??140)&&\n    p.actions.every(a=>a.type===HYDRO?s.allowed?.mixed!==false:s.allowed?.atomic!==false)&&\n    BigInt(p.atoms)*s.atomCost+BigInt(p.hydros)*s.hydroCost<=s.gold;\n  // Test the committed goal first. No repeated hydro launch when its per-run\n  // allowance has already been spent; a flying hydro can only receive atom help.\n  if(envelope(old))try{\n    const check=assess(s,old,{deadline,minAtomHits:minHits,maxTicks:options.maxTicks});\n    if(check.ok)return {chosen:{...old,...check.result},decision:old.actions.length?'keep':'observe',\n      reason:old.actions.length?'변경된 SAM에서도 남은 계획 유효':'추가 발사 없이 현재 비행으로 목표 달성 예상',snapshotTick:s.tick};\n  }catch(e){if(e.message!=='SEARCH_TIMEOUT')throw e;}\n  const timeLeft=deadline-performance.now();\n  if(timeLeft<=0)return {chosen:null,decision:'stop',limited:true,reason:'재계산 시간 내 유효한 계획을 확인하지 못했습니다',snapshotTick:s.tick};\n  const result=search(s,{...options,budgetMs:timeLeft,maxAtoms:cap,initialTicks:lead,\n    allowHydroGoal:request.goal!=='atomic',allowNewHydro:hydroLeft>0});\n  if(!result.chosen)return {...result,decision:'stop',reason:cap===0?'이번 공격의 누적 원자 발사 한도에 도달했습니다':result.reason};\n  const goal=result.chosen.goal??(result.chosen.hydros?'hydro':'atomic');\n  const decision=!result.chosen.actions.length?'observe':goal==='atomic'?'atomic':request.sentHydros>0?'rescue':'mixed';\n  const reason={observe:'현재 관측 상태로 목표 달성 예상 — 추가 발사 보류',\n    atomic:request.goal==='atomic'?'변경된 방어에 맞춰 원자 집중 수량·일정 수정':'수소 구출 계획을 찾지 못해 원자 집중으로 전환',rescue:`비행 중 수소 구출을 위해 원자 ${result.chosen.atoms}발 보강`,\n    mixed:`원자 ${result.chosen.atoms}발 + 수소 ${result.chosen.hydros}발로 남은 계획 수정`}[decision];\n  return {...result,decision,reason};\n}\n\n// Advice is a separate, non-executing next-attack experiment. It never mutates\n// the live game or pretends an upgrade can finish before a flying hydro arrives.\nfunction upgradeAdvice(s,options={}) {\n  const deadline=performance.now()+(options.budgetMs??800),attempts=[];\n  const ready={...s,includeCommitted:false,inflight:[],confirmedAtomHits:0,confirmedHydroHits:0,\n    tick:s.tick+s.rules.samCooldown+90,\n    silos:s.silos.filter(u=>!u.building).map(u=>({...u,queue:[]})),\n    sams:s.sams.map(u=>({...u,queue:[],level:Math.max(u.level,u.upgrade?.targetLevel??u.level),upgrade:null}))};\n  if(!ready.silos.length)return {text:'먼저 사일로를 건설하고 완공 후 다시 분석하세요',verified:false};\n  const check=state=>search(state,{...options,budgetMs:Math.max(1,Math.min(120,deadline-performance.now())),initialTicks:3});\n  if(performance.now()<deadline) {\n    const base=check(ready);\n    if(base.chosen)return {text:'현재 배치도 재장전 완료 후 다음 공격에서 돌파 계획이 있습니다. 발사관을 충전한 뒤 다시 분석하세요',verified:true,kind:'reload'};\n  }\n  for(const silo of ready.silos.slice().sort((a,b)=>Math.abs(a.x-s.target.x)+Math.abs(a.y-s.target.y)-Math.abs(b.x-s.target.x)-Math.abs(b.y-s.target.y)).slice(0,3)) {\n    for(const add of [10,25,50,100]) {\n      if(performance.now()>=deadline)return {text:'현재 탐색 시간 안에 레벨업만으로 해결되는 조건을 확인하지 못했습니다. 사일로 추가·배치 변경도 검토하세요',verified:false,attempts};\n      const next={...ready,silos:ready.silos.map(u=>u.id===silo.id?{...u,level:u.level+add}:u)};\n      const r=check(next);attempts.push({id:silo.id,add,success:!!r.chosen});\n      if(r.chosen)return {text:`다음 공격 후보: 사일로 (${silo.x}, ${silo.y}) Lv${silo.level} → Lv${silo.level+add}. 업그레이드·재장전 완료를 가정하면 돌파 예상 (최소 레벨·업그레이드 비용 검증 아님)`,\n        verified:true,kind:'upgrade',silo:silo.id,from:silo.level,to:silo.level+add,plan:r.chosen,attempts};\n    }\n  }\n  return {text:'시험한 레벨업만으로는 돌파를 확인하지 못했습니다. 사일로 수·배치 또는 다음 공격의 발사 한도를 검토하세요',verified:false,attempts};\n}\n\nself.onmessage = e => { try { const d=e.data; const result=d.kind===\"adapt\"?adapt(d.snapshot,d.request,d.options):d.kind===\"advice\"?upgradeAdvice(d.snapshot,d.options):d.kind===\"assess\"?assess(d.snapshot,d.plan,{...d.options,deadline:performance.now()+(d.options.budgetMs??2500)}):search(d.snapshot,d.options); self.postMessage({id:d.id,result}); } catch(error) { self.postMessage({id:e.data.id,error:error.message}); }};";
 
 
   // ─────────────────────────────────────────────
@@ -1221,7 +1061,7 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   let lastMouseMoveAt = 0;
   window.addEventListener(
     "mousemove",
-    (e) => { if(hudEl?.contains(e.target))return; lastMouse = { x: e.clientX, y: e.clientY }; lastMouseMoveAt = Date.now(); },
+    (e) => { lastMouse = { x: e.clientX, y: e.clientY }; lastMouseMoveAt = Date.now(); },
     { passive: true },
   );
 
@@ -3324,7 +3164,7 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   // (구버전은 청크마다 서버 반영을 기다리며 300ms씩 쉬어 500레벨에 수 초가 걸렸다)
   //
   // 안전 원칙:
-  //   · 클릭마다 FIFO 작업을 추가한다. 앞 묶음 반영 후 현재 레벨 + 저장된 N을 계산한다.
+  //   · 목표는 '절대 레벨'(클릭 시점 lv0 + N) — 반영 지연 중 겹쳐 눌러도 초과 계산 없음.
   //   · 보낸 총량은 (목표 - lv0)을 넘지 않는다.
   //   · 서버 초당 한도(10건)에 여유 1을 두고 스스로 페이싱한다 (드롭 0).
   //   · 골드로 감당 가능한 만큼만 사전 절단 (최종 판정은 서버).
@@ -3334,12 +3174,10 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   //   → X(+500=10건)를 눌러도 창에 여유가 남아 Z 살포·수소가 굶지 않는다.
   let upSentTimes = [];
   const upgradeJobs = new Map();
-  const upgradeQueue = [];
   let upgradeEpoch = 0, upgradeSelectionPending = false;
   function cancelUpgrades() {
     upgradeEpoch++;
     upgradeSelectionPending=false;
-    upgradeQueue.length=0;
     for(const job of upgradeJobs.values())job.cancel();
     upgradeJobs.clear();
   }
@@ -3352,152 +3190,145 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
     return Math.max(0, cap - upSentTimes.length);
   }
 
-  function fireUpgrade(unitId, type, row, me, bus, ctor, big, entry=null) {
-    return new Promise(resolve=>{
-      if(upgradeJobs.has(unitId)) {
-        toast('업그레이드 진행·반영 대기 중 — 같은 구조물 중복 요청을 생략했습니다', '#ffd166');
-        resolve(false);return;
-      }
-      const lv0 = unitLevel(unitId, type);
-      if (lv0 === null) {
-        toast(`⚠️ ${koName(type)} 레벨 확인 실패 — 중단 (게임 로드 후 재시도)`, "#ffaa00");
-        resolve(false);return;
-      }
-      const target = entry?(entry.mode==='set'?entry.want:lv0+entry.want):goalLevel(type, lv0, big);
-      if (target <= lv0) {
-        toast(`ℹ️ ${koName(type)} 이미 Lv ${lv0} (목표 ${target})`, "#ffd166");
-        resolve(true);return;
-      }
-      let remaining = target - lv0;
-      if(!Number.isSafeInteger(remaining)||remaining<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');resolve(false);return;}
-      let cappedByGold = false;
+  function fireUpgrade(unitId, type, row, me, bus, ctor, big) {
+    if(upgradeJobs.has(unitId)) {
+      toast('업그레이드 진행·반영 대기 중 — 같은 구조물 중복 요청을 생략했습니다', '#ffd166');
+      return;
+    }
+    const lv0 = unitLevel(unitId, type);
+    if (lv0 === null) {
+      toast(`⚠️ ${koName(type)} 레벨 확인 실패 — 중단 (게임 로드 후 재시도)`, "#ffaa00");
+      return;
+    }
+    const target = goalLevel(type, lv0, big);
+    if (target <= lv0) {
+      toast(`ℹ️ ${koName(type)} 이미 Lv ${lv0} (목표 ${target})`, "#ffd166");
+      return;
+    }
+    let remaining = target - lv0;
+    if(!Number.isSafeInteger(remaining)||remaining<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');return;}
+    let cappedByGold = false;
 
-      // 골드 상한 — upgradeCosts[k-1] = k회 연속 업그레이드의 누적 비용
-      try {
-        const costs = row && row.upgradeCosts;
-        if (costs && costs.length > 0) {
-          const gold = toBig(me.gold());
-          const priceable = Math.min(remaining, costs.length);
-          let k = priceable;
-          while (k > 0 && toBig(costs[k - 1]) > gold) k--;
-          if (k <= 0) {
-            toast(`💰 골드 부족 — ${koName(type)} 다음 강화 불가`, "#ff5555");
-            resolve(false);return;
-          }
-          if (k < priceable) { cappedByGold = true; remaining = k; }
+    // 골드 상한 — upgradeCosts[k-1] = k회 연속 업그레이드의 누적 비용
+    try {
+      const costs = row && row.upgradeCosts;
+      if (costs && costs.length > 0) {
+        const gold = toBig(me.gold());
+        const priceable = Math.min(remaining, costs.length);
+        let k = priceable;
+        while (k > 0 && toBig(costs[k - 1]) > gold) k--;
+        if (k <= 0) {
+          toast(`💰 골드 부족 — ${koName(type)} 다음 강화 불가`, "#ff5555");
+          return;
         }
-      } catch (e) {}
+        if (k < priceable) { cappedByGold = true; remaining = k; }
+      }
+    } catch (e) {}
 
-      const perIntent = 50; // 업그레이드는 원자탄 CFG.amount와 독립: +500 = 정확히 10건
-      const t0 = lv0;
-      const startedAt = Date.now();
-      let sent = 0;
-      let timer = null;
-      const game=getGameView(),epoch=upgradeEpoch;
-      const job={cancel(success=false){if(timer!==null)clearTimeout(timer);timer=null;resolve(success);}};
-      upgradeJobs.set(unitId,job);
-      const cleanup=(success=false)=>{job.cancel(success);if(upgradeJobs.get(unitId)===job)upgradeJobs.delete(unitId);};
+    const perIntent = 50; // 업그레이드는 원자탄 CFG.amount와 독립: +500 = 정확히 10건
+    const t0 = lv0;
+    const startedAt = Date.now();
+    let sent = 0;
+    let timer = null;
+    const game=getGameView(),epoch=upgradeEpoch;
+    const job={cancel(){if(timer!==null)clearTimeout(timer);timer=null;}};
+    upgradeJobs.set(unitId,job);
+    const cleanup=()=>{job.cancel();if(upgradeJobs.get(unitId)===job)upgradeJobs.delete(unitId);};
 
-      const valid=()=>{
-        const u=game.unit?.(unitId);
-        return epoch===upgradeEpoch&&getGameView()===game&&game.myPlayer()===me&&!document.hidden&&
-          u&&u.isActive?.()!==false&&isOwnedByMe(u,me)&&!u.isUnderConstruction?.();
+    // 발송이 끝난 뒤 반영을 지켜보고 결과를 알린다 (발사 자체는 이미 끝났다)
+    function finish() {
+      let tries = 0;
+      const wantLv = t0 + sent;
+      const report = (nowLv) => {
+        cleanup();
+        const gained = (nowLv === null ? t0 : nowLv) - t0;
+        const tail = cappedByGold ? " (골드 한도)" : "";
+        if (gained > 0) toast(`✅ ${koName(type)} Lv ${t0} → ${nowLv} (+${gained})${tail}`, "#7ee787");
+        else toast(`⚠️ ${koName(type)} 반영 없음 — Lv ${t0} 유지 (골드·건설상태 확인)`, "#ffaa00");
       };
-      // 발송이 끝난 뒤 반영을 지켜보고 결과를 알린다 (발사 자체는 이미 끝났다)
-      function finish() {
-        let tries = 0;
-        const wantLv = t0 + sent;
-        const report = (nowLv) => {
-          cleanup(nowLv!==null&&nowLv>=wantLv);
-          const gained = (nowLv === null ? t0 : nowLv) - t0;
-          const tail = cappedByGold ? " (골드 한도)" : "";
-          if (gained > 0) toast(`✅ ${koName(type)} Lv ${t0} → ${nowLv} (+${gained})${tail}`, "#7ee787");
-          else toast(`⚠️ ${koName(type)} 반영 없음 — Lv ${t0} 유지 (골드·건설상태 확인)`, "#ffaa00");
-        };
-        const poll = () => {
-          if(!valid()){cleanup();return;}
-          const nowLv = unitLevel(unitId, type);
-          if (nowLv !== null && nowLv >= wantLv) { report(nowLv); return; }
-          if (++tries >= 25) { report(nowLv); return; }   // 최대 ~5초 대기
-          timer = setTimeout(poll, 200);
-        };
-        poll();
+      const poll = () => {
+        if(epoch!==upgradeEpoch||getGameView()!==game){cleanup();return;}
+        const nowLv = unitLevel(unitId, type);
+        if (nowLv !== null && nowLv >= wantLv) { report(nowLv); return; }
+        if (++tries >= 25) { report(nowLv); return; }   // 최대 ~5초 대기
+        timer = setTimeout(poll, 200);
+      };
+      poll();
+    }
+
+    // 창당 몰아쓰기 발송 (서버 초당 한도 10건을 최대 속력으로)
+    function pump() {
+      timer = null;
+      if(epoch!==upgradeEpoch||getGameView()!==game){cleanup();return;}
+      if (sent >= remaining) { finish(); return; }
+
+      const now = Date.now();
+      RL.secWindow = RL.secWindow.filter((x) => now - x < 1000);
+      RL.minWindow = RL.minWindow.filter((x) => now - x < 60000);
+
+      // 분당 한도(150건)가 바닥이면 분 경계까지 대기
+      if (RL.minWindow.length >= RL.perMinute - 5) {
+        const waitMs = Math.max(1100, RL.minWindow[0] + 60000 - now + 60);
+        const ts = Date.now();
+        if (ts - lastBlockToast > 3000) {
+          lastBlockToast = ts;
+          toast(`⏳ 서버 분당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
+        }
+        timer = setTimeout(pump, waitMs);
+        return;
       }
 
-      // 창당 몰아쓰기 발송 (서버 초당 한도 10건을 최대 속력으로)
-      function pump() {
-        timer = null;
-        if(!valid()){cleanup();return;}
-        if (sent >= remaining) { finish(); return; }
-
-        const now = Date.now();
-        RL.secWindow = RL.secWindow.filter((x) => now - x < 1000);
-        RL.minWindow = RL.minWindow.filter((x) => now - x < 60000);
-
-        // 분당 한도(150건)가 바닥이면 분 경계까지 대기
-        if (RL.minWindow.length >= RL.perMinute - 5) {
-          const waitMs = Math.max(1100, RL.minWindow[0] + 60000 - now + 60);
-          const ts = Date.now();
-          if (ts - lastBlockToast > 3000) {
-            lastBlockToast = ts;
-            toast(`⏳ 서버 분당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
-          }
-          timer = setTimeout(pump, waitMs);
-          return;
+      // 창에 '남은 여유'만큼 지금 바로 보낸다.
+      //   · 창이 비었거나 여유가 있으면 → 즉시 (여러 번 클릭해도 안 막힘)
+      //   · 창이 꽉 찼으면 → 그 창이 닫힐 때까지(첫 발송 + 1.05초) 대기 후 몰아쓰기
+      //  (살포 Z·수동 발사와 창을 나눠 쓰므로 어느 쪽도 버려지지 않는다)
+      const room = RL.perSecond - RL.secWindow.length;
+      if (room <= 0) {
+        const waitMs = Math.max(40, RL.secWindow[0] + 1050 - now);
+        if (Date.now() - startedAt > 180000) {
+          toast(`⏳ 서버 한도 대기 초과 — 중단 (남은 ${remaining - sent}레벨)`, "#ffaa00");
+          cleanup();return;
         }
-
-        // 창에 '남은 여유'만큼 지금 바로 보낸다.
-        //   · 창이 비었거나 여유가 있으면 → 즉시 (여러 번 클릭해도 안 막힘)
-        //   · 창이 꽉 찼으면 → 그 창이 닫힐 때까지(첫 발송 + 1.05초) 대기 후 몰아쓰기
-        //  (살포 Z·수동 발사와 창을 나눠 쓰므로 어느 쪽도 버려지지 않는다)
-        const room = RL.perSecond - RL.secWindow.length;
-        if (room <= 0) {
-          const waitMs = Math.max(40, RL.secWindow[0] + 1050 - now);
-          if (Date.now() - startedAt > 180000) {
-            toast(`⏳ 서버 한도 대기 초과 — 중단 (남은 ${remaining - sent}레벨)`, "#ffaa00");
-            cleanup();return;
-          }
-          const ts = Date.now();
-          if (ts - lastBlockToast > 3000) {
-            lastBlockToast = ts;
-            toast(`⏳ 서버 초당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
-          }
-          timer = setTimeout(pump, waitMs);
-          return;
+        const ts = Date.now();
+        if (ts - lastBlockToast > 3000) {
+          lastBlockToast = ts;
+          toast(`⏳ 서버 초당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
         }
-
-        // 이번 창 몫: 서버 여유 · 업그레이드 전용 상한 · 남은 양 중 최소
-        const burst = Math.min(room, upRoomNow(), RL.perMinute - 5 - RL.minWindow.length, Math.ceil((remaining - sent)/perIntent));
-        let n = 0;
-        while (n < burst && sent < remaining) {
-          const amt = Math.min(perIntent, remaining - sent);
-          if (amt <= 0) break;
-          try {
-            bus.emit(new ctor(unitId, type, amt));
-            rateUse();
-            upSentTimes.push(Date.now());
-          } catch (e) {
-            console.warn("[x50] 업그레이드 emit 실패:", e);
-            toast("❌ 업그레이드 발송 실패", "#ff5555");
-            cleanup();return;
-          }
-          sent += amt;
-          n++;
-        }
-        if (sent < remaining) {
-          // 이번 창에서 업그레이드 몫을 다 썼다 → 창 회전까지 기다린다.
-          //   (60ms 재시도로는 결국 창을 다 먹어 독점이 그대로 재현된다 — 실측 확인)
-          const last = upSentTimes.length ? upSentTimes[upSentTimes.length - 1] : Date.now();
-          const wait2 = Math.max(60, last + 1050 - Date.now());
-          timer = setTimeout(pump, wait2);
-          return;
-        }
-        finish();
+        timer = setTimeout(pump, waitMs);
+        return;
       }
 
-      toast(`🚀 ${koName(type)} +${remaining} · ${Math.ceil(remaining/perIntent)}건 요청 (Lv ${t0} → ${t0 + remaining})${cappedByGold ? " — 골드 한도" : ""}`, "#ffd166");
-      pump();
-    });
+      // 이번 창 몫: 서버 여유 · 업그레이드 전용 상한 · 남은 양 중 최소
+      const burst = Math.min(room, upRoomNow(), RL.perMinute - 5 - RL.minWindow.length, Math.ceil((remaining - sent)/perIntent));
+      let n = 0;
+      while (n < burst && sent < remaining) {
+        const amt = Math.min(perIntent, remaining - sent);
+        if (amt <= 0) break;
+        try {
+          bus.emit(new ctor(unitId, type, amt));
+          rateUse();
+          upSentTimes.push(Date.now());
+        } catch (e) {
+          console.warn("[x50] 업그레이드 emit 실패:", e);
+          toast("❌ 업그레이드 발송 실패", "#ff5555");
+          cleanup();return;
+        }
+        sent += amt;
+        n++;
+      }
+      if (sent < remaining) {
+        // 이번 창에서 업그레이드 몫을 다 썼다 → 창 회전까지 기다린다.
+        //   (60ms 재시도로는 결국 창을 다 먹어 독점이 그대로 재현된다 — 실측 확인)
+        const last = upSentTimes.length ? upSentTimes[upSentTimes.length - 1] : Date.now();
+        const wait2 = Math.max(60, last + 1050 - Date.now());
+        timer = setTimeout(pump, wait2);
+        return;
+      }
+      finish();
+    }
+
+    toast(`🚀 ${koName(type)} +${remaining} · ${Math.ceil(remaining/perIntent)}건 요청 (Lv ${t0} → ${t0 + remaining})${cappedByGold ? " — 골드 한도" : ""}`, "#ffd166");
+    pump();
   }
 
   // ═════════════════════════════════════════════
@@ -3509,106 +3340,95 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   //   따라서 여러 척을 띄우려면 build_unit 인텐트를 N번 반복 발송해야 한다.
   //   건조 위치는 서버가 정한다(warshipSpawn): 클릭한 바다와 같은 수역에 있는
   //   내 항구 중 가장 가까운 항구 타일. 항구가 없으면 건조되지 않는다.
-  //   비용·수역별 건조 가능 여부는 매 요청 전 공식 buildables 응답으로 확인한다.
+  //   비용은 보유 수 기준 (n+1)×25만, 4척 넘으면 100만 고정.
   // ═════════════════════════════════════════════
-  // One FIFO for every click; one unacknowledged build at a time.
-  const warshipQueue=[];
-  let warshipTimer=null,warshipBusy=false,warshipEpoch=0;
-  let warshipProgress={sent:0,confirmed:0,phase:'idle',message:''};
-  function warshipStatus() {
-    const head=warshipQueue[0];
-    return {...warshipProgress,running:warshipQueue.length>0,batches:warshipQueue.length,
-      remaining:warshipQueue.reduce((n,j)=>n+j.want-j.confirmed,0),tile:head?.tile??null};
-  }
-  function cancelWarships(reason='남은 군함 건조를 취소했습니다') {
-    const had=warshipQueue.length>0;
-    warshipEpoch++;clearTimeout(warshipTimer);warshipTimer=null;warshipBusy=false;warshipQueue.length=0;
-    if(had){warshipProgress.phase='stopped';warshipProgress.message=reason;toast(reason+' · 이미 보낸 요청은 유지됩니다','#ffd166');}
-  }
-  window.addEventListener('pagehide',()=>cancelWarships('화면을 떠나 군함 대기열을 중단했습니다'));
-  document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelWarships('탭을 전환해 군함 대기열을 중단했습니다');});
-  function scheduleWarships(delay) {
-    clearTimeout(warshipTimer);
-    warshipTimer=setTimeout(()=>{warshipTimer=null;pumpWarships();},delay);
-  }
-  async function pumpWarships() {
-    if(warshipBusy||!warshipQueue.length)return;
-    warshipBusy=true;
-    const epoch=warshipEpoch,job=warshipQueue[0];let delay=80;
-    const live=()=>epoch===warshipEpoch&&warshipQueue[0]===job;
-    try {
-      if(document.hidden||getGameView()!==job.game||job.game.myPlayer()!==job.me||job.me.isAlive?.()===false) {
-        cancelWarships('게임 상태가 바뀌어 군함 대기열을 중단했습니다');return;
-      }
-      if(job.pending) {
-        const created=job.game.units('Warship').find(u=>{
-          if(!u.isActive()||!isOwnedByMe(u,job.me)||job.pending.ids.has(u.id()))return false;
-          try{return u.warshipState().patrolTile===job.tile;}catch{return false;}
-        });
-        if(!created) {
-          if(Date.now()-job.pending.at>=5000)cancelWarships('군함 건조 반영을 확인하지 못해 중단했습니다. 자동으로 재전송하지 않습니다');
-          else {warshipProgress.phase='confirming';warshipProgress.message='요청한 군함이 게임에 생성되는지 확인 중';}
-          return;
-        }
-        job.confirmed++;warshipProgress.confirmed++;job.pending=null;
-        if(job.confirmed===job.want) {
-          warshipQueue.shift();
-          if(!warshipQueue.length) {
-            warshipProgress.phase='complete';warshipProgress.message=`군함 ${warshipProgress.confirmed}척 건조 반영 확인`;
-            toast(warshipProgress.message,'#7ee787');return;
-          }
-          warshipProgress.phase='queued';warshipProgress.message='다음 클릭 위치의 군함을 순서대로 건조합니다';return;
-        }
-      }
-      const wait=rateGate();
-      if(wait>0) {
-        delay=wait*1000+80;warshipProgress.phase='rate-wait';
-        warshipProgress.message=`명령 한도 대기 · 약 ${wait}초 후 이어서 건조합니다`;return;
-      }
-      warshipProgress.phase='checking';warshipProgress.message='해당 수역의 항구와 군함 가격 확인 중';
-      let timeout;
-      const query=typeof job.me.buildables==='function'?job.me.buildables(job.tile,['Warship']):job.me.actions?.(job.tile,['Warship']);
-      const result=await Promise.race([Promise.resolve(query),new Promise((_,reject)=>{
-        timeout=setTimeout(()=>reject(Error('군함 건조 조건 조회 시간 초과')),1500);
-      })]).finally(()=>clearTimeout(timeout));
-      if(!live())return;
-      if(document.hidden||getGameView()!==job.game||job.game.myPlayer()!==job.me) {cancelWarships('게임 상태가 바뀌어 군함 대기열을 중단했습니다');return;}
-      const row=(Array.isArray(result)?result:result?.buildableUnits)?.find(u=>u.type==='Warship');
-      if(!row||!((typeof row.cost==='bigint'&&row.cost>=0n)||(Number.isSafeInteger(row.cost)&&row.cost>=0)))
-        throw Error('게임에서 군함 가격을 확인할 수 없습니다');
-      if(BigInt(job.me.gold())<BigInt(row.cost))throw Error(`골드 부족 · 다음 군함에 ${BigInt(row.cost).toLocaleString()}골드 필요`);
-      if(typeof row.canBuild!=='number'||!Number.isInteger(row.canBuild)||row.canBuild<0)
-        throw Error('이 위치에서 군함을 건조할 수 없습니다. 같은 수역의 완성된 항구와 게임 제한을 확인하세요');
-      // Other hotkeys can use capacity while the engine worker answers.
-      const waitAgain=rateGate();
-      if(waitAgain>0){delay=waitAgain*1000+80;warshipProgress.phase='rate-wait';warshipProgress.message='명령 한도 회복 후 이어서 건조합니다';return;}
-      job.pending={at:Date.now(),ids:new Set(job.game.units('Warship').map(u=>u.id()))};
-      job.bus.emit(new job.ctor('Warship',job.tile,undefined,1));rateUse();
-      warshipProgress.sent++;warshipProgress.phase='confirming';warshipProgress.message='요청한 군함이 게임에 생성되는지 확인 중';
-      delay=Math.max(120,CFG.warshipDelayMs|0);
-    } catch(error) {if(live())cancelWarships('군함 건조 중단: '+error.message);}
-    finally {if(epoch===warshipEpoch){warshipBusy=false;if(warshipQueue.length)scheduleWarships(delay);}}
-  }
   function requestWarships() {
-    if(typeof plannerState!=='undefined'&&(plannerState.run||plannerState.pending?.execute)) {
-      toast('공격 계획 실행 중입니다. Esc로 끝낸 뒤 군함을 건조하세요','#ffd166');return;
+    const game = getGameView();
+    const bus = getEventBus();
+    if (!game || !bus) { toast("❌ 게임 시작 후 사용하세요", "#ff5555"); return; }
+    const me = game.myPlayer();
+    if (!me) { toast("❌ 플레이어 정보 없음", "#ff5555"); return; }
+    const ctor = findNukeEventCtor();   // build_unit 인텐트와 동일 클래스
+    if (!ctor) { toast("❌ 건조 경로 없음 (게임 시작 후 재시도)", "#ff5555"); return; }
+    const tile = computeCursorTile();
+    if (tile === null) { toast("❌ 커서 위치 인식 실패", "#ff5555"); return; }
+
+    // 바다인지 확인 (군함은 물에만 건조 가능)
+    try {
+      if (typeof game.isLand === "function" && game.isLand(tile)) {
+        toast("❌ 바다를 클릭하세요 (군함은 육지에 못 띄웁니다)", "#ffaa00");
+        setArmed(false);   // 실패했으면 무장 해제
+        return;
+      }
+    } catch (e) {}
+
+    // 항구 보유 확인 — 없으면 서버가 조용히 실패한다
+    let portCount = 0;
+    try {
+      portCount = game.units("Port").filter((u) => {
+        try { return isOwnedByMe(u, me); } catch (e) { return false; }
+      }).length;
+    } catch (e) {}
+    if (portCount === 0) {
+      toast("❌ 항구가 없습니다 — 군함은 항구에서만 건조됩니다", "#ff5555");
+      setArmed(false);   // 실패했으면 무장을 풀어 사용자가 상태를 알 수 있게
+      return;
     }
-    const game=getGameView(),bus=getEventBus(),me=game?.myPlayer(),ctor=findNukeEventCtor(),tile=computeCursorTile();
-    if(!game||!bus||!me||!ctor){toast('게임 시작 후 군함을 건조하세요','#ffd166');return;}
-    if(tile===null||tile===undefined||game.isLand?.(tile)) {toast('군함을 보낼 바다를 클릭하세요','#ffd166');return;}
-    if(!game.units('Port').some(u=>u.isActive()&&!u.isUnderConstruction()&&isOwnedByMe(u,me))) {
-      toast('사용할 수 있는 완성된 항구가 없습니다','#ffd166');return;
+
+    const want = Math.max(1, Math.min(CFG.warshipCount | 0, CFG.warshipMaxCount));
+    const baseDelay = Math.max(110, CFG.warshipDelayMs | 0);   // 초당 10개 제한(100ms) 대비 여유
+
+    // 분당·초당 한도에 여유가 없으면 잠시 기다렸다가 다시 시도한다
+    const room = rateDelayFor(want);
+    if (room.allowed <= 0) {
+      const wait = room.waitSec || rateGate() || 1;
+      // 초당 한도는 짧게 기다리면 풀리므로 자동 재시도 (분당 소진은 길어서 포기)
+      if (wait <= 3) {
+        toast(`⏳ 서버 한도 — ${wait}초 후 자동 재시도`, "#ffd166");
+        setTimeout(() => { try { requestWarships(); } catch (e) {} }, wait * 1000 + 80);
+      } else {
+        toast(`⏳ 서버 한도 소진 — 약 ${wait}초 후 다시 시도하세요`, "#ffaa00");
+        setArmed(false);
+      }
+      return;
     }
-    if(warshipQueue.length&&warshipQueue[0].game!==game)cancelWarships('게임이 바뀌어 이전 군함 대기열을 취소했습니다');
-    if(!warshipQueue.length)warshipProgress={sent:0,confirmed:0,phase:'queued',message:''};
-    const want=Math.max(1,Math.min(CFG.warshipCount|0,CFG.warshipMaxCount));
-    warshipQueue.push({game,me,bus,ctor,tile,want,confirmed:0,pending:null});
-    if(typeof plannerCancelJob==='function')plannerCancelJob();
-    toast(`군함 ${want}척 대기열 추가 · 남은 ${warshipStatus().remaining}척 (Esc: 취소)`,'#7ee787');
-    if(!warshipBusy&&warshipTimer===null)pumpWarships();
+    const count = room.allowed;
+    // 남은 분당 여유에 맞춰 간격을 늘린다 (최소 간격 유지)
+    const minGap = Math.ceil(60000 / Math.max(1, RL.perMinute - 5));
+    const delay = Math.max(baseDelay, minGap);
+    if (count < want) {
+      toast(`🚢 한도로 ${want}척 중 ${count}척만 건조합니다`, "#ffd166");
+    }
+
+    let sent = 0;
+    for (let i = 0; i < count; i++) {
+      setTimeout(() => {
+        try {
+          // amount 는 서버가 군함에 대해 무시하므로 1로 보낸다
+          bus.emit(new ctor("Warship", tile, undefined, 1));
+          rateUse();
+          sent++;
+          if (sent === count) {
+            toast(`🚢 군함 ${count}척 건조 요청 완료 (항구 ${portCount}곳)`, "#7ee787");
+          }
+        } catch (e) {
+          console.warn("[x50] 군함 건조 emit 실패:", e);
+          toast("❌ 군함 건조 발송 실패", "#ff5555");
+        }
+      }, i * delay);
+    }
+    if (count > 1) toast(`🚢 군함 ${count}척 건조 시작…`, "#7ee787");
   }
 
-  // 인텐트 속도 제한: 초당·분당 여유를 전송 직전에 확인한다.
+  // ═════════════════════════════════════════════
+  // 인텐트 속도 제한 (서버와 동일한 규칙을 클라이언트에서 미리 계산)
+  //
+  // 게임 서버(ClientMsgRateLimiter): 초당 10개 AND 분당 150개.
+  // 둘 다 통과해야 하며, 초과분은 통보 없이 조용히 버려진다(킥 아님).
+  // 분당 버킷은 시간이 아니라 '분 경계'에서 리셋되므로, 소진하면
+  // 최대 60초간 아무것도 안 먹히는 것처럼 보인다.
+  //   → 여기서 미리 세어 한도에 닿으면 발사를 막고 남은 시간을 알려준다.
+  // ═════════════════════════════════════════════
   const RL = {
     perSecond: 10,
     perMinute: 150,
@@ -3657,69 +3477,100 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
     };
   }
 
-  // Freeze target, mode and quantity at each click. Only one selection/send/ACK
-  // chain runs at a time, even for different structures or mixed V/X clicks.
-  function upgradeStatus() {return {running:upgradeQueue.length>0,batches:upgradeQueue.length,target:upgradeQueue[0]?.id??null};}
   function requestUpgrade(big) {
-    if(typeof plannerState!=='undefined'&&(plannerState.run||plannerState.pending?.execute))return;
-    const game=getGameView(),me=game?.myPlayer(),tile=computeCursorTile();
-    if(!game||!me||tile===null||tile===undefined||document.hidden)return;
-    const hit=nearestOwn(game,me,tile,CFG.upgradableTypes,15);
-    if(!hit){toast('클릭 위치에 업그레이드 가능한 내 구조물이 없습니다','#ffd166');return;}
-    const u=hit.unit,type=u.type(),want=CFG.mode==='set'?targetFor(type):addFor(type,big);
-    if(!Number.isSafeInteger(want)||want<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');return;}
-    if(upgradeQueue.length&&upgradeQueue[0].game!==game)cancelUpgrades();
-    upgradeQueue.push({game,me,tile,id:u.id(),type,big,mode:CFG.mode,want});
-    if(typeof plannerCancelJob==='function')plannerCancelJob();
-    toast(`${big?'X':'V'} 업그레이드 대기열 추가 · ${upgradeQueue.length}묶음 (Esc: 남은 작업 취소)`,'#7ee787');
-    pumpUpgradeQueue();
-  }
-  async function pumpUpgradeQueue() {
-    if(upgradeSelectionPending||!upgradeQueue.length)return;
+    if(upgradeSelectionPending)return;
     upgradeSelectionPending=true;
-    const epoch=upgradeEpoch,entry=upgradeQueue[0];
-    try {
-      const complete=await selectUpgrade(entry.big,epoch,entry);
-      if(epoch!==upgradeEpoch)return;
-      if(!complete){cancelUpgrades();toast('업그레이드 적용을 완료하지 못해 남은 대기열을 중단했습니다. 자동 재전송하지 않습니다','#ffaa00');return;}
-      upgradeQueue.shift();
-    } catch(e) {
-      if(epoch===upgradeEpoch){cancelUpgrades();toast('업그레이드 대기열 중단: '+e.message,'#ffaa00');}
-    } finally {
-      if(epoch===upgradeEpoch){upgradeSelectionPending=false;if(upgradeQueue.length)pumpUpgradeQueue();}
-    }
+    const epoch=upgradeEpoch;
+    selectUpgrade(big,epoch).catch(e=>{console.warn('[x50] 업그레이드 대상 확인 실패',e);})
+      .finally(()=>{if(epoch===upgradeEpoch)upgradeSelectionPending=false;});
   }
-  async function selectUpgrade(big,epoch,entry) {
-    const {game,me,id,type,tile}=entry;
-    const valid=()=>{
-      const u=game.unit?.(id);
-      return epoch===upgradeEpoch&&getGameView()===game&&game.myPlayer()===me&&!document.hidden&&
-        u&&u.type()===type&&u.isActive?.()!==false&&isOwnedByMe(u,me)&&!u.isUnderConstruction?.();
+  async function selectUpgrade(big,epoch) {
+    const game = getGameView();
+    const bus = getEventBus();
+    if (!game || !bus) { toast("❌ 게임 시작 후 사용하세요", "#ff5555"); return; }
+    const me = game.myPlayer();
+    if (!me) { toast("❌ 플레이어 정보 없음", "#ff5555"); return; }
+    const ctor = findUpgradeEventCtor();
+    if (!ctor) { toast("❌ 업그레이드 경로 없음 (게임 시작 후 재시도)", "#ff5555"); return; }
+    const tile = computeCursorTile();
+    if (tile === null) { toast("❌ 커서 위치 인식 실패", "#ff5555"); return; }
+
+    const types = CFG.upgradableTypes;
+    const maxDist = 15; // 게임 structureMinDist와 동일
+
+    // 폴백: 게임 판정을 못 쓸 때 직접 최근접 탐색
+    const direct = () => {
+      const hit = nearestOwn(game, me, tile, types, maxDist);
+      if (hit) { fireUpgrade(hit.unit.id(), hit.unit.type(), null, me, bus, ctor, big); return; }
+      const dp = nearestOwn(game, me, tile, ["Defense Post"], maxDist);
+      if (dp) { toast("ℹ️ 디펜스 포스트는 업그레이드할 수 없습니다", "#ffaa00"); return; }
+      toast(`❌ 반경 ${maxDist}타일 내 업그레이드 가능한 내 구조물 없음`, "#ffaa00");
     };
-    if(!valid())throw Error('저장한 구조물이 없어졌거나 소유권·건설 상태가 바뀌었습니다');
-    const bus=getEventBus(),ctor=findUpgradeEventCtor();
-    if(!bus||!ctor)throw Error('업그레이드 전송 경로를 확인할 수 없습니다');
-    const query=typeof me.buildables==='function'?me.buildables(tile,[type]):me.actions?.(tile,[type]);
-    // Legacy clients without the official asynchronous API retain the explicit
-    // frozen-unit path. A failed/negative official response never bypasses it.
-    if(!query||typeof query.then!=='function')return fireUpgrade(id,type,null,me,bus,ctor,big,entry);
-    let timeout,result;
+
+    // 1순위: 게임 공식 판정 (buildables → canUpgrade = 업그레이드 대상 유닛 id)
+    let p = null;
     try {
-      result=await Promise.race([query,new Promise((_,reject)=>{
-        timeout=setTimeout(()=>reject(Error('업그레이드 대상 조회 시간 초과')),1500);
-      })]);
-    } finally {clearTimeout(timeout);}
-    if(!valid())return false;
-    const row=(Array.isArray(result)?result:result?.buildableUnits)?.find(r=>r.type===type);
-    if(!row||row.canUpgrade!==id)throw Error('저장한 구조물을 지금 강화할 수 없습니다. 골드·건설 상태를 확인하세요');
-    return fireUpgrade(id,type,row,me,bus,ctor,big,entry);
+      if (typeof me.buildables === "function") p = me.buildables(tile, types);
+      else if (typeof me.actions === "function") p = me.actions(tile, types);
+    } catch (e) { p = null; }
+
+    if (!p || typeof p.then !== "function") { direct(); return; }
+
+    let res;
+    try{res=await p;}catch{if(epoch===upgradeEpoch&&getGameView()===game)direct();return;}
+    if(epoch!==upgradeEpoch||getGameView()!==game)return;
+    {
+      const arr = Array.isArray(res) ? res : (res && res.buildableUnits) || [];
+      // canUpgrade가 살아있는 행들 중 클릭 지점에서 가장 가까운 구조물 선택
+      let bestId = null, bestType = null, bestRow = null, bestD = Infinity;
+      for (const row of arr) {
+        if (!row || row.canUpgrade === false) continue;
+        let d = Infinity;
+        try {
+          // game.unit(id) 없으면 전체 유닛에서 찾는다
+          let u = null;
+          if (typeof game.unit === "function") u = game.unit(row.canUpgrade);
+          if (!u) {
+            for (const cand of game.units(row.type)) {
+              try { if (cand.id() === row.canUpgrade) { u = cand; break; } } catch (e) {}
+            }
+          }
+          if (u) d = game.manhattanDist(tile, u.tile());
+        } catch (e) {}
+        if (d < bestD) { bestD = d; bestId = row.canUpgrade; bestType = row.type; bestRow = row; }
+      }
+      if (bestId !== null) { fireUpgrade(bestId, bestType, bestRow, me, bus, ctor, big); return; }
+
+      // 업그레이드 대상이 없음 → 사유를 정확히 안내
+      const hit = nearestOwn(game, me, tile, types, maxDist);
+      if (hit) {
+        try {
+          if (typeof hit.unit.isUnderConstruction === "function" && hit.unit.isUnderConstruction()) {
+            toast(`⏳ ${koName(hit.unit.type())} 건설 중 — 완료 후 다시 시도`, "#ffaa00");
+            return;
+          }
+        } catch (e) {}
+        // 골드 부족 여부 판정
+        let row = null;
+        for (const r of arr) { if (r && r.type === hit.unit.type()) { row = r; break; } }
+        if (row && row.cost !== undefined && toBig(row.cost) > toBig(me.gold())) {
+          toast(`❌ 골드 부족 — ${koName(hit.unit.type())} 다음 강화에 ${String(row.cost)} 필요`, "#ff5555");
+          return;
+        }
+        fireUpgrade(hit.unit.id(), hit.unit.type(), row, me, bus, ctor, big);
+        return;
+      }
+      const dp = nearestOwn(game, me, tile, ["Defense Post"], maxDist);
+      if (dp) { toast("ℹ️ 디펜스 포스트는 업그레이드할 수 없습니다", "#ffaa00"); return; }
+      toast(`❌ 반경 ${maxDist}타일 내 업그레이드 가능한 내 구조물 없음`, "#ffaa00");
+    }
   }
 
   // ── 무장 상태 클릭 가로채기 (캡처 단계 → 게임보다 먼저) ──
   // 무장은 클릭해도 풀리지 않는다 — V/N을 다시 누르거나 Esc 로만 해제.
   // (여러 구조물을 연속으로 올릴 때 매번 키를 다시 누르지 않도록)
   window.addEventListener("pointerdown", (e) => {
-    if (!armed || hudEl?.contains(e.target)) return;
+    if (!armed) return;
     if (e.button !== 0) return;
     lastMouse = { x: e.clientX, y: e.clientY };
     const mode = armedMode;   // 이번 클릭 처리 후에도 유지
@@ -3748,12 +3599,12 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
     clearTimeout(idleTimer);
     if (v) {
       if (armedMode === "warship") {
-        toast(`🚢 군함 무장 ON — 바다를 클릭하면 ${CFG.warshipCount}척 건조 (N: 배치 모드 해제 / Esc: 대기열 취소)`, "#7ee787");
+        toast(`🚢 군함 무장 ON — 바다를 클릭하면 ${CFG.warshipCount}척 건조 (N/Esc: 해제)`, "#7ee787");
       } else if (armedMode === "upgradeBig") {
         const silo = (CFG.addLevelsByTypeBig && CFG.addLevelsByTypeBig["Missile Silo"]) || CFG.addLevelsBig;
-        toast(`🚀 업그레이드(大) 무장 ON — 클릭당 +${CFG.addLevelsBig} (사일로 +${silo}) (X: 모드 해제 / Esc: 대기열 취소)`, "#7ee787");
+        toast(`🚀 업그레이드(大) 무장 ON — 클릭당 +${CFG.addLevelsBig} (사일로 +${silo}) (X/Esc: 해제)`, "#7ee787");
       } else {
-        toast("🎯 업그레이드 무장 ON — 구조물을 계속 클릭하세요 (V: 모드 해제 / Esc: 대기열 취소)", "#7ee787");
+        toast("🎯 업그레이드 무장 ON — 구조물을 계속 클릭하세요 (V/Esc: 해제)", "#7ee787");
       }
       scheduleIdleDisarm();
     } else {
@@ -3785,7 +3636,7 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   window.addEventListener(
     "keydown",
     (e) => {
-      if(e.code==='Escape'){cancelUpgrades();cancelWarships();if(armed)setArmed(false);}
+      if(e.code==='Escape'){cancelUpgrades();if(armed)setArmed(false);}
       if (isTypingTarget(e.target)) return;
       if (plannerKeyGuard(e)) return;
       if(e.repeat&&[CFG.hotkeyUpgrade,CFG.hotkeyUpgradeBig,CFG.hotkeyWarship].includes(e.code)) {
@@ -4130,9 +3981,9 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
       if (!r.ok) {
         rate += `\n⏳ 리밋 해제까지 ${r.left.toFixed(1)}초 (80%↑)`;
       } else {
-        rate += "\n요청 한도 여유 (공격 분석과 별개)";
+        rate += "\n✅ 사용 가능 (80%↑)";
       }
-      plannerRenderHud(el, r);
+      el.textContent = hudTargetLine() + "\n" + rate;
       el.style.display = "block";
     } catch (e) {}
     hudTimer = setTimeout(hudTick, 200);
@@ -4169,226 +4020,17 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
     } catch (e) {}
   }
 
-// Shared rolling-window gate for the I dispatcher. Hydrogen also costs one
-// request; counts are intents, not missiles. Return milliseconds until room.
-function strikeRateDelay(rate,now) {
-  const delay=(entries,span,cap)=>{
-    const active=entries.filter(t=>now-t<span).sort((a,b)=>a-b);
-    return active.length<cap?0:Math.max(0,active[active.length-cap]+span-now);
-  };
-  return Math.max(delay(rate.secWindow,1000,rate.perSecond),
-    delay(rate.minWindow,60000,rate.perMinute-5));
-}
-
-// PlayerView intentionally lacks Player.unitsOwned / unitsConstructed. Prices
-// must come from the engine worker's buildables query, as the game's UI does.
-function createPriceReader({now=()=>Date.now(),refreshMs=2000,maxAgeMs=5000,timeoutMs=1500,onUpdate=()=>{}}={}) {
-  const cache=new WeakMap(),types=['Atom Bomb','Hydrogen Bomb'];
-  function entry(game,player) {
-    let e=cache.get(game);
-    if(!e||e.player!==player){e={player,at:-Infinity,retryAt:0,values:null,error:null,pending:null};cache.set(game,e);}
-    return e;
-  }
-  function refresh(game,player,force=false) {
-    const e=entry(game,player);
-    if(e.pending)return e.pending;
-    if(!force&&e.values&&!e.error&&now()-e.at<refreshMs)return Promise.resolve(e.values);
-    if(!force&&now()<e.retryAt)return Promise.reject(e.error??Error('무기 가격 조회 대기 중'));
-    let timer;
-    e.pending=Promise.race([
-      Promise.resolve().then(()=>{
-        if(typeof player.buildables==='function')return player.buildables(undefined,types);
-        if(typeof player.actions==='function')return player.actions(undefined,types);
-        throw Error('클라이언트에 무기 가격 조회 API가 없습니다');
-      }),
-      new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('무기 가격 조회 시간 초과')),timeoutMs);}),
-    ]).then(result=>{
-      const rows=Array.isArray(result)?result:result?.buildableUnits;
-      if(!Array.isArray(rows))throw Error('무기 가격 응답 형식을 확인할 수 없습니다');
-      const values={};
-      for(const type of types){
-        const v=rows.find(row=>row.type===type)?.cost;
-        if(!((typeof v==='bigint'&&v>=0n)||(typeof v==='number'&&Number.isSafeInteger(v)&&v>=0)))
-          throw Error(type+' 가격 정보가 없거나 올바르지 않습니다');
-        values[type]=BigInt(v);
-      }
-      e.values=values;e.at=now();e.error=null;return values;
-    }).catch(error=>{e.error=error;e.retryAt=now()+1000;throw error;})
-      .finally(()=>{clearTimeout(timer);e.pending=null;onUpdate();});
-    return e.pending;
-  }
-  function read(game,player) {
-    const e=entry(game,player);
-    if(now()-e.at>=refreshMs&&!e.pending&&now()>=e.retryAt)refresh(game,player).catch(()=>{});
-    if(e.error)throw Error('무기 가격 확인 실패: '+e.error.message);
-    if(!e.values||now()-e.at>maxAgeMs)throw Error('게임에서 무기 가격을 조회 중입니다');
-    return e.values;
-  }
-  return {read,refresh};
-}
-
-// Presentation only. Never changes a plan, its acceptance, or execution limits.
-function resultPresentation(r,s={}) {
-  const n=value=>Number(value??0).toLocaleString('ko-KR');
-  let title,tone,reason,action;
-  if(r.chosen) {
-    title=r.mode==='mixed'?'수소 혼합 공격 추천':'원자 집중 공격 추천';tone='ready';
-    reason=r.mode==='mixed'?'원자탄과 수소탄을 섞어 보내는 계획입니다.':'원자탄만 보내는 계획입니다.';
-    action='I를 누르면 최신 상태로 확인한 뒤 발사합니다.';
-  } else {
-    tone='caution';title=r.limited?'미리보기에서 아직 확인 못했습니다':'돌파 계획을 찾지 못했습니다';
-    reason='발사 수량·순서를 바꿔 시험했지만 통과를 확인하지 못했습니다.';
-    action='사일로 레벨·위치와 재장전 상태를 확인하세요.';
-    if(r.limited) {reason='화면 갱신용 짧은 계산에서 결론이 나지 않았습니다. 공격 불가 판정은 아닙니다.';action='I를 누르면 후보를 끝까지 검토합니다. 검증되면 발사합니다. Esc로 취소합니다.';}
-    else if(!r.silos.length||s.silos?.every(u=>u.building)) {reason='사용할 수 있는 완성된 사일로가 없습니다.';action='사일로를 건설하거나 완공될 때까지 기다리세요.';}
-    else if(s.allowed?.atomic===false&&s.allowed?.mixed===false) {reason='게임 규칙상 이 위치에는 핵무기를 발사할 수 없습니다.';action='목표 위치를 바꿔 다시 확인하세요.';}
-    else if(s.gold!==undefined&&s.gold<s.atomCost&&s.gold<s.hydroCost) {reason='원자탄이나 수소탄을 살 골드가 부족합니다.';action='골드를 모은 뒤 다시 확인하세요.';}
-    else if(s.intentBudget===0) {reason='이 스크립트의 명령 전송 한도를 사용했습니다.';action='아래의 명령 한도가 회복될 때까지 기다리세요.';}
-    else if(!r.ready) {reason='현재 사일로의 발사관이 모두 재장전 중입니다.';action='재장전이 끝난 뒤 다시 확인하세요.';}
-    else if(r.failure?.tubeShortage) {reason=`시험한 공격에서 ${n(r.failure.tubeShortage)}발을 발사관 부족으로 보내지 못했습니다.`;action='사일로 레벨업·추가 건설 또는 재장전 대기를 검토하세요.';}
-    else if(r.failure?.blockedBy?.length) {reason='시험한 수소탄이 SAM에 요격됐습니다.';action='사일로 레벨·위치를 바꿀 필요가 있는지 상세에서 확인하세요.';}
-  }
-  const option=(name,plan)=>plan?{name,value:`원자 ${n(plan.atoms)}발${plan.hydros?` + 수소 ${n(plan.hydros)}발`:''}`,
-    note:`예상 도달: ${plan.hydroHits?`수소 ${n(plan.hydroHits)}발`:''}${plan.hydroHits&&plan.atomHits?' · ':''}${plan.atomHits?`원자 ${n(plan.atomHits)}발`:''}`,
-    chosen:plan===r.chosen}: {name,value:r.limited?'시간 내 확인 못함':'돌파 계획 미확인',note:'',chosen:false};
-  return {title,tone,reason,action,options:[option('수소 + 원자',r.mixed),option('원자만',r.atomic)],
-    resources:`내 사일로 ${n(r.silos.length)}기 · 재장전 완료 ${n(r.ready)}발분`,
-    defense:`지도 전체에서 SAM ${n(r.sams.length)}기 검토`,
-    limit:`원자 최대 ${n(r.maxAtoms)}발 범위에서 계산`};
-}
-
-  // Stable DOM: update only changed text, retaining the detail scroll position.
-  function plannerHudEnsure(el) {
-    if(el._plannerHud)return el._plannerHud;
-    el.id='of-strike-hud';el.setAttribute('role','region');el.setAttribute('aria-label','공격 분석');
-    Object.assign(el.style,{padding:'16px',borderRadius:'12px',width:'370px',maxWidth:'calc(100vw - 16px)',
-      maxHeight:'min(80vh,680px)',boxSizing:'border-box',background:'#101820',color:'#edf3f8',
-      border:'1px solid #53616e',textShadow:'none',whiteSpace:'normal',wordBreak:'keep-all',font:'400 14px/1.55 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif',overflow:'hidden'});
-    const style=document.createElement('style');style.textContent=`
-      #of-strike-hud *{box-sizing:border-box}
-      #of-strike-hud p{margin:0} #of-strike-hud [hidden]{display:none!important}
-      #of-strike-hud .of-title{font-size:18px;font-weight:700;line-height:1.4;overflow-wrap:anywhere}
-      #of-strike-hud[data-tone="ready"] .of-title{color:#a6e4bf}
-      #of-strike-hud[data-tone="caution"] .of-title{color:#f4d49a}
-      #of-strike-hud[data-tone="error"] .of-title{color:#ffc1b9}
-      #of-strike-hud .of-reason{margin-top:6px;color:#d5e0e9;overflow-wrap:anywhere}
-      #of-strike-hud .of-action{margin-top:10px;font-weight:600;overflow-wrap:anywhere}
-      #of-strike-hud .of-options{margin:14px 0 12px;border-top:1px solid #354450}
-      #of-strike-hud .of-option{display:grid;grid-template-columns:86px minmax(0,1fr);gap:8px;padding:8px 0;border-bottom:1px solid #354450}
-      #of-strike-hud .of-label{color:#b9cbd9} #of-strike-hud .of-value{font-weight:600;overflow-wrap:anywhere}
-      #of-strike-hud .of-note{color:#b9cbd9;font-size:12px}
-      #of-strike-hud .of-meta{color:#b9cbd9;font-size:12px;margin-top:3px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-      #of-strike-hud .of-refresh{min-height:38px;color:#b9cbd9;font-size:12px;margin-top:10px;overflow-wrap:anywhere}
-      #of-strike-hud .of-keys{margin-top:10px;padding-top:9px;border-top:1px solid #354450;color:#d5e0e9;font-size:12px}
-      #of-strike-hud .of-details{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;color:#d5e0e9;max-height:220px;overflow-y:auto;margin-top:12px;padding-right:4px;overscroll-behavior:contain}
-      #of-strike-hud .of-report{margin-top:10px;color:#f4d49a;font-size:12px;white-space:pre-line;overflow-wrap:anywhere}
-      #of-strike-hud .of-details:focus-visible{outline:2px solid #b9cbd9;outline-offset:2px}
-      @media(max-height:600px){#of-strike-hud{max-height:calc(100vh - 16px)!important}}
-    `;document.head.appendChild(style);
-    el.replaceChildren();
-    const add=(tag,cls,parent=el)=>{const node=document.createElement(tag);node.className=cls;parent.appendChild(node);return node;};
-    const title=add('p','of-title');title.setAttribute('aria-live','polite');title.setAttribute('aria-atomic','true');
-    const reason=add('p','of-reason'),action=add('p','of-action'),options=add('div','of-options');
-    const rows=[0,1].map(()=>{const row=add('div','of-option',options),label=add('span','of-label',row),body=add('div','',row);return {label,value:add('p','of-value',body),note:add('p','of-note',body)};});
-    const resources=add('p','of-meta'),defense=add('p','of-meta'),position=add('p','of-meta'),refresh=add('p','of-refresh'),report=add('p','of-report'),keys=add('p','of-keys'),rate=add('p','of-meta'),details=add('div','of-details');
-    details.tabIndex=0;details.setAttribute('role','region');details.setAttribute('aria-label','계산 근거와 사일로·SAM 배치 상세');
-    return el._plannerHud={title,reason,action,options,rows,resources,defense,position,refresh,report,keys,rate,details};
-  }
-
-  function plannerDetails(display,error='') {
-    const lines=[];
-    if(error)lines.push('오류 상세: '+error);
-    if(!display)return lines.join('\n');
-    const {result:r,snapshot:s}=display;
-    lines.push(`분석 위치 (${s.target.x}, ${s.target.y})`,
-      `성공 조건: 수소 1발 또는 원자 ${r.minAtomHits}발 도달`,
-      `원자 최대 ${r.maxAtoms.toLocaleString()}발까지 후보를 계산합니다. 최대 수량을 항상 발사한다는 뜻은 아닙니다.`,
-      '재장전 완료 1발분 = 지금 비어 있는 미사일 발사관 1개.',
-      'SAM 수는 지도 전체의 아군 외 검토 대상입니다. 목표 주변에 모두 있다는 뜻은 아닙니다.',
-      `비행 중 ${r.existingFlights}발 관측. 다른 공격의 방어 소모·SAM 파괴 효과는 성공 근거에서 제외합니다.`);
-    const building=s.sams?.filter(u=>u.building)??[];
-    if(building.length)lines.push(`건설 중 SAM ${building.length}기: 착공 확인 시 완공·가동 시간 반영, 시점 불명은 즉시 가동으로 계산`);
-    lines.push('발사 중 수소 구출 실패 시: 원자 폭발 반경 안 SAM 제거가 검증될 때만 원자 집중으로 전환. 목표 SAM이 없으면 중단.');
-    if(r.reason)lines.push('계산 결과: '+r.reason);
-    if(r.diagnostics?.length)lines.push(...r.diagnostics);
-    for(const [name,plan] of [['수소 + 원자',r.mixed],['원자만',r.atomic]])if(plan) {
-      lines.push(`${name}: 비용 ${plan.cost.toLocaleString()}골드 · ${plan.up?'위쪽':'아래쪽'} 궤적 · 계획 기준 약 ${(plan.lastArrival/10).toFixed(1)}초 후 도달`,
-        `사용 사일로 ${plan.usedSilos.length}기 · 이 계획에서 요격하는 SAM ${plan.participating.length}기`);
-    }
-    const used=new Set(r.chosen?.usedSilos??[]),sams=new Set(r.chosen?.participating??[]);
-    lines.push('','사일로 배치');
-    for(const u of r.silos)lines.push(`(${u.x}, ${u.y}) Lv${u.level} · 재장전 완료 ${u.ready}발분${used.has(u.id)?' · 추천 계획에 사용':''}`);
-    lines.push('','SAM 배치');
-    for(const u of r.sams) {const live=s.sams?.find(v=>v.id===u.id);lines.push(`(${u.x}, ${u.y}) Lv${u.level} · 요격 준비 ${u.ready}발분${sams.has(u.id)?' · 추천 계획에서 요격':''}${live?.building?(live.readyTick===undefined?' · 건설 시점 불명: 즉시 가동 가정':` · 약 ${Math.max(0,(live.readyTick-s.tick)/10).toFixed(1)}초 후 가동 (최대 0.2초 조기 가동도 검증)`):''}`);}
-    lines.push('','현재 상태의 예측입니다. 명중이나 최소 필요 레벨을 보장하지 않습니다.');
-    return lines.join('\n');
-  }
-
-  function plannerRenderHud(el,rate) {
-    plannerRefreshPreview();
-    const dom=plannerHudEnsure(el),p=plannerState,g=getGameView(),tile=computeCursorTile(),d=p.display,run=p.run;
-    let model={title:'목표 위치를 선택하세요',tone:'idle',reason:'게임 지도에 커서를 잠시 멈추세요.',action:'',options:[],resources:'',defense:''};
-    let refresh='',position='',report='';
-    const changed=!!d&&(d.snapshot.tile!==tile||d.snapshot.game!==g?.gameID());
-    if(d) {
-      model=resultPresentation(d.result,d.snapshot);
-      position=`${changed?'이전 분석 위치':'목표 위치'} (${d.snapshot.target.x}, ${d.snapshot.target.y})`;
-      refresh=changed?'커서를 멈추면 새 위치를 분석합니다.':p.pending?'재계산 중 · 직전 결과를 표시하고 있습니다.':`${Math.max(0,Math.floor((Date.now()-d.updated)/1000))}초 전 계산 · 현재 상태의 예측`;
-      if(changed){model={...model,title:'이전 위치 · '+model.title,tone:'idle',action:'새 위치를 확인한 뒤 I로 분석·발사하세요.'};}
-    } else if(p.pending) {model.title='공격 방법을 계산하고 있습니다';model.reason='이 위치에 도달할 수 있는 원자·수소 공격을 비교합니다.';model.action='Esc로 계산을 취소할 수 있습니다.';}
-    if(p.pending?.execute&&!run) {refresh=p.pending.kind==='prices'?'발사 준비 · 가격 확인 중':p.pending.kind==='advice'?'다음 공격에 필요한 조건 확인 중':p.pending.kind==='retry'?p.pending.message:p.pending.kind==='search'?`후보 ${p.pending.tested??0}개 검토 · ${Math.floor((Date.now()-p.pending.started)/1000)}초째 계속 계산 중 · Esc 취소`:`최신 상태 검증 중 · ${Math.floor((Date.now()-p.pending.started)/1000)}초 · Esc 취소`;model.action='선택한 목표를 확인 중입니다. 아직 발사하지 않았습니다.';}
-    if(p.error&&!run) {
-      const loading=/가격.*조회 중/.test(p.error);
-      model={...model,title:loading?'무기 가격을 확인하고 있습니다':'지금은 분석할 수 없습니다',tone:loading?'idle':'error',
-        reason:/not a function|undefined|TypeError/.test(p.error)?'게임 정보를 읽는 중 오류가 발생했습니다.':p.error,
-        action:loading?'가격을 받으면 자동으로 분석합니다.':'원인을 확인한 뒤 I로 다시 분석하세요. 오류 상세는 F8에 있습니다.',options:[]};
-      refresh=d?'이전 계산은 현재 상태의 추천으로 사용하지 않습니다.':'';
-    }
-    if(run) {
-      const phase={firing:'계획대로 발사 중',adapting:'방어가 바뀌어 계획 수정 중',observing:'발사 완료 · 도달 확인 중','waiting-ack':'게임의 발사 반영을 기다리는 중'}[run.phase];
-      model={title:phase,tone:run.phase==='adapting'?'caution':'ready',reason:run.reason,
-        action:'Esc를 누르면 아직 보내지 않은 발사를 멈춥니다.',options:[
-          {name:'발사한 수량',value:`원자 ${run.sentAtoms}발 + 수소 ${run.sentHydros}발`,note:`공격 전체 한도: 원자 ${run.atomLimit}발 · 수소 ${run.hydroLimit}발`},
-          {name:'도달 확인',value:`원자 ${run.hitAtoms}발 · 수소 ${run.hitHydros}발`,note:`게임에 반영된 발사 ${run.confirmed}/${run.sent}발 · 계획 수정 ${run.replans}회`}],resources:'',defense:''};
-      position=`고정 목표 (${run.current.target.x}, ${run.current.target.y})`;refresh='이미 발사한 미사일은 취소되지 않습니다.';
-    } else if(warshipQueue.length||(armed&&armedMode==='warship')) {
-      const ships=warshipStatus();
-      model={title:ships.running?(ships.phase==='rate-wait'?'군함 건조 · 한도 대기':'군함을 순서대로 건조 중'):'군함 배치 모드',
-        tone:ships.phase==='stopped'?'caution':'ready',reason:ships.message||`바다를 클릭할 때마다 군함 ${CFG.warshipCount}척을 대기열에 추가합니다.`,
-        action:'연속 클릭도 순서대로 처리합니다. Esc로 남은 요청을 취소합니다.',
-        options:[{name:'건조 반영',value:`${ships.confirmed}척 확인 / ${ships.sent}척 요청`,note:'요청 전송과 게임 생성 확인을 구분합니다.'},
-          {name:'남은 수량',value:`${ships.remaining}척 · ${ships.batches}묶음`,note:'클릭한 위치를 저장해 순서대로 처리합니다.'}],resources:'',defense:''};
-      position=ships.tile===null?'':`현재 배치 목표 (${g.x(ships.tile)}, ${g.y(ships.tile)})`;
-      refresh='N: 배치 모드 전환 · Esc: 남은 대기열 취소';
-    } else if(p.lastExecution)report=[p.lastExecution,p.advice].filter(Boolean).join('\n');
-    const set=(node,text)=>{text=String(text??'');if(node.textContent!==text)node.textContent=text;node.hidden=!text;};
-    el.dataset.tone=model.tone;
-    set(dom.title,model.title);set(dom.reason,model.reason);set(dom.action,model.action);
-    dom.options.hidden=!model.options.length;
-    dom.rows.forEach((row,i)=>{const value=model.options[i]??{};set(row.label,value.name);set(row.value,value.value);set(row.note,value.note);});
-    set(dom.resources,model.resources);set(dom.defense,model.defense);set(dom.position,position);set(dom.refresh,refresh);set(dom.report,report);
-    set(dom.keys,`F8 상세 ${plannerSettings.details?'닫기':'보기'}${p.pending||run?' · Esc 취소':''}`);
-    set(dom.rate,`명령 전송: 최근 1초 ${rate.secUsed}/${rate.secCap}건 · 1분 ${rate.minUsed}/${rate.minCap}건${rate.ok?'':` · 한도 여유 회복까지 ${Math.ceil(rate.left)}초`}`);
-    const detailKey=[d,p.error,plannerSettings.details];
-    if(!dom.detailKey||detailKey.some((v,i)=>v!==dom.detailKey[i])) {set(dom.details,plannerSettings.details?plannerDetails(d,p.error):'');dom.detailKey=detailKey;}
-    el.style.pointerEvents=plannerSettings.details?'auto':'none';el.style.overflowY='auto';
-  }
-
   // Predictive I/HUD integration. The old manual H/J/Z/etc. remain available.
   const plannerSettings = {maxAtoms:2000,maxHydros:1,minAtomHits:1,budgetMs:1800,maxTicks:1200,
-    adaptiveBudgetMs:350,maxReplans:Infinity,details:false};
+    adaptiveBudgetMs:350,maxReplans:12,details:false};
   const plannerState = {worker:null,job:0,pending:null,tile:null,game:null,result:null,
-    snapshot:null,display:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
+    snapshot:null,error:'',updated:0,stableAt:0,run:null,timer:null,lastExecution:'',advice:null};
   const plannerPaths=new WeakMap();
-  const plannerPrices=createPriceReader({onUpdate:()=>{plannerState.updated=0;}});
-
-  const plannerConstructionEpoch=new WeakMap();
 
   function plannerSnapshot(tile) {
     const g=getGameView(), me=g?.myPlayer();
     if(!g||!me||tile===null||tile===undefined) throw Error('게임에서 목표 위치에 커서를 올리세요');
     const cfg=g.config(), tick=g.ticks();
-    const prices=plannerPrices.read(g,me);
     if(typeof cfg.isReplay==='function'&&cfg.isReplay()) throw Error('리플레이에서는 공격을 실행하지 않습니다');
     if(g.inSpawnPhase()||g.isSpawnImmunityActive()) throw Error('시작 보호 시간이 끝난 후 분석합니다');
     if(g.isImpassable(tile)) throw Error('이 지형에는 핵무기를 발사할 수 없습니다');
@@ -4397,39 +4039,19 @@ function resultPresentation(r,s={}) {
     const read=(obj,name)=>{if(typeof obj[name]!=='function')throw Error('현재 게임에서 '+name+' 정보를 제공하지 않습니다');return obj[name]();};
     const rules={tickMs:read(cfg,'msPerTick'),samCooldown:read(cfg,'SAMCooldown'),siloCooldown:read(cfg,'SiloCooldown'),
       atomSpeed:cfg.nukeSpeed(ATOM),hydroSpeed:cfg.nukeSpeed(HYDRO),samSpeed:read(cfg,'defaultSamMissileSpeed'),
-      targetRange:read(cfg,'defaultNukeTargetableRange'),maxSamRange:read(cfg,'maxSamRange'),atomBlastRadius:cfg.nukeMagnitudes(ATOM).outer};
+      targetRange:read(cfg,'defaultNukeTargetableRange'),maxSamRange:read(cfg,'maxSamRange')};
     if(rules.tickMs!==100||![rules.atomSpeed,rules.hydroSpeed,rules.samSpeed].every(v=>Number.isInteger(v)&&v>0))
       throw Error('틱·미사일 속도 규칙이 변경되어 계산기 업데이트가 필요합니다');
     // Fail visibly when the pinned curve/targeting model's range law changes.
     if([1,5,20].some(l=>Math.abs(cfg.samRange(l)-(rules.maxSamRange-480/(l+5)))>1e-7))
       throw Error('SAM 사거리 규칙이 변경되어 계산기 업데이트가 필요합니다');
-    // GameView.units filters the whole unit map on every call. Enumerate once
-    // and preserve game order inside each type for all snapshot consumers.
-    const unitsByType=new Map();
-    for(const u of g.units()) {
-      if(!u.isActive())continue;
-      const type=u.type();let group=unitsByType.get(type);
-      if(!group)unitsByType.set(type,group=[]);group.push(u);
-    }
-    // Establish the baseline only after a complete, usable client snapshot.
-    // A price-loading or spawn-phase read must not make rejoined units look new.
-    if(!plannerConstructionEpoch.has(g))plannerConstructionEpoch.set(g,tick);
-    const units=type=>unitsByType.get(type)??[];
     const structural=u=>({id:u.id(),x:g.x(u.tile()),y:g.y(u.tile()),level:u.level(),
       queue:[...read(u,'missileTimerQueue')],building:u.isUnderConstruction(),owner:u.owner().smallID()});
-    const silos=units('Missile Silo').filter(u=>u.isActive()&&isOwnedByMe(u,me)).map(structural);
+    const silos=g.units('Missile Silo').filter(u=>u.isActive()&&isOwnedByMe(u,me)).map(structural);
     const sams=[];
-    for(const u of units('SAM Launcher')) {
+    for(const u of g.units('SAM Launcher')) {
       if(!u.isActive()||isOwnedByMe(u,me)||me.isOnSameTeam(u.owner())) continue;
       const sam=structural(u), state=u.state;
-      const start=state?.constructionStartTick;
-      // UnitView records first appearance, not server construction progress.
-      // Only starts after our baseline in this GameView are trusted. Reloaded
-      // or already-building structures remain conservatively active now.
-      if(sam.building&&Number.isInteger(start)&&start>plannerConstructionEpoch.get(g)&&start<=tick) {
-        const duration=cfg.unitInfo('SAM Launcher').constructionDuration;
-        if(Number.isInteger(duration)&&duration>=0)sam.readyTick=start+duration+2;
-      }
       // Include allies as potential defenders; nuclear blasts can break alliances.
       // SAMs anywhere on the map are considered, not only the target's 150 tiles.
       if(typeof u.samLauncherState==='function') {
@@ -4441,15 +4063,19 @@ function resultPresentation(r,s={}) {
       } else throw Error('SAM 업그레이드 상태를 읽을 수 없습니다. 현재 클라이언트는 지원되지 않습니다');
       sams.push(sam);
     }
-    const price=type=>prices[type];
+    const price=type=>{
+      const value=cfg.unitInfo(type).cost(g,me);
+      if(typeof value!=='bigint'&&!(typeof value==='number'&&Number.isSafeInteger(value))) throw Error('무기 가격을 읽을 수 없습니다');
+      return BigInt(value);
+    };
     const structures=['City','Factory','Port','Missile Silo','SAM Launcher','Defense Post'];
-    const teamStructures=structures.flatMap(type=>units(type)).filter(u=>u.isActive()&&me.isOnSameTeam(u.owner()));
+    const teamStructures=structures.flatMap(type=>g.units(type)).filter(u=>u.isActive()&&me.isOnSameTeam(u.owner()));
     const owner=g.owner(tile), ownTeam=owner?.isPlayer?.()&&me.isOnSameTeam(owner);
     const allowedFor=type=>!cfg.isUnitDisabled(type)&&!ownTeam&&!teamStructures.some(u=>dist2(target,{x:g.x(u.tile()),y:g.y(u.tile())})<=cfg.nukeMagnitudes(type).outer**2);
     const allowed={atomic:allowedFor(ATOM),mixed:allowedFor(HYDRO)};
     const inflight=[];
-    const samTargets=new Set(units('SAM Missile').filter(u=>u.isActive()).map(u=>u.state?.targetUnitId??u.targetUnit?.()?.id?.()));
-    for(const type of [ATOM,HYDRO,'MIRV Warhead']) for(const u of units(type)) {
+    const samTargets=new Set(g.units('SAM Missile').filter(u=>u.isActive()).map(u=>u.state?.targetUnitId??u.targetUnit?.()?.id?.()));
+    for(const type of [ATOM,HYDRO,'MIRV Warhead']) for(const u of g.units(type)) {
       if(!u.isActive()) continue;
       // Only confirmed launches from this operation are credited during adaptation.
       let ns; try{ns=u.nukeState();}catch{continue;}
@@ -4468,6 +4094,10 @@ function resultPresentation(r,s={}) {
     validateSnapshot(s); return s;
   }
 
+  function plannerFingerprint(s) {
+    return JSON.stringify([s.game,s.me,s.target,s.rules,s.atomCost.toString(),s.hydroCost.toString(),s.allowed,
+      s.silos.map(u=>[u.id,u.x,u.y,u.level,u.building]),s.sams.map(u=>[u.id,u.x,u.y,u.level,u.building,u.upgrade])]);
+  }
   function plannerStop(reason='사용자가 남은 발사를 중단했습니다') {
     plannerCancelJob();
     if(plannerState.timer!==null) clearTimeout(plannerState.timer);
@@ -4482,29 +4112,11 @@ function resultPresentation(r,s={}) {
     if(plannerState.pending) clearTimeout(plannerState.pending.timeout);
     plannerState.pending=null; plannerState.job++;
   }
-  // Long worker jobs may outlive the price cache. Refresh before reading the
-  // latest snapshot, retaining the same cancellation generation across await.
-  async function plannerFreshPrices(id) {
-    const game=getGameView(),me=game?.myPlayer();
-    plannerState.pending={id,execute:true,kind:'prices',timeout:null};
-    try {
-      if(!game||!me)throw Error('게임 정보를 읽을 수 없습니다');
-      await plannerPrices.refresh(game,me,true);
-      if(id!==plannerState.job)return false;
-      plannerState.pending=null;
-      return !document.hidden&&getGameView()===game;
-    }catch(e){
-      if(id===plannerState.job){plannerState.pending=null;plannerState.error=e.message;}
-      return false;
-    }
-  }
-
-  function plannerCompute(snapshot,execute=false,validationLead=10) {
+  function plannerCompute(snapshot,execute=false) {
     if(plannerState.run)return;
     plannerCancelJob();
     const id=plannerState.job;
     plannerState.error='';plannerState.result=null;plannerState.snapshot=snapshot;
-    if(plannerState.display?.snapshot.game!==snapshot.game)plannerState.display=null;
     plannerState.tile=snapshot.tile;plannerState.game=snapshot.game;
     const blob=new Blob([PLANNER_WORKER_SOURCE],{type:'text/javascript'}), url=URL.createObjectURL(blob);
     let worker;
@@ -4512,33 +4124,22 @@ function resultPresentation(r,s={}) {
     URL.revokeObjectURL(url);plannerState.worker=worker;
     const budgetMs=execute?Math.max(4000,plannerSettings.budgetMs):plannerSettings.budgetMs;
     const fail=message=>{if(id!==plannerState.job)return;plannerCancelJob();plannerState.error=message;plannerState.updated=Date.now();};
-    plannerState.pending={id,execute,kind:'search',started:Date.now(),tested:0,timeout:execute?null:setTimeout(()=>fail('미리보기 계산이 지연됐습니다. I로 끝까지 분석할 수 있습니다'),budgetMs+2000)};
+    plannerState.pending={id,execute,timeout:setTimeout(()=>fail('계산 시간이 초과되었습니다. I로 다시 분석하세요'),budgetMs+2000)};
     worker.onerror=e=>fail('계산 오류: '+e.message);
-    worker.onmessage=async event=>{
+    worker.onmessage=event=>{
       if(id!==plannerState.job)return;
-      const {result,error,progress}=event.data;
-      if(progress){Object.assign(plannerState.pending,progress);return;}
+      const {result,error}=event.data;
       clearTimeout(plannerState.pending.timeout);plannerState.pending=null;
       worker.terminate();plannerState.worker=null;
       if(error){plannerState.error='판정 불가: '+error;plannerState.updated=Date.now();return;}
-      if(execute&&!(await plannerFreshPrices(id)))return;
       if(getGameView()?.gameID()!==snapshot.game || (!execute&&computeCursorTile()!==snapshot.tile)) return;
-      if(execute)result.validationLead=validationLead;
       plannerState.result=result;plannerState.updated=Date.now();
-      plannerState.display={result,snapshot,updated:plannerState.updated};
       if(execute) {
-        if(!result.chosen) {
-          let fresh;try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
-          if(fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
-          if(planningStructureKey(fresh)!==planningStructureKey(snapshot,fresh.tick)) {
-            plannerRetry(snapshot,null,'계산 중 상태 변경 · 최신 상태에서 후보를 다시 탐색합니다',100,validationLead);return;
-          }
-          toast(result.reason,'#ffd166');return;
-        }
+        if(!result.chosen) {toast(result.reason,'#ffd166');return;}
         plannerExecute(snapshot,result);
       }
     };
-    worker.postMessage({id,snapshot:workerSnapshot(snapshot),options:{...plannerSettings,budgetMs,continuous:execute,initialTicks:execute?validationLead:3,allowNewHydro:plannerSettings.maxHydros>0}});
+    worker.postMessage({id,snapshot,options:{...plannerSettings,budgetMs,allowNewHydro:plannerSettings.maxHydros>0}});
   }
 
   function plannerJob(kind,data,budget,done,fail) {
@@ -4548,84 +4149,49 @@ function resultPresentation(r,s={}) {
     try{worker=new Worker(url);}catch(e){URL.revokeObjectURL(url);fail(e.message);return;}
     URL.revokeObjectURL(url);plannerState.worker=worker;
     const failed=message=>{if(id!==plannerState.job)return;plannerCancelJob();fail(message);};
-    plannerState.pending={id,execute:true,kind,started:Date.now(),timeout:Number.isFinite(budget)?setTimeout(()=>failed('계산 시간 초과'),budget+1500):null};
+    plannerState.pending={id,execute:true,kind,timeout:setTimeout(()=>failed('계산 시간 초과'),budget+1500)};
     worker.onerror=e=>failed(e.message);
-    worker.onmessage=async e=>{
+    worker.onmessage=e=>{
       if(id!==plannerState.job)return;
       clearTimeout(plannerState.pending.timeout);plannerState.pending=null;plannerState.worker=null;worker.terminate();
-      if(e.data.error){fail(e.data.error);return;}
-      if(kind==='assess'&&!(await plannerFreshPrices(id)))return;
-      done(e.data.result);
+      if(e.data.error)fail(e.data.error);else done(e.data.result);
     };
-    worker.postMessage({id,kind,...data,snapshot:workerSnapshot(data.snapshot)});
-  }
-
-  // I can use all ten requests in the shared second window. Other shortcut
-  // queues retain their own reserve policy; every send still records in RL.
-  function plannerRateDelay(now=Date.now()) {
-    RL.secWindow=RL.secWindow.filter(t=>now-t<1000);
-    RL.minWindow=RL.minWindow.filter(t=>now-t<60000);
-    return strikeRateDelay(RL,now);
-  }
-
-  // Retry the fixed I target without allowing a late response to resurrect an
-  // Esc-cancelled operation. A state change is a revalidation, not a user error.
-  function plannerRetry(snapshot,result,message,delay=100,validationLead=10) {
-    plannerCancelJob();const id=plannerState.job;
-    plannerState.pending={id,execute:true,kind:'retry',message,started:Date.now(),timeout:setTimeout(()=>{
-      if(id!==plannerState.job)return;
-      plannerState.pending=null;
-      try {
-        const fresh=plannerSnapshot(snapshot.tile);
-        if(document.hidden||fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
-        if(result)plannerExecute(fresh,result);else plannerCompute(fresh,true,validationLead);
-      }catch(e){plannerState.error=e.message;}
-    },delay)};
+    worker.postMessage({id,kind,...data});
   }
 
   // Freeze limits for the whole operation, including every later revision.
   function plannerExecute(snapshot,result) {
     let fresh;
     try{fresh=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
-    if(document.hidden||fresh.game!==snapshot.game||fresh.me!==snapshot.me)return;
-    if(result.chosen.actions.some(a=>a.type===HYDRO?fresh.allowed.mixed===false:fresh.allowed.atomic===false)){plannerRetry(snapshot,null,'목표의 발사 제한 변경 · 가능한 공격을 다시 확인합니다');return;}
-    const planToCheck=scheduledCandidate(result.chosen,result.validationLead??10);
-    plannerJob('assess',{snapshot:fresh,plan:planToCheck,options:{minAtomHits:plannerSettings.minAtomHits,maxTicks:plannerSettings.maxTicks,budgetMs:Infinity}},Infinity,check=>{
+    if(plannerFingerprint(fresh)!==plannerFingerprint(snapshot)) {
+      plannerState.error='계산 중 구조물·규칙이 바뀌었습니다. I로 다시 분석하세요';return;
+    }
+    plannerJob('assess',{snapshot:fresh,plan:result.chosen,options:{minAtomHits:plannerSettings.minAtomHits,budgetMs:2500}},2500,check=>{
+      if(!check.ok){plannerState.error='현재 상태에서 계획이 유효하지 않습니다. I로 다시 분석하세요';return;}
       let current;try{current=plannerSnapshot(snapshot.tile);}catch(e){plannerState.error=e.message;return;}
-      if(document.hidden||current.game!==snapshot.game||current.me!==snapshot.me)return;
-      if(planningStructureKey(current)!==planningStructureKey(fresh,current.tick)||!ownQueuesFollowClock(fresh,current)) {
-        plannerRetry(snapshot,result,'구조물·내 발사관 변경 · 기존 후보를 유지하며 재검증합니다');return;
+      if(current.tick-fresh.tick>2||plannerFingerprint(current)!==plannerFingerprint(fresh)||
+        JSON.stringify(current.silos.map(s=>s.queue))!==JSON.stringify(fresh.silos.map(s=>s.queue))||
+        JSON.stringify(current.sams.map(s=>s.queue))!==JSON.stringify(fresh.sams.map(s=>s.queue))) {
+        plannerState.error='발사 직전 상태가 변했습니다. I로 다시 분석하세요';return;
       }
-      if(!check.ok){
-        const alternative=[result.mixed,result.atomic].find(p=>p&&p!==result.chosen);
-        if(alternative){plannerRetry(snapshot,{...result,mixed:null,atomic:null,chosen:alternative},'기존의 다른 후보를 재검증합니다');return;}
-        plannerRetry(snapshot,null,'기존 후보의 검증 실패 · 변경된 방어에 맞는 대안을 탐색합니다',100,result.validationLead??10);return;
-      }
-      if(planToCheck.actions[0]&&fresh.tick+planToCheck.actions[0].tick<=current.tick) {
-        plannerRetry(snapshot,{...result,validationLead:Math.max(result.validationLead??10,(current.tick-fresh.tick)*2+3)},'기존 후보 유지 · 계산 시간에 맞춰 발사 시각만 조정합니다');return;
-      }
-      const plan={...planToCheck,...check.result},bus=getEventBus(),ctor=findNukeEventCtor();
-      if(current.gold<plan.cost){plannerState.error='계획을 실행할 골드가 부족합니다';return;}
-      const rateWait=plannerRateDelay();
-      if(rateWait>0||plan.actions.length>current.intentBudget) {
-        plannerRetry(snapshot,result,'명령 한도 회복 대기 · 회복 후 최신 상태로 재검증합니다',1000);return;
-      }
+      const plan=result.chosen,bus=getEventBus(),ctor=findNukeEventCtor();
+      if(current.gold<plan.cost||rateGate()>0){plannerState.error='골드 또는 명령 한도가 부족합니다';return;}
       if(!bus||!ctor){plannerState.error='게임 발사 이벤트를 찾지 못했습니다';return;}
       const ids=new Set(getGameView().units(ATOM,HYDRO).map(u=>u.id()));
       const run={plan,tile:snapshot.tile,game:snapshot.game,me:snapshot.me,rules:JSON.stringify(current.rules),
-        baseTick:fresh.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,tracked:new Map(),outbox:[],
+        baseTick:current.tick,index:0,sent:0,sentAtoms:0,sentHydros:0,confirmed:0,ids,tracked:new Map(),outbox:[],
         atomLimit:Math.min(5000,Math.max(0,plannerSettings.maxAtoms)),hydroLimit:Math.max(0,plannerSettings.maxHydros),
         minHits:Math.max(1,plannerSettings.minAtomHits),goal:plan.goal??(plan.hydros?'hydro':'atomic'),
-        hitAtoms:0,hitHydros:0,destroyedSAMs:new Set(),replans:0,phase:'firing',reason:'검증된 계획 실행',needsReplan:false,
+        hitAtoms:0,hitHydros:0,replans:0,phase:'firing',reason:'검증된 계획 실행',needsReplan:false,
         startedTick:current.tick,lastTick:current.tick,lastTickAt:Date.now(),bus,ctor,current,
-        signature:defenseSignature(current),candidate:null,history:[]};
+        signature:defenseSignature(current),risk:'',history:[]};
       plannerState.run=run;plannerState.lastExecution='';plannerState.advice=null;plannerState.report=null;
       plannerPump();
     },message=>{plannerState.error='발사 검증 오류: '+message;});
   }
 
   function plannerObserve(run,current) {
-    const g=getGameView(),records=new Map(),previousHits=run.hitAtoms;
+    const g=getGameView(),records=new Map();
     for(const u of g.units(ATOM,HYDRO))records.set(u.id(),{id:u.id(),unitType:u.type(),ownerID:u.owner().smallID(),
       targetTile:u.targetTile(),isActive:u.isActive(),reachedTarget:u.reachedTarget?.()??false});
     // Capture terminal states even when the active-unit list already dropped it.
@@ -4655,24 +4221,21 @@ function resultPresentation(r,s={}) {
       b.committed=run.tracked.has(b.id)&&b.owner===run.me&&b.targetTile===run.tile;
       if(b.committed&&b.progressError)throw Error(b.progressError);
     }
-    // A previous hit cannot destroy a newly built SAM. Credit only an observed
-    // new atomic arrival together with an explicit inactive SAM state; a team
-    // or owner change must never be mistaken for structural destruction.
-    if(run.hitAtoms>previousHits)for(const id of atomicSAMTargets(run.current)) {
-      if(g.unit?.(id)?.isActive()===false)run.destroyedSAMs.add(id);
-    }
-    current.confirmedDestroyedSAMs=[...run.destroyedSAMs];
     current.includeCommitted=true;current.confirmedAtomHits=run.hitAtoms;current.confirmedHydroHits=run.hitHydros;
     run.current=current;
     const pending=run.outbox.find(v=>v.acked<v.amount);
     if(pending&&current.tick-pending.tick>12)throw Error('발사 요청의 게임 반영을 확인하지 못했습니다');
+  }
+  function plannerRisk(s) {
+    return JSON.stringify([s.confirmedAtomHits,s.confirmedHydroHits,
+      s.inflight.filter(b=>b.committed).map(b=>[b.id,b.targeted])]);
   }
   function plannerFinish(reason,s,advice=false) {
     const run=plannerState.run;
     plannerStop(reason);
     if(!advice||!run)return;
     plannerState.advice='다음 공격에 필요한 조건을 확인 중…';
-    plannerJob('advice',{snapshot:s,options:{requireSamDestruction:run.goal==='hydro'||!!run.plan.targetSAMIds,maxAtoms:run.atomLimit,minAtomHits:run.minHits,budgetMs:800,allowNewHydro:run.hydroLimit>0}},800,result=>{
+    plannerJob('advice',{snapshot:s,options:{maxAtoms:run.atomLimit,minAtomHits:run.minHits,budgetMs:800,allowNewHydro:run.hydroLimit>0}},800,result=>{
       plannerState.advice=result.text;
     },message=>{plannerState.advice='구체적인 레벨업 조건을 확인하지 못했습니다: '+message;});
   }
@@ -4680,42 +4243,25 @@ function resultPresentation(r,s={}) {
     if(run.sent!==run.confirmed){run.phase='waiting-ack';return;}
     if(run.replans>=plannerSettings.maxReplans)return plannerFinish('방어 변화가 반복되어 재계산 한도에 도달했습니다',s,true);
     run.replans++;run.phase='adapting';run.needsReplan=false;
-    const timeLeft=(plannerSettings.maxTicks-(s.tick-run.startedTick)-3)*100;
-    if(timeLeft<50)return plannerFinish('공격 관측 시간 안에 남은 계획을 검증할 시간이 없습니다',s,false);
-    const budget=Math.max(50,Math.min(timeLeft,run.adaptiveBudget??plannerSettings.adaptiveBudgetMs)),lead=Math.ceil(budget/100)+2;
-    const continueComputing=()=>{
-      if(plannerState.run!==run)return;
-      // A timed-out candidate search is unknown, not an impossible attack.
-      // Keep the cumulative weapon caps and observe flights while trying again.
-      run.adaptiveBudget=budget*2;run.replans--;
-      run.phase='waiting-ack';run.needsReplan=true;
-      run.reason='재계산 시간이 더 필요해 계산 시간을 늘려 다시 확인합니다 · 남은 발사 보류';
-    };
-    const signature=defenseSignature(s);
-    const candidate=run.candidate;
-    const remaining=candidate?remainingPlan(candidate.plan,0,candidate.baseTick,s.tick,lead):remainingPlan(run.plan,run.index,run.baseTick,s.tick,lead);
-    plannerJob('adapt',{snapshot:s,request:{remaining,goal:candidate?.plan.goal??run.goal,atomLimit:run.atomLimit,hydroLimit:run.hydroLimit,
+    const budget=Math.max(50,Math.min(1500,plannerSettings.adaptiveBudgetMs)),lead=Math.ceil(budget/100)+2;
+    const signature=defenseSignature(s),risk=plannerRisk(s);
+    const remaining=remainingPlan(run.plan,run.index,run.baseTick,s.tick,lead);
+    plannerJob('adapt',{snapshot:s,request:{remaining,goal:run.goal,atomLimit:run.atomLimit,hydroLimit:run.hydroLimit,
       sentAtoms:run.sentAtoms,sentHydros:run.sentHydros},options:{minAtomHits:run.minHits,maxTicks:plannerSettings.maxTicks,budgetMs:budget,initialTicks:lead}},budget,result=>{
       if(plannerState.run!==run)return;
       let fresh;
       try{fresh=plannerSnapshot(run.tile);plannerObserve(run,fresh);}catch(e){return plannerFinish(e.message,run.current,false);}
       const first=result.chosen?.actions[0];
-      if(result.limited&&!result.chosen){continueComputing();return;}
-      if(signature!==defenseSignature(fresh)||newHydrogenThreat(s,fresh)||(first&&s.tick+first.tick<=fresh.tick)||fresh.tick-s.tick>lead) {
-        if(result.chosen)run.candidate={plan:result.chosen,baseTick:s.tick};
-        run.phase='waiting-ack';run.needsReplan=true;run.reason='변경 사항 확인 · 기존 후보를 유지하며 재검증';return;
+      if(signature!==defenseSignature(fresh)||risk!==plannerRisk(fresh)||(first&&s.tick+first.tick<=fresh.tick)||fresh.tick-s.tick>lead) {
+        run.phase='waiting-ack';run.needsReplan=true;run.reason='계산 중 상태가 바뀌어 다시 검증';return;
       }
       if(!result.chosen)return plannerFinish('남은 발사 중단: '+result.reason,fresh,true);
       run.plan=result.chosen;run.baseTick=s.tick;run.index=0;run.signature=signature;
       run.goal=run.plan.goal??(run.plan.hydros?'hydro':'atomic');
       run.phase=run.plan.actions.length?'firing':'observing';run.reason=result.reason;
       run.history.push({tick:fresh.tick,decision:result.decision,atoms:run.plan.atoms,hydros:run.plan.hydros,reason:result.reason});
-      run.needsReplan=false;run.candidate=null;run.adaptiveBudget=plannerSettings.adaptiveBudgetMs;
-    },message=>{
-      if(plannerState.run!==run)return;
-      if(message==='계산 시간 초과'){continueComputing();return;}
-      plannerFinish('재계산 실패로 남은 발사 중단: '+message,run.current,true);
-    });
+      run.needsReplan=false;
+    },message=>{if(plannerState.run===run)plannerFinish('재계산 실패로 남은 발사 중단: '+message,run.current,true);});
   }
 
   function plannerPump() {
@@ -4723,7 +4269,7 @@ function resultPresentation(r,s={}) {
     const run=plannerState.run;if(!run)return;
     try {
       if(document.hidden)return plannerStop('탭이 숨겨져 남은 발사를 중단했습니다');
-      if(getGameView()?.ticks()===run.sampledTick&&run.rateWaitingTick!==run.sampledTick) {
+      if(getGameView()?.ticks()===run.sampledTick) {
         if(Date.now()-run.lastTickAt>2000)return plannerStop('게임 진행이 멈춰 남은 발사를 중단했습니다');
         plannerState.timer=setTimeout(plannerPump,40);return;
       }
@@ -4735,9 +4281,8 @@ function resultPresentation(r,s={}) {
       if(Date.now()-run.lastTickAt>2000)return plannerStop('게임 진행이 멈춰 남은 발사를 중단했습니다');
       if(tick-run.startedTick>plannerSettings.maxTicks)return plannerFinish('공격 관측 제한 시간에 도달했습니다',current,false);
       plannerObserve(run,current);
-      const atomicDone=run.goal==='atomic'&&run.hitAtoms>=run.minHits&&(!run.plan.targetSAMIds||run.plan.targetSAMIds.every(id=>run.destroyedSAMs.has(id))&&atomicSAMTargets(current).length===0);
-      if(run.hitHydros>=1||atomicDone)
-        return plannerFinish(`목표 도달 확인: 수소 ${run.hitHydros}발 · 원자 ${run.hitAtoms}발${atomicDone&&run.plan.targetSAMIds?` · 목표 SAM ${run.plan.targetSAMIds.length}기 제거 확인`:''}`,current,false);
+      if(run.hitHydros>=1||(run.goal==='atomic'&&run.hitAtoms>=run.minHits))
+        return plannerFinish(`목표 도달 확인: 수소 ${run.hitHydros}발 · 원자 ${run.hitAtoms}발`,current,false);
       const signature=defenseSignature(current);
       if(signature!==run.signature){run.needsReplan=true;run.reason='SAM·사일로 변화 감지 — 남은 발사 보류';}
       for(const b of current.inflight)if(b.committed&&b.type===HYDRO&&b.targeted&&!run.tracked.get(b.id).targeted) {
@@ -4753,30 +4298,20 @@ function resultPresentation(r,s={}) {
             return plannerFinish('이번 공격의 누적 발사 한도에 도달했습니다',current,true);
           const cost=(hydro?current.hydroCost:current.atomCost)*BigInt(action.amount);
           const ready=current.silos.reduce((sum,s)=>sum+(s.building?0:Math.max(0,s.level-s.queue.length)),0);
-          const rateWait=plannerRateDelay();
-          if(rateWait>0) {
-            // A 40ms poll can reach the next game tick just before the wall-clock
-            // second expires. Retry WITHIN this tick instead of wasting a replan.
-            // If the due tick passes, the normal missed-deadline guard revalidates.
-            run.rateWaitingTick=tick;run.reason='명령 한도 회복 대기 · 같은 틱 안에서 재확인';
-            plannerState.timer=setTimeout(plannerPump,Math.max(1,Math.min(40,Math.ceil(rateWait))));return;
-          }
-          run.rateWaitingTick=null;
-          if(current.gold<cost||ready-(run.sent-run.confirmed)<action.amount||
+          if(rateGate()>0||current.gold<cost||ready-(run.sent-run.confirmed)<action.amount||
             (hydro?current.allowed.mixed===false:current.allowed.atomic===false)) {
             run.needsReplan=true;run.reason='골드·발사관·명령 한도 변경 — 남은 발사 보류';plannerReplan(run,current);
           }else {
             // Reserve before emit so a synchronous test adapter cannot race ACK.
             run.outbox.push({type:action.type,amount:action.amount,acked:0,tick});
             run.bus.emit(new run.ctor(action.type,run.tile,run.plan.up,action.amount));rateUse();
-            run.reason='검증된 일정으로 발사 중 · 원자 최대 50발 × 초당 10건';
             run.sent+=action.amount;run.index++;
             if(hydro)run.sentHydros+=action.amount;else run.sentAtoms+=action.amount;
           }
         }else if(!action) {
           run.phase=run.sent===run.confirmed?'observing':'waiting-ack';
           if(run.sent===run.confirmed&&!current.inflight.some(b=>b.committed))
-            return plannerFinish(run.plan.targetSAMIds?`비행 종료 · 원자 ${run.hitAtoms}발 도달, 목표 SAM 제거 확인 ${run.plan.targetSAMIds.filter(id=>run.destroyedSAMs.has(id)).length}/${run.plan.targetSAMIds.length}기`:`비행 종료 · 목표 도달 확인 부족 (수소 ${run.hitHydros}, 원자 ${run.hitAtoms})`,current,true);
+            return plannerFinish(`비행 종료 · 목표 도달 확인 부족 (수소 ${run.hitHydros}, 원자 ${run.hitAtoms})`,current,true);
         }
       }
     }catch(e){return plannerStop('상태 확인 실패로 중단: '+e.message);}
@@ -4786,21 +4321,8 @@ function resultPresentation(r,s={}) {
   function startStrike() {
     if(plannerState.run){toast('계획 실행 중입니다. Esc로 남은 발사를 중단할 수 있습니다','#ffd166');return;}
     if(plannerState.pending?.execute){toast('선택한 위치의 발사 계획을 검증 중입니다. Esc로 취소할 수 있습니다','#ffd166');return;}
-    if(warshipQueue.length||upgradeJobs.size||upgradeSelectionPending||salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
-    const game=getGameView(),me=game?.myPlayer(),tile=computeCursorTile();
-    if(!game||!me||tile===null){plannerState.error='게임에서 목표 위치에 커서를 올리세요';return;}
-    plannerCancelJob();const id=plannerState.job;
-    plannerState.error='';
-    plannerState.pending={id,execute:true,kind:'prices',timeout:null};
-    plannerPrices.refresh(game,me,true).then(()=>{
-      if(id!==plannerState.job)return;
-      plannerState.pending=null;
-      if(document.hidden||getGameView()!==game)return;
-      plannerCompute(plannerSnapshot(tile),true);
-    }).catch(e=>{
-      if(id!==plannerState.job)return;
-      plannerState.pending=null;plannerState.error=e.message;toast('공격 준비 중단 · 표시창의 원인을 확인하세요','#ffd166');
-    });
+    if(upgradeJobs.size||upgradeSelectionPending||salvoQueue.length||salvoTimer!==null||salvoFollow!==null||armed){toast('기존 작업을 Esc로 끝낸 뒤 I를 누르세요','#ffd166');return;}
+    try{plannerCompute(plannerSnapshot(computeCursorTile()),true);}catch(e){plannerState.error=e.message;toast(e.message,'#ffd166');}
   }
   function plannerKeyGuard(e) {
     if(e.code==='F8'&&!e.repeat){plannerSettings.details=!plannerSettings.details;e.preventDefault();return true;}
@@ -4816,23 +4338,52 @@ function resultPresentation(r,s={}) {
   document.addEventListener('visibilitychange',()=>{if(document.hidden){plannerCancelJob();plannerStop('탭을 전환해 계획을 중단했습니다');}});
   window.addEventListener('pagehide',()=>{plannerCancelJob();plannerStop('게임 화면을 떠나 계획을 중단했습니다');});
 
-  // Background refresh never removes the last completed display. The engine
-  // still receives a fresh snapshot and I still independently revalidates it.
-  function plannerRefreshPreview() {
-    const p=plannerState,now=Date.now(),tile=computeCursorTile(),g=getGameView();
-    if(p.run||warshipQueue.length||(armed&&armedMode==='warship'))return;
-    if(!g?.myPlayer()){p.display=null;p.error='';return;}
-    if(!p.pending?.execute&&(tile!==p.tile||g.gameID()!==p.game)) {
-      const differentGame=g.gameID()!==p.game;
-      plannerCancelJob();p.tile=tile;p.game=g.gameID();p.result=null;p.error='';p.stableAt=now;p.updated=0;
-      if(differentGame){p.display=null;p.lastExecution='';p.advice=null;}
-    }
-    if(!p.pending&&!document.hidden&&now-p.stableAt>350&&now-p.updated>2500) {
-      try{plannerCompute(plannerSnapshot(tile));}catch(e){p.error=e.message;p.updated=now;}
-    }
+  function plannerPlanText(label,p,minHits) {
+    if(!p)return label+': 검증된 계획 없음';
+    return `${label}: 원자 ${p.atoms} + 수소 ${p.hydros} → 수소 ${p.hydroHits} / 원자 ${p.atomHits}발 예상\n`+
+      `  ${p.up?'위쪽':'아래쪽'} 궤적 · 비용 ${p.cost.toLocaleString()} · 약 ${(p.lastArrival/10).toFixed(1)}초`;
   }
   function hudTargetLine() {
-    return hudEl?.innerText??'게임 지도에 커서를 잠시 멈추세요.';
+    const p=plannerState,now=Date.now(),tile=computeCursorTile(),g=getGameView();
+    if(p.run) {
+      const run=p.run,phase={firing:'발사 중',adapting:'변화 감지 · 재계산 중',observing:'비행 관측 중','waiting-ack':'발사 반영 대기'}[run.phase];
+      return `${phase} · Esc: 남은 발사 중단\n${run.reason}\n누적 원자 ${run.sentAtoms}/${run.atomLimit} · 수소 ${run.sentHydros}/${run.hydroLimit}\n남은 계획: 원자 ${run.plan.actions.slice(run.index).filter(a=>a.type===ATOM).reduce((n,a)=>n+a.amount,0)} · 수소 ${run.plan.actions.slice(run.index).filter(a=>a.type===HYDRO).reduce((n,a)=>n+a.amount,0)}\n게임 반영 ${run.confirmed}/${run.sent} · 수정 ${run.replans}회\n도달 확인: 원자 ${run.hitAtoms} · 수소 ${run.hitHydros}\n목표 고정: (${run.current.target.x}, ${run.current.target.y})`;
+    }
+    const report=[p.lastExecution,p.advice].filter(Boolean).join('\n');
+    if(!g?.myPlayer())return '공격 분석 · 게임에서 목표에 커서를 올리세요';
+    if(!p.pending?.execute&&(tile!==p.tile||g.gameID()!==p.game)) {
+      plannerCancelJob();p.tile=tile;p.game=g.gameID();p.result=null;p.error='';p.stableAt=now;p.updated=0;
+    }
+    if(!p.pending && !document.hidden && now-p.stableAt>350 && now-p.updated>2500) {
+      try{plannerCompute(plannerSnapshot(tile));}catch(e){p.error=e.message;p.updated=now;}
+    }
+    if(p.pending)return `${report?report+'\n':''}${p.pending.kind==='advice'?'중단 후 조언':p.pending.execute?'발사 전 검증':'공격 분석'} 중…\n${p.pending.execute?'선택한 목표 고정 · Esc로 취소':'커서를 잠시 멈추면 두 공격 방식을 비교합니다'}`;
+    if(p.error)return [report,'판정 불가 · '+p.error].filter(Boolean).join('\n');
+    const r=p.result;
+    if(!r)return [report,'공격 분석 · 목표에 커서를 잠시 멈추세요'].filter(Boolean).join('\n');
+    const title=r.chosen?(r.mode==='mixed'?'수소 혼합 추천':'원자 집중 추천'):(r.limited?'계산 미완료':'현재 탐색 범위에서 돌파 어려움');
+    const used=r.chosen?.usedSilos.length??0;
+    const lines=[title+' · 현재 상태 기준 예측',
+      `목표: 수소 1발 / 원자 ${r.minAtomHits}발 · 원자 최대 ${r.maxAtoms.toLocaleString()}발 탐색`,
+      `사일로 ${r.silos.length}기 · 준비 ${r.ready}관 · 계획 사용 ${used}기`,
+      `SAM ${r.sams.length}기 검토 · 요격 참여 ${r.chosen?.participating.length??'—'}기`,
+      plannerPlanText('수소 혼합',r.mixed,r.minAtomHits),plannerPlanText('원자 집중',r.atomic,r.minAtomHits)];
+    if(r.reason)lines.push(r.reason);
+    if(r.diagnostics?.length)lines.push(...r.diagnostics);
+    if(r.chosen)lines.push('I: 재검증 후 추천 공격 · Esc: 취소');
+    if(r.limited&&r.chosen)lines.push('시간 제한 내 찾은 계획 · 최적해 보장 없음');
+    lines.push(`비행 중 ${r.existingFlights}발 관측 · 타 미사일의 방어 소모·SAM 파괴 효과 제외`);
+    if(plannerSettings.details) {
+      const usedIds=new Set(r.chosen?.usedSilos??[]),samIds=new Set(r.chosen?.participating??[]);
+      lines.push('사일로 배치 (＊계획 사용)');
+      for(const u of r.silos)lines.push(`${usedIds.has(u.id)?'＊':'·'} (${u.x}, ${u.y}) Lv${u.level} · 준비 ${u.ready}`);
+      lines.push('SAM 배치 (＊요격 참여)');
+      for(const u of r.sams)lines.push(`${samIds.has(u.id)?'＊':'·'} (${u.x}, ${u.y}) Lv${u.level} · 준비 ${u.ready}`);
+    }
+    lines.push('F8: 배치 상세 '+(plannerSettings.details?'접기':'보기'));
+    if(hudEl){hudEl.style.pointerEvents=plannerSettings.details?'auto':'none';hudEl.style.overflowY=plannerSettings.details?'auto':'hidden';}
+    if(report)lines.unshift(report);
+    return lines.join('\n');
   }
   const plannerDebug={settings:plannerSettings,snapshot:()=>plannerSnapshot(computeCursorTile()),
     result:()=>plannerState.result,stop:()=>{plannerCancelJob();plannerStop();},
@@ -4842,7 +4393,7 @@ function resultPresentation(r,s={}) {
   // ── 디버그용 노출 (F12 콘솔: __x50) ──
   try {
     window.__x50 = {
-      planner: plannerDebug, CFG, setArmed, requestUpgrade, cancelUpgrades, upgrades:{state:upgradeStatus,cancel:cancelUpgrades}, requestWarships, warships:{state:warshipStatus,cancel:cancelWarships}, rateGate, rateDelayFor, rateUse, RL,
+      planner: plannerDebug, CFG, setArmed, requestUpgrade, cancelUpgrades, requestWarships, rateGate, rateDelayFor, rateUse, RL,
       fireAtoms, fireHydro, fireMax, fireMirv, startSalvo, salvoStop,
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
       samsNear, simpleShots, simpleVerdict, verdictText,

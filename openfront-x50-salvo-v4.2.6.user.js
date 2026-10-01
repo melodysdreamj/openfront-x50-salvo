@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenFront x50 Nuke + Structure Max (private/사설 로비용)
 // @namespace    of-x50-salvo
-// @version      4.2.7
+// @version      4.2.6
 // @description  사설·연습 로비 — 커서 공격 예측 / I: 추천 계획 실행 / Esc: 중단
 // @author       local build
 // @match        https://openfront.io/*
@@ -3324,7 +3324,7 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   // (구버전은 청크마다 서버 반영을 기다리며 300ms씩 쉬어 500레벨에 수 초가 걸렸다)
   //
   // 안전 원칙:
-  //   · 클릭마다 FIFO 작업을 추가한다. 앞 묶음 반영 후 현재 레벨 + 저장된 N을 계산한다.
+  //   · 목표는 '절대 레벨'(클릭 시점 lv0 + N) — 반영 지연 중 겹쳐 눌러도 초과 계산 없음.
   //   · 보낸 총량은 (목표 - lv0)을 넘지 않는다.
   //   · 서버 초당 한도(10건)에 여유 1을 두고 스스로 페이싱한다 (드롭 0).
   //   · 골드로 감당 가능한 만큼만 사전 절단 (최종 판정은 서버).
@@ -3334,12 +3334,10 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
   //   → X(+500=10건)를 눌러도 창에 여유가 남아 Z 살포·수소가 굶지 않는다.
   let upSentTimes = [];
   const upgradeJobs = new Map();
-  const upgradeQueue = [];
   let upgradeEpoch = 0, upgradeSelectionPending = false;
   function cancelUpgrades() {
     upgradeEpoch++;
     upgradeSelectionPending=false;
-    upgradeQueue.length=0;
     for(const job of upgradeJobs.values())job.cancel();
     upgradeJobs.clear();
   }
@@ -3352,152 +3350,145 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
     return Math.max(0, cap - upSentTimes.length);
   }
 
-  function fireUpgrade(unitId, type, row, me, bus, ctor, big, entry=null) {
-    return new Promise(resolve=>{
-      if(upgradeJobs.has(unitId)) {
-        toast('업그레이드 진행·반영 대기 중 — 같은 구조물 중복 요청을 생략했습니다', '#ffd166');
-        resolve(false);return;
-      }
-      const lv0 = unitLevel(unitId, type);
-      if (lv0 === null) {
-        toast(`⚠️ ${koName(type)} 레벨 확인 실패 — 중단 (게임 로드 후 재시도)`, "#ffaa00");
-        resolve(false);return;
-      }
-      const target = entry?(entry.mode==='set'?entry.want:lv0+entry.want):goalLevel(type, lv0, big);
-      if (target <= lv0) {
-        toast(`ℹ️ ${koName(type)} 이미 Lv ${lv0} (목표 ${target})`, "#ffd166");
-        resolve(true);return;
-      }
-      let remaining = target - lv0;
-      if(!Number.isSafeInteger(remaining)||remaining<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');resolve(false);return;}
-      let cappedByGold = false;
+  function fireUpgrade(unitId, type, row, me, bus, ctor, big) {
+    if(upgradeJobs.has(unitId)) {
+      toast('업그레이드 진행·반영 대기 중 — 같은 구조물 중복 요청을 생략했습니다', '#ffd166');
+      return;
+    }
+    const lv0 = unitLevel(unitId, type);
+    if (lv0 === null) {
+      toast(`⚠️ ${koName(type)} 레벨 확인 실패 — 중단 (게임 로드 후 재시도)`, "#ffaa00");
+      return;
+    }
+    const target = goalLevel(type, lv0, big);
+    if (target <= lv0) {
+      toast(`ℹ️ ${koName(type)} 이미 Lv ${lv0} (목표 ${target})`, "#ffd166");
+      return;
+    }
+    let remaining = target - lv0;
+    if(!Number.isSafeInteger(remaining)||remaining<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');return;}
+    let cappedByGold = false;
 
-      // 골드 상한 — upgradeCosts[k-1] = k회 연속 업그레이드의 누적 비용
-      try {
-        const costs = row && row.upgradeCosts;
-        if (costs && costs.length > 0) {
-          const gold = toBig(me.gold());
-          const priceable = Math.min(remaining, costs.length);
-          let k = priceable;
-          while (k > 0 && toBig(costs[k - 1]) > gold) k--;
-          if (k <= 0) {
-            toast(`💰 골드 부족 — ${koName(type)} 다음 강화 불가`, "#ff5555");
-            resolve(false);return;
-          }
-          if (k < priceable) { cappedByGold = true; remaining = k; }
+    // 골드 상한 — upgradeCosts[k-1] = k회 연속 업그레이드의 누적 비용
+    try {
+      const costs = row && row.upgradeCosts;
+      if (costs && costs.length > 0) {
+        const gold = toBig(me.gold());
+        const priceable = Math.min(remaining, costs.length);
+        let k = priceable;
+        while (k > 0 && toBig(costs[k - 1]) > gold) k--;
+        if (k <= 0) {
+          toast(`💰 골드 부족 — ${koName(type)} 다음 강화 불가`, "#ff5555");
+          return;
         }
-      } catch (e) {}
+        if (k < priceable) { cappedByGold = true; remaining = k; }
+      }
+    } catch (e) {}
 
-      const perIntent = 50; // 업그레이드는 원자탄 CFG.amount와 독립: +500 = 정확히 10건
-      const t0 = lv0;
-      const startedAt = Date.now();
-      let sent = 0;
-      let timer = null;
-      const game=getGameView(),epoch=upgradeEpoch;
-      const job={cancel(success=false){if(timer!==null)clearTimeout(timer);timer=null;resolve(success);}};
-      upgradeJobs.set(unitId,job);
-      const cleanup=(success=false)=>{job.cancel(success);if(upgradeJobs.get(unitId)===job)upgradeJobs.delete(unitId);};
+    const perIntent = 50; // 업그레이드는 원자탄 CFG.amount와 독립: +500 = 정확히 10건
+    const t0 = lv0;
+    const startedAt = Date.now();
+    let sent = 0;
+    let timer = null;
+    const game=getGameView(),epoch=upgradeEpoch;
+    const job={cancel(){if(timer!==null)clearTimeout(timer);timer=null;}};
+    upgradeJobs.set(unitId,job);
+    const cleanup=()=>{job.cancel();if(upgradeJobs.get(unitId)===job)upgradeJobs.delete(unitId);};
 
-      const valid=()=>{
-        const u=game.unit?.(unitId);
-        return epoch===upgradeEpoch&&getGameView()===game&&game.myPlayer()===me&&!document.hidden&&
-          u&&u.isActive?.()!==false&&isOwnedByMe(u,me)&&!u.isUnderConstruction?.();
+    // 발송이 끝난 뒤 반영을 지켜보고 결과를 알린다 (발사 자체는 이미 끝났다)
+    function finish() {
+      let tries = 0;
+      const wantLv = t0 + sent;
+      const report = (nowLv) => {
+        cleanup();
+        const gained = (nowLv === null ? t0 : nowLv) - t0;
+        const tail = cappedByGold ? " (골드 한도)" : "";
+        if (gained > 0) toast(`✅ ${koName(type)} Lv ${t0} → ${nowLv} (+${gained})${tail}`, "#7ee787");
+        else toast(`⚠️ ${koName(type)} 반영 없음 — Lv ${t0} 유지 (골드·건설상태 확인)`, "#ffaa00");
       };
-      // 발송이 끝난 뒤 반영을 지켜보고 결과를 알린다 (발사 자체는 이미 끝났다)
-      function finish() {
-        let tries = 0;
-        const wantLv = t0 + sent;
-        const report = (nowLv) => {
-          cleanup(nowLv!==null&&nowLv>=wantLv);
-          const gained = (nowLv === null ? t0 : nowLv) - t0;
-          const tail = cappedByGold ? " (골드 한도)" : "";
-          if (gained > 0) toast(`✅ ${koName(type)} Lv ${t0} → ${nowLv} (+${gained})${tail}`, "#7ee787");
-          else toast(`⚠️ ${koName(type)} 반영 없음 — Lv ${t0} 유지 (골드·건설상태 확인)`, "#ffaa00");
-        };
-        const poll = () => {
-          if(!valid()){cleanup();return;}
-          const nowLv = unitLevel(unitId, type);
-          if (nowLv !== null && nowLv >= wantLv) { report(nowLv); return; }
-          if (++tries >= 25) { report(nowLv); return; }   // 최대 ~5초 대기
-          timer = setTimeout(poll, 200);
-        };
-        poll();
+      const poll = () => {
+        if(epoch!==upgradeEpoch||getGameView()!==game){cleanup();return;}
+        const nowLv = unitLevel(unitId, type);
+        if (nowLv !== null && nowLv >= wantLv) { report(nowLv); return; }
+        if (++tries >= 25) { report(nowLv); return; }   // 최대 ~5초 대기
+        timer = setTimeout(poll, 200);
+      };
+      poll();
+    }
+
+    // 창당 몰아쓰기 발송 (서버 초당 한도 10건을 최대 속력으로)
+    function pump() {
+      timer = null;
+      if(epoch!==upgradeEpoch||getGameView()!==game){cleanup();return;}
+      if (sent >= remaining) { finish(); return; }
+
+      const now = Date.now();
+      RL.secWindow = RL.secWindow.filter((x) => now - x < 1000);
+      RL.minWindow = RL.minWindow.filter((x) => now - x < 60000);
+
+      // 분당 한도(150건)가 바닥이면 분 경계까지 대기
+      if (RL.minWindow.length >= RL.perMinute - 5) {
+        const waitMs = Math.max(1100, RL.minWindow[0] + 60000 - now + 60);
+        const ts = Date.now();
+        if (ts - lastBlockToast > 3000) {
+          lastBlockToast = ts;
+          toast(`⏳ 서버 분당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
+        }
+        timer = setTimeout(pump, waitMs);
+        return;
       }
 
-      // 창당 몰아쓰기 발송 (서버 초당 한도 10건을 최대 속력으로)
-      function pump() {
-        timer = null;
-        if(!valid()){cleanup();return;}
-        if (sent >= remaining) { finish(); return; }
-
-        const now = Date.now();
-        RL.secWindow = RL.secWindow.filter((x) => now - x < 1000);
-        RL.minWindow = RL.minWindow.filter((x) => now - x < 60000);
-
-        // 분당 한도(150건)가 바닥이면 분 경계까지 대기
-        if (RL.minWindow.length >= RL.perMinute - 5) {
-          const waitMs = Math.max(1100, RL.minWindow[0] + 60000 - now + 60);
-          const ts = Date.now();
-          if (ts - lastBlockToast > 3000) {
-            lastBlockToast = ts;
-            toast(`⏳ 서버 분당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
-          }
-          timer = setTimeout(pump, waitMs);
-          return;
+      // 창에 '남은 여유'만큼 지금 바로 보낸다.
+      //   · 창이 비었거나 여유가 있으면 → 즉시 (여러 번 클릭해도 안 막힘)
+      //   · 창이 꽉 찼으면 → 그 창이 닫힐 때까지(첫 발송 + 1.05초) 대기 후 몰아쓰기
+      //  (살포 Z·수동 발사와 창을 나눠 쓰므로 어느 쪽도 버려지지 않는다)
+      const room = RL.perSecond - RL.secWindow.length;
+      if (room <= 0) {
+        const waitMs = Math.max(40, RL.secWindow[0] + 1050 - now);
+        if (Date.now() - startedAt > 180000) {
+          toast(`⏳ 서버 한도 대기 초과 — 중단 (남은 ${remaining - sent}레벨)`, "#ffaa00");
+          cleanup();return;
         }
-
-        // 창에 '남은 여유'만큼 지금 바로 보낸다.
-        //   · 창이 비었거나 여유가 있으면 → 즉시 (여러 번 클릭해도 안 막힘)
-        //   · 창이 꽉 찼으면 → 그 창이 닫힐 때까지(첫 발송 + 1.05초) 대기 후 몰아쓰기
-        //  (살포 Z·수동 발사와 창을 나눠 쓰므로 어느 쪽도 버려지지 않는다)
-        const room = RL.perSecond - RL.secWindow.length;
-        if (room <= 0) {
-          const waitMs = Math.max(40, RL.secWindow[0] + 1050 - now);
-          if (Date.now() - startedAt > 180000) {
-            toast(`⏳ 서버 한도 대기 초과 — 중단 (남은 ${remaining - sent}레벨)`, "#ffaa00");
-            cleanup();return;
-          }
-          const ts = Date.now();
-          if (ts - lastBlockToast > 3000) {
-            lastBlockToast = ts;
-            toast(`⏳ 서버 초당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
-          }
-          timer = setTimeout(pump, waitMs);
-          return;
+        const ts = Date.now();
+        if (ts - lastBlockToast > 3000) {
+          lastBlockToast = ts;
+          toast(`⏳ 서버 초당 한도 — ${Math.ceil(waitMs / 1000)}초 후 자동 재개`, "#ffaa00");
         }
-
-        // 이번 창 몫: 서버 여유 · 업그레이드 전용 상한 · 남은 양 중 최소
-        const burst = Math.min(room, upRoomNow(), RL.perMinute - 5 - RL.minWindow.length, Math.ceil((remaining - sent)/perIntent));
-        let n = 0;
-        while (n < burst && sent < remaining) {
-          const amt = Math.min(perIntent, remaining - sent);
-          if (amt <= 0) break;
-          try {
-            bus.emit(new ctor(unitId, type, amt));
-            rateUse();
-            upSentTimes.push(Date.now());
-          } catch (e) {
-            console.warn("[x50] 업그레이드 emit 실패:", e);
-            toast("❌ 업그레이드 발송 실패", "#ff5555");
-            cleanup();return;
-          }
-          sent += amt;
-          n++;
-        }
-        if (sent < remaining) {
-          // 이번 창에서 업그레이드 몫을 다 썼다 → 창 회전까지 기다린다.
-          //   (60ms 재시도로는 결국 창을 다 먹어 독점이 그대로 재현된다 — 실측 확인)
-          const last = upSentTimes.length ? upSentTimes[upSentTimes.length - 1] : Date.now();
-          const wait2 = Math.max(60, last + 1050 - Date.now());
-          timer = setTimeout(pump, wait2);
-          return;
-        }
-        finish();
+        timer = setTimeout(pump, waitMs);
+        return;
       }
 
-      toast(`🚀 ${koName(type)} +${remaining} · ${Math.ceil(remaining/perIntent)}건 요청 (Lv ${t0} → ${t0 + remaining})${cappedByGold ? " — 골드 한도" : ""}`, "#ffd166");
-      pump();
-    });
+      // 이번 창 몫: 서버 여유 · 업그레이드 전용 상한 · 남은 양 중 최소
+      const burst = Math.min(room, upRoomNow(), RL.perMinute - 5 - RL.minWindow.length, Math.ceil((remaining - sent)/perIntent));
+      let n = 0;
+      while (n < burst && sent < remaining) {
+        const amt = Math.min(perIntent, remaining - sent);
+        if (amt <= 0) break;
+        try {
+          bus.emit(new ctor(unitId, type, amt));
+          rateUse();
+          upSentTimes.push(Date.now());
+        } catch (e) {
+          console.warn("[x50] 업그레이드 emit 실패:", e);
+          toast("❌ 업그레이드 발송 실패", "#ff5555");
+          cleanup();return;
+        }
+        sent += amt;
+        n++;
+      }
+      if (sent < remaining) {
+        // 이번 창에서 업그레이드 몫을 다 썼다 → 창 회전까지 기다린다.
+        //   (60ms 재시도로는 결국 창을 다 먹어 독점이 그대로 재현된다 — 실측 확인)
+        const last = upSentTimes.length ? upSentTimes[upSentTimes.length - 1] : Date.now();
+        const wait2 = Math.max(60, last + 1050 - Date.now());
+        timer = setTimeout(pump, wait2);
+        return;
+      }
+      finish();
+    }
+
+    toast(`🚀 ${koName(type)} +${remaining} · ${Math.ceil(remaining/perIntent)}건 요청 (Lv ${t0} → ${t0 + remaining})${cappedByGold ? " — 골드 한도" : ""}`, "#ffd166");
+    pump();
   }
 
   // ═════════════════════════════════════════════
@@ -3657,62 +3648,93 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
     };
   }
 
-  // Freeze target, mode and quantity at each click. Only one selection/send/ACK
-  // chain runs at a time, even for different structures or mixed V/X clicks.
-  function upgradeStatus() {return {running:upgradeQueue.length>0,batches:upgradeQueue.length,target:upgradeQueue[0]?.id??null};}
   function requestUpgrade(big) {
-    if(typeof plannerState!=='undefined'&&(plannerState.run||plannerState.pending?.execute))return;
-    const game=getGameView(),me=game?.myPlayer(),tile=computeCursorTile();
-    if(!game||!me||tile===null||tile===undefined||document.hidden)return;
-    const hit=nearestOwn(game,me,tile,CFG.upgradableTypes,15);
-    if(!hit){toast('클릭 위치에 업그레이드 가능한 내 구조물이 없습니다','#ffd166');return;}
-    const u=hit.unit,type=u.type(),want=CFG.mode==='set'?targetFor(type):addFor(type,big);
-    if(!Number.isSafeInteger(want)||want<=0){toast('업그레이드 수량 설정을 확인하세요','#ffaa00');return;}
-    if(upgradeQueue.length&&upgradeQueue[0].game!==game)cancelUpgrades();
-    upgradeQueue.push({game,me,tile,id:u.id(),type,big,mode:CFG.mode,want});
-    if(typeof plannerCancelJob==='function')plannerCancelJob();
-    toast(`${big?'X':'V'} 업그레이드 대기열 추가 · ${upgradeQueue.length}묶음 (Esc: 남은 작업 취소)`,'#7ee787');
-    pumpUpgradeQueue();
-  }
-  async function pumpUpgradeQueue() {
-    if(upgradeSelectionPending||!upgradeQueue.length)return;
+    if(upgradeSelectionPending)return;
     upgradeSelectionPending=true;
-    const epoch=upgradeEpoch,entry=upgradeQueue[0];
-    try {
-      const complete=await selectUpgrade(entry.big,epoch,entry);
-      if(epoch!==upgradeEpoch)return;
-      if(!complete){cancelUpgrades();toast('업그레이드 적용을 완료하지 못해 남은 대기열을 중단했습니다. 자동 재전송하지 않습니다','#ffaa00');return;}
-      upgradeQueue.shift();
-    } catch(e) {
-      if(epoch===upgradeEpoch){cancelUpgrades();toast('업그레이드 대기열 중단: '+e.message,'#ffaa00');}
-    } finally {
-      if(epoch===upgradeEpoch){upgradeSelectionPending=false;if(upgradeQueue.length)pumpUpgradeQueue();}
-    }
+    const epoch=upgradeEpoch;
+    selectUpgrade(big,epoch).catch(e=>{console.warn('[x50] 업그레이드 대상 확인 실패',e);})
+      .finally(()=>{if(epoch===upgradeEpoch)upgradeSelectionPending=false;});
   }
-  async function selectUpgrade(big,epoch,entry) {
-    const {game,me,id,type,tile}=entry;
-    const valid=()=>{
-      const u=game.unit?.(id);
-      return epoch===upgradeEpoch&&getGameView()===game&&game.myPlayer()===me&&!document.hidden&&
-        u&&u.type()===type&&u.isActive?.()!==false&&isOwnedByMe(u,me)&&!u.isUnderConstruction?.();
+  async function selectUpgrade(big,epoch) {
+    const game = getGameView();
+    const bus = getEventBus();
+    if (!game || !bus) { toast("❌ 게임 시작 후 사용하세요", "#ff5555"); return; }
+    const me = game.myPlayer();
+    if (!me) { toast("❌ 플레이어 정보 없음", "#ff5555"); return; }
+    const ctor = findUpgradeEventCtor();
+    if (!ctor) { toast("❌ 업그레이드 경로 없음 (게임 시작 후 재시도)", "#ff5555"); return; }
+    const tile = computeCursorTile();
+    if (tile === null) { toast("❌ 커서 위치 인식 실패", "#ff5555"); return; }
+
+    const types = CFG.upgradableTypes;
+    const maxDist = 15; // 게임 structureMinDist와 동일
+
+    // 폴백: 게임 판정을 못 쓸 때 직접 최근접 탐색
+    const direct = () => {
+      const hit = nearestOwn(game, me, tile, types, maxDist);
+      if (hit) { fireUpgrade(hit.unit.id(), hit.unit.type(), null, me, bus, ctor, big); return; }
+      const dp = nearestOwn(game, me, tile, ["Defense Post"], maxDist);
+      if (dp) { toast("ℹ️ 디펜스 포스트는 업그레이드할 수 없습니다", "#ffaa00"); return; }
+      toast(`❌ 반경 ${maxDist}타일 내 업그레이드 가능한 내 구조물 없음`, "#ffaa00");
     };
-    if(!valid())throw Error('저장한 구조물이 없어졌거나 소유권·건설 상태가 바뀌었습니다');
-    const bus=getEventBus(),ctor=findUpgradeEventCtor();
-    if(!bus||!ctor)throw Error('업그레이드 전송 경로를 확인할 수 없습니다');
-    const query=typeof me.buildables==='function'?me.buildables(tile,[type]):me.actions?.(tile,[type]);
-    // Legacy clients without the official asynchronous API retain the explicit
-    // frozen-unit path. A failed/negative official response never bypasses it.
-    if(!query||typeof query.then!=='function')return fireUpgrade(id,type,null,me,bus,ctor,big,entry);
-    let timeout,result;
+
+    // 1순위: 게임 공식 판정 (buildables → canUpgrade = 업그레이드 대상 유닛 id)
+    let p = null;
     try {
-      result=await Promise.race([query,new Promise((_,reject)=>{
-        timeout=setTimeout(()=>reject(Error('업그레이드 대상 조회 시간 초과')),1500);
-      })]);
-    } finally {clearTimeout(timeout);}
-    if(!valid())return false;
-    const row=(Array.isArray(result)?result:result?.buildableUnits)?.find(r=>r.type===type);
-    if(!row||row.canUpgrade!==id)throw Error('저장한 구조물을 지금 강화할 수 없습니다. 골드·건설 상태를 확인하세요');
-    return fireUpgrade(id,type,row,me,bus,ctor,big,entry);
+      if (typeof me.buildables === "function") p = me.buildables(tile, types);
+      else if (typeof me.actions === "function") p = me.actions(tile, types);
+    } catch (e) { p = null; }
+
+    if (!p || typeof p.then !== "function") { direct(); return; }
+
+    let res;
+    try{res=await p;}catch{if(epoch===upgradeEpoch&&getGameView()===game)direct();return;}
+    if(epoch!==upgradeEpoch||getGameView()!==game)return;
+    {
+      const arr = Array.isArray(res) ? res : (res && res.buildableUnits) || [];
+      // canUpgrade가 살아있는 행들 중 클릭 지점에서 가장 가까운 구조물 선택
+      let bestId = null, bestType = null, bestRow = null, bestD = Infinity;
+      for (const row of arr) {
+        if (!row || row.canUpgrade === false) continue;
+        let d = Infinity;
+        try {
+          // game.unit(id) 없으면 전체 유닛에서 찾는다
+          let u = null;
+          if (typeof game.unit === "function") u = game.unit(row.canUpgrade);
+          if (!u) {
+            for (const cand of game.units(row.type)) {
+              try { if (cand.id() === row.canUpgrade) { u = cand; break; } } catch (e) {}
+            }
+          }
+          if (u) d = game.manhattanDist(tile, u.tile());
+        } catch (e) {}
+        if (d < bestD) { bestD = d; bestId = row.canUpgrade; bestType = row.type; bestRow = row; }
+      }
+      if (bestId !== null) { fireUpgrade(bestId, bestType, bestRow, me, bus, ctor, big); return; }
+
+      // 업그레이드 대상이 없음 → 사유를 정확히 안내
+      const hit = nearestOwn(game, me, tile, types, maxDist);
+      if (hit) {
+        try {
+          if (typeof hit.unit.isUnderConstruction === "function" && hit.unit.isUnderConstruction()) {
+            toast(`⏳ ${koName(hit.unit.type())} 건설 중 — 완료 후 다시 시도`, "#ffaa00");
+            return;
+          }
+        } catch (e) {}
+        // 골드 부족 여부 판정
+        let row = null;
+        for (const r of arr) { if (r && r.type === hit.unit.type()) { row = r; break; } }
+        if (row && row.cost !== undefined && toBig(row.cost) > toBig(me.gold())) {
+          toast(`❌ 골드 부족 — ${koName(hit.unit.type())} 다음 강화에 ${String(row.cost)} 필요`, "#ff5555");
+          return;
+        }
+        fireUpgrade(hit.unit.id(), hit.unit.type(), row, me, bus, ctor, big);
+        return;
+      }
+      const dp = nearestOwn(game, me, tile, ["Defense Post"], maxDist);
+      if (dp) { toast("ℹ️ 디펜스 포스트는 업그레이드할 수 없습니다", "#ffaa00"); return; }
+      toast(`❌ 반경 ${maxDist}타일 내 업그레이드 가능한 내 구조물 없음`, "#ffaa00");
+    }
   }
 
   // ── 무장 상태 클릭 가로채기 (캡처 단계 → 게임보다 먼저) ──
@@ -3751,9 +3773,9 @@ const PLANNER_WORKER_SOURCE = "/**\n *  Precomputes regular curve step points al
         toast(`🚢 군함 무장 ON — 바다를 클릭하면 ${CFG.warshipCount}척 건조 (N: 배치 모드 해제 / Esc: 대기열 취소)`, "#7ee787");
       } else if (armedMode === "upgradeBig") {
         const silo = (CFG.addLevelsByTypeBig && CFG.addLevelsByTypeBig["Missile Silo"]) || CFG.addLevelsBig;
-        toast(`🚀 업그레이드(大) 무장 ON — 클릭당 +${CFG.addLevelsBig} (사일로 +${silo}) (X: 모드 해제 / Esc: 대기열 취소)`, "#7ee787");
+        toast(`🚀 업그레이드(大) 무장 ON — 클릭당 +${CFG.addLevelsBig} (사일로 +${silo}) (X/Esc: 해제)`, "#7ee787");
       } else {
-        toast("🎯 업그레이드 무장 ON — 구조물을 계속 클릭하세요 (V: 모드 해제 / Esc: 대기열 취소)", "#7ee787");
+        toast("🎯 업그레이드 무장 ON — 구조물을 계속 클릭하세요 (V/Esc: 해제)", "#7ee787");
       }
       scheduleIdleDisarm();
     } else {
@@ -4842,7 +4864,7 @@ function resultPresentation(r,s={}) {
   // ── 디버그용 노출 (F12 콘솔: __x50) ──
   try {
     window.__x50 = {
-      planner: plannerDebug, CFG, setArmed, requestUpgrade, cancelUpgrades, upgrades:{state:upgradeStatus,cancel:cancelUpgrades}, requestWarships, warships:{state:warshipStatus,cancel:cancelWarships}, rateGate, rateDelayFor, rateUse, RL,
+      planner: plannerDebug, CFG, setArmed, requestUpgrade, cancelUpgrades, requestWarships, warships:{state:warshipStatus,cancel:cancelWarships}, rateGate, rateDelayFor, rateUse, RL,
       fireAtoms, fireHydro, fireMax, fireMirv, startSalvo, salvoStop,
       samDefenders, mySilos, samRangeAtLevel, stPlan, stStream, stDeadRuns, stPath, stEngage,
       samsNear, simpleShots, simpleVerdict, verdictText,
